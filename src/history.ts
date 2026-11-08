@@ -3,7 +3,7 @@ import type { Receipt } from './clean.ts';
 import type { Provider } from './types.ts';
 import { atomicWrite, readOrdinaryFile, validateReceipt } from './state.ts';
 
-type CleanupType = 'delete-sessions' | 'delete-files' | 'compress-png';
+type CleanupType = 'delete-sessions' | 'delete-files' | 'compress-png' | 'slim-history';
 export interface CleanupLog {
   schemaVersion: 1; operationId: string; provider: Provider; root: string; source: Receipt['source'];
   startedAt: string; finishedAt: string; status: Exclude<Receipt['status'], 'dry-run'>;
@@ -34,7 +34,7 @@ function validLog(value: unknown): asserts value is CleanupLog {
   const types = new Set<string>();
   for (const entry of value.cleanupTypes) {
     if (!object(entry) || typeof entry.type !== 'string' || !count(entry.cleanedRecords)) throw new Error('Invalid cleanup type count');
-    require(['delete-sessions', 'delete-files', 'compress-png'].includes(entry.type) && !types.has(entry.type));
+    require(['delete-sessions', 'delete-files', 'compress-png', 'slim-history'].includes(entry.type) && !types.has(entry.type));
     types.add(entry.type); total += entry.cleanedRecords;
     require(Number.isSafeInteger(total));
   }
@@ -63,7 +63,7 @@ export async function recordCleanup(stateDir: string, r: Receipt): Promise<void>
   const counts = new Map<CleanupType, number>();
   for (const action of r.actions) {
     if (action.status !== 'completed' || action.recoveryState !== 'finalized') continue;
-    const type = action.sessionIds ? 'delete-sessions' : action.kind === 'compress-png' ? 'compress-png' : 'delete-files';
+    const type = action.sessionIds ? 'delete-sessions' : action.kind === 'compress-png' || action.kind === 'slim-history' ? action.kind : 'delete-files';
     counts.set(type, (counts.get(type) ?? 0) + (action.sessionIds?.length ?? action.files.length));
   }
   const entry: CleanupLog = {

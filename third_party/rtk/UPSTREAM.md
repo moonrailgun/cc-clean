@@ -18,7 +18,7 @@ The imported code is from RTK's **Apache-2.0 CLI `src/` tree**. The upstream lic
 - Ported Rust grouping, sorting, truncation and test-summary logic to TypeScript; adapted output labels to plain text.
 - Restricted parsing to recognized historical output. Unknown formats, diagnostics, terminal controls and failed tests remain unchanged. Pytest filtering accepts only all-passed summaries.
 - Retained the 10 matches/files per group and 20 directory limits. Cargo summaries also retain suite counts, ignored/filtered counts and available durations.
-- Require smaller output.
+- Require smaller output. The history adapter additionally pairs tool calls/results, checks successful completion, preserves execution metadata, and adds an explicit irreversible-compaction marker.
 - Do not execute commands or import RTK's CLI runtime, telemetry, recall storage, engine or proxy. This is a subset, not a complete RTK implementation.
 
 When updating the port, pin the new revision, verify the license of each source file, retain copyright/license/modification notices, and update this mapping and the synthetic filter tests together.

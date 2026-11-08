@@ -2,7 +2,7 @@
 
 A Node.js CLI for local Claude Code and Codex storage, with menu navigation inspired by [Mole](https://github.com/tw93/mole).
 
-- **Clean:** scan and deep scan, review targets and estimated savings, then press Enter to clean verified temporary files older than 72 hours and losslessly compress eligible PNGs. You can also select files yourself.
+- **Clean:** scan and deep scan, review targets and estimated savings, then press Enter to clean verified temporary files older than 72 hours and losslessly compress eligible PNGs. Select files yourself or opt into **Slim history** to remove inline images and compact shell output.
 - **Analyze:** explore Storage, browse Projects and their sessions, or open Insights for usage and images.
 - **Statistics:** read recorded cleanup history, with before/after storage and cleaned record counts, separately for Claude and Codex.
 
@@ -60,7 +60,7 @@ npm pack
 npm exec --package=/absolute/path/cc-clean-1.0.0.tgz -- cc-clean --help
 ```
 
-`npm test` includes cleanup and native deletion tests against disposable fixtures. Agents must not run that suite or cleanup commands, including previews, without an explicit user request; see [AGENTS.md](AGENTS.md). `test:read-only` excludes cleanup, compression and native deletion execution.
+`npm test` includes cleanup and native deletion tests against disposable fixtures. Agents must not run that suite or cleanup commands, including previews, without an explicit user request; see [AGENTS.md](AGENTS.md). `test:read-only` excludes cleanup planning/execution, file compression and native deletion. It includes synthetic in-memory history transforms, inert plan rendering, and temporary layout/receipt fixtures; it does not rewrite user history or invoke native clients.
 
 ## Agent and script usage
 
@@ -100,7 +100,7 @@ A timeout or killed process may leave no complete JSON response. For mutations, 
 All JSON responses carry `schemaVersion` and `status`. Successful statistics responses use version `2`; other responses use version `1`:
 
 - Analysis: `reports`, each containing directories, categories, projects, sessions, usage, opportunities, warnings and completeness flags.
-- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
+- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. `slim-history` actions also include `slimOptions: { removeImages, compactTools }` and `slimCounts: { images, toolOutputs }`. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
 - Statistics: `providers`, `savedBytes` and `cleanedRecords`. Each provider includes these totals, JSONL `operations`, a `pending` review count and `pendingOperations` recovery receipts. `--provider` limits both the returned providers and totals.
 - Errors: `error: { code, message }`, with `USAGE_ERROR`, `OPERATION_FAILED` or `INTERRUPTED`.
 
@@ -138,17 +138,49 @@ node src/cli.ts analyze delete --provider codex --file /absolute/.codex/generate
 
 Repeat `--session` or `--file` to select multiple targets. Explicit selections require one provider; session and file selections cannot be mixed. File selections remain subject to the same eligibility rules as the menu, and an ineligible selection fails before execution. Session deletion previews include verified descendants.
 
-Every cleanup plan starts with a storage scan and deep session analysis. Interactive cleanup, including Quick clean, selected files, session deletion and terminal commands with `--yes`, lists the full target paths, operations and estimated savings before asking for confirmation. Press **Enter** to start the listed operations automatically; **Q / Esc** cancels. No source files are changed before confirmation. Cancelling any scan in Quick clean cancels the whole request. Noninteractive and JSON commands never prompt and still require explicit `--yes` for mutation. Deletion is permanent; this tool does not offer undo.
+Every cleanup plan starts with a storage scan and deep session analysis. Interactive cleanup, including Quick clean, Slim history, selected files, session deletion and terminal commands with `--yes`, lists the full target paths, operations and estimated savings before asking for confirmation. Press **Enter** to start the listed operations automatically; **Q / Esc** cancels. No source files are changed before confirmation. Cancelling a scan cancels the request. Noninteractive and JSON commands never prompt and still require explicit `--yes` for mutation. Deletion and history slimming are permanent; this tool does not offer undo.
 
 Deletion estimates use the selected files' logical sizes. PNG estimates recompress verified source data in memory without replacing files. Failed estimates remain unknown instead of counting as zero. Estimates may differ from actual directory changes, especially when safety checks skip changed or active files. Actual savings are measured around execution.
 
 ### 72-hour protection
 
-Quick clean, automatic selection and bulk operations only delete or irreversibly change files whose **last modification time is more than 72 hours ago**. This includes temporary files, generated-image deletion and session deletion. Session creation time does not determine eligibility. Recent files, files exactly 72 hours old, future timestamps and invalid timestamps are retained, with reasons shown and no estimated savings credited. Execution rechecks age and file identity before mutation.
+Quick clean, automatic selection and bulk operations only delete or irreversibly change files whose **last modification time is more than 72 hours ago**. This includes temporary files, generated-image deletion, session deletion, inline-image removal and shell-output compaction. Session creation time does not determine eligibility. Recent files, files exactly 72 hours old, future timestamps and invalid timestamps are retained, with reasons shown and no estimated savings credited. Execution rechecks age and file identity before mutation.
 
 Only explicitly selecting **one file or one session without descendants** can bypass the age limit. Multiple selections, choosing a provider, `--yes`, or a scan finding only one candidate do not bypass it. A session deletion that includes descendants is protected as a group: any recent file retains the whole action. Other checks and confirmation still apply to a single target.
 
 Lossless PNG recompression that preserves image content and supported metadata is exempt from the age limit.
+
+### Slim history
+
+Open **Clean → Slim history**, choose Claude Code, Codex or both, then enable either or both options. Both start unchecked; Quick clean does not enable them. This bulk flow only changes history files last modified more than 72 hours ago; an explicit single-file CLI operation can use the age exception above.
+
+| Option | Effect |
+| --- | --- |
+| **Remove inline images** / `--remove-images` | Replace recognized Base64 image content blocks with a text block containing `[image removed]`. Remove recognized duplicate inline images from Codex UI events while keeping image hints and ordering aligned. |
+| **Compact shell output** / `--compact-tools` | Apply the ported RTK filters to recognized, completed, successful shell output. Keep tool-call IDs and execution metadata, and mark omitted content as unavailable. |
+
+The preview lists full file paths, enabled operations, stored image copies removed, tool outputs compacted, and exact estimated byte reductions. Image counts include duplicate stored copies, not unique pictures. Estimation transforms data in memory; execution repeats the transform and requires matching source/result hashes before atomic replacement. No-saving files are omitted; unsupported files are retained with warnings.
+
+The following are examples to run **only when explicitly requested**:
+
+```sh
+# Preview both operations for both providers; does not modify history.
+node src/cli.ts clean --provider all --remove-images --compact-tools --dry-run --json
+
+# Interactively review and press Enter to remove inline images.
+node src/cli.ts clean --provider claude --remove-images
+
+# Explicit noninteractive compaction of one selected history file.
+node src/cli.ts clean --provider codex --file /absolute/.codex/sessions/example.jsonl --compact-tools --yes --json
+```
+
+Supported inputs are Claude Code **2.1.319** transcripts and Codex **0.167.0** plain legacy rollouts, up to **64 MiB per file**. Claude version fields must all match. Codex requires a complete scan and checks **every current and archived session header**, including unselected files: materialized history databases, compressed rollouts, shared/paginated/forked/imported/attached histories, custom SQLite locations and uncertain configuration block rewriting. Mixed-version roots may therefore be skipped entirely.
+
+Image removal handles Claude message and nested tool-result image blocks, Codex top-level response-message `input_image` data URLs, and known Codex user-message UI image arrays. Remote URLs, local image paths, standalone generated image files, arbitrary Base64 text, reasoning/signatures and unknown image shapes stay intact. Codex compacted replacement histories are not rewritten.
+
+The RTK subset covers numbered `rg`/`grep` matches, `rg --files`/`find`/`fd` listings, recognized successful `cargo test` output and all-passed `pytest` output. Search output keeps up to 10 matches per file; listings keep up to 20 directories and 10 files per directory. Test output retains summaries. Claude requires a paired `Bash` result explicitly marked successful; Codex requires a paired `exec_command` or `shell_command` result with a recognized successful completion envelope. Shell pipelines, compound commands, JavaScript `functions.exec` wrappers, failures, warnings, terminal controls and unrecognized output stay intact. Historical commands are never executed.
+
+**Loss is permanent:** removed image content and omitted command output cannot be recovered from cc-clean. Temporary recovery originals are removed after successful finalization. Synthetic checks cover the transformations and guards; native resume/continuation after a rewrite has **not** been verified. See [compatibility limits](docs/native-compatibility.md#history-slimming-synthetic-checks-only).
 
 ## Configuration and application data
 
@@ -184,14 +216,14 @@ Precedence: configuration file → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` → defaul
 | PNG compression | Eligible static PNGs in Codex `generated_images/`; recompress IDAT losslessly, preserving inflated scanlines and supported metadata; replace only when smaller |
 | Claude session deletion | Complete **2.1.319** transcripts and verifiably owned subagent/tool-result files; retain memory, configuration, file-history and history.jsonl |
 | Codex session deletion | Installed **0.167.0**, through official `codex delete`; verify full spawn descendant scope; reject incomplete indexes, attached relationships and compressed rollouts |
-| Field compression | Report sizes and candidates only; no field removal, JSONL rewriting or embedded-image mutation |
+| History slimming | Opt-in removal of recognized inline images and RTK shell-output compaction for Claude **2.1.319** and Codex **0.167.0** plain legacy history; irreversible, with native resume unverified |
 | Platforms | Mutations on macOS after checks; analysis, previews and statistics on other platforms |
 
 Claude has no verified automatic temporary-file or standalone-image rule yet, so its quick clean may report zero candidates. A directory called `.tmp` or `cache` is not automatically disposable: installed plugins may still reference its resources through links.
 
 Close the relevant Claude/Codex clients and services before mutation. Active processes, open files, incomplete scans, uncertain references and changed files block affected operations. Live analysis is a snapshot that may change. Session deletion currently requires complete deep analysis of the provider; an unrelated malformed or oversized transcript can also block deletion.
 
-PNG support excludes APNG, unknown/unsupported chunks, damaged images, extended attributes, JPEG/WebP and Base64 images. Direct file transactions require the source and application work directory on the same filesystem. See [native compatibility evidence](docs/native-compatibility.md) for native version checks and limits.
+PNG compression excludes APNG, unknown/unsupported chunks, damaged images, extended attributes, JPEG/WebP and Base64 images. History slimming handles supported Base64 images separately. Direct file transactions require the source and application work directory on the same filesystem. See [native compatibility evidence](docs/native-compatibility.md) for native version checks and limits.
 
 ## Accounting and recovery
 
@@ -204,7 +236,7 @@ Each line is a JSON object, for example:
 ```
 
 - **Times and sizes:** `startedAt` is the execution start, after confirmation; `finishedAt` is its end. `savedBytes` equals `beforeBytes - afterBytes`.
-- **Records and types:** count only completed, finalized actions. `delete-sessions` counts sessions including deleted descendants; `delete-files` and `compress-png` count files. `cleanupTypes` groups the counts, whose sum is `cleanedRecords`. Skipped and failed items do not count.
+- **Records and types:** count only completed, finalized actions. `delete-sessions` counts sessions including deleted descendants; `delete-files`, `compress-png` and `slim-history` count files. Slimming does not count as deleting a session. `cleanupTypes` groups the counts, whose sum is `cleanedRecords`. Skipped and failed items do not count.
 - **Totals:** sum verified history entries, separately for Claude and Codex. Incomplete measurements use `null` and set `needsReview`; those operations are excluded from totals. Recovery updates the same operation ID without double counting.
 
 Hard links count once. These are logical bytes, not physical free space on APFS or another filesystem. Native startup files or concurrent writes inside the source directory can affect the measured difference, including making it negative. The receipt's `confirmedReductionBytes` remains a separate action-level diagnostic; it is not the statistics total.
@@ -215,6 +247,6 @@ Metadata analysis reads bounded record prefixes; usage and field analysis parse 
 
 ## Third-party attribution
 
-This project includes modified TypeScript ports of selected [RTK CLI](https://github.com/rtk-ai/rtk) filters, copyright **2026 RTK AI Labs**, licensed under **Apache License 2.0**. The pinned upstream revision is [`653efb6ed02bd287d686c50e830dd1009356904f`](https://github.com/rtk-ai/rtk/tree/653efb6ed02bd287d686c50e830dd1009356904f). Only the Apache-2.0 CLI `src/` code is used; RTK's BUSL-1.1 engine/proxy code is not included.
+Shell-output compaction contains modified TypeScript ports of selected [RTK CLI](https://github.com/rtk-ai/rtk) filters, copyright **2026 RTK AI Labs**, licensed under **Apache License 2.0**. The pinned upstream revision is [`653efb6ed02bd287d686c50e830dd1009356904f`](https://github.com/rtk-ai/rtk/tree/653efb6ed02bd287d686c50e830dd1009356904f). Only the Apache-2.0 CLI `src/` code is used; RTK's BUSL-1.1 engine/proxy code is not included.
 
-See the distributed [Apache-2.0 license](third_party/rtk/LICENSE) and [source/function mapping and modifications](third_party/rtk/UPSTREAM.md). This port implements the grep, find, cargo-test and pytest subset listed in the source mapping, not all RTK filters or its runtime.
+See the distributed [Apache-2.0 license](third_party/rtk/LICENSE) and [source/function mapping and modifications](third_party/rtk/UPSTREAM.md). This port implements the subset described above, not all RTK filters or its runtime.

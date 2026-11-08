@@ -63,7 +63,7 @@ async function main() {
   const plans = [];
   for (const p of selected) {
     signal.throwIfAborted();
-    const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting };
+    const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting, removeImages: v['remove-images'], compactTools: v['compact-tools'] };
     const item = interactive ? await ui.scanPlan(config, p, options, signal) : await plan(config, p, options, signal);
     if (!item) { process.exitCode = 130; return; }
     plans.push(item);

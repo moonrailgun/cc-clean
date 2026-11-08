@@ -140,7 +140,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
   for (const action of data.actions) {
     requireReceipt(object(action) && text(action.id) && uuid.test(action.id) && !ids.has(action.id));
     ids.add(action.id);
-    requireReceipt(['delete-files', 'compress-png', 'codex-delete'].includes(action.kind as string) && text(action.targetId) && action.targetId.length > 0);
+    requireReceipt(['delete-files', 'compress-png', 'codex-delete', 'slim-history'].includes(action.kind as string) && text(action.targetId) && action.targetId.length > 0);
     requireReceipt(['planned', 'completed', 'skipped', 'failed'].includes(action.status as string) &&
       ['prepared', 'applied', 'finalized'].includes(action.recoveryState as string));
     requireReceipt(bytes(action.beforeBytes) && bytes(action.afterBytes) && (action.reason === undefined || text(action.reason)));
@@ -161,9 +161,17 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       fileBytes += file.size; requireReceipt(Number.isSafeInteger(fileBytes));
     }
     requireReceipt(action.kind === 'codex-delete' || action.beforeBytes === fileBytes);
-    if (action.kind === 'compress-png') {
+    if (action.kind === 'compress-png' || action.kind === 'slim-history') {
       requireReceipt(action.files.length === 1 && action.afterBytes <= action.beforeBytes);
       if (action.status === 'completed') requireReceipt(action.beforeHash && action.afterHash);
+    }
+    if (action.kind === 'slim-history') {
+      requireReceipt(action.sessionIds === undefined && object(action.slimOptions) &&
+        typeof action.slimOptions.removeImages === 'boolean' && typeof action.slimOptions.compactTools === 'boolean' &&
+        (action.slimOptions.removeImages || action.slimOptions.compactTools));
+      requireReceipt(object(action.slimCounts) && bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
+        (action.slimOptions.removeImages || action.slimCounts.images === 0) && (action.slimOptions.compactTools || action.slimCounts.toolOutputs === 0));
+      requireReceipt(action.files.every(file => file.category === 'sessions'));
     }
     if (action.kind === 'codex-delete') requireReceipt(data.provider === 'codex' && uuid.test(action.targetId) &&
       Array.isArray(action.sessionIds) && action.sessionIds.includes(action.targetId));

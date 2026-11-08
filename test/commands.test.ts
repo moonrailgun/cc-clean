@@ -24,6 +24,21 @@ test('explicit file lists require a single provider and absolute paths', () => {
   ]) assert.throws(() => parseCommand(args, false), UsageError);
   assert.equal(parseCommand(['analyze', 'delete', '--provider', 'codex', '--file', '/tmp/a', '--dry-run'], false).deleting, true);
 });
+test('history flags are independent clean-only opt-ins and keep confirmation requirements', () => {
+  const quick = parseCommand(['clean'], true);
+  assert.equal(quick.values['remove-images'], undefined);
+  assert.equal(quick.values['compact-tools'], undefined);
+  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-images', '--compact-tools']]) {
+    assert.throws(() => parseCommand(['clean', ...flags, '--json'], true), /--yes/);
+    const parsed = parseCommand(['clean', ...flags, '--yes', '--json'], true);
+    assert.equal(parsed.interactive, false);
+    for (const flag of flags) assert.equal(parsed.values[flag.slice(2) as 'remove-images' | 'compact-tools'], true);
+    assert.equal(parseCommand(['clean', ...flags, '--yes'], true).interactive, true);
+    assert.equal(parseCommand(['clean', ...flags, '--dry-run'], false).values['dry-run'], true);
+    for (const command of [['analyze'], ['stats'], ['analyze', 'delete', '--provider', 'claude', '--session', id, '--yes']])
+      assert.throws(() => parseCommand([...command, ...flags], true), /require clean/);
+  }
+});
 test('deletion requires explicit UUIDs or file paths with valid command-specific flags', () => {
   assert.deepEqual(parseCommand(['analyze', 'delete', '--provider', 'claude', '--session', id, '--session', id, '--yes'], false).values.session, [id, id]);
   for (const args of [

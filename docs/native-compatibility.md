@@ -1,6 +1,14 @@
-# Native session deletion compatibility
+# Native compatibility evidence
 
 Validated on 2026-11-08, macOS 15.7.4 arm64, with Codex CLI **0.167.0** and Claude Code **2.1.319**. All mutation probes used disposable synthetic data roots. No existing user session was deleted or rewritten, and no model turn was requested. These are explicit version gates, not claims of forward compatibility.
+
+## History slimming: synthetic checks only
+
+The deletion evidence below does **not** validate resuming rewritten history. `slim-history` has in-memory tests for recognized Claude Code 2.1.319 and Codex 0.167.0 records, exact preservation of untouched bytes, image placeholders, paired successful shell output, malformed-input rejection and idempotence. Synthetic filesystem fixtures check Codex layout rejection without invoking the planner, executor or native clients.
+
+No native resume, generated continuation or end-to-end history rewrite probe has been run for this feature. Images and omitted output are permanently lost after a successful operation; transaction recovery is not undo. Keeping identities and signed fields unchanged does not prove native replay compatibility.
+
+Codex rewriting is limited to plain legacy roots: all current and archived session headers must pass the version/layout checks, with no materialized `thread_history` database, compressed sibling, shared history, pagination, fork/import or attached-thread metadata. Custom SQLite configuration and uncertain layouts are rejected. Claude files must have consistent session identity and supported version fields. Files larger than 64 MiB are retained. Compacted replacement histories and other unrecognized image shapes are left untouched.
 
 ## Codex 0.167.0
 

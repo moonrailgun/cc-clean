@@ -17,7 +17,7 @@ function plan(actions: Action[], explicitTarget?: string): Plan {
 }
 
 test('every destructive kind uses a strict 72-hour modification cutoff', () => {
-  for (const kind of ['delete-files', 'codex-delete'] as const) {
+  for (const kind of ['delete-files', 'codex-delete', 'slim-history'] as const) {
     assert.equal(ageProtectionReason(action(kind, cutoff - 1), undefined, now), null);
     for (const modified of [cutoff, cutoff + 1, now, now + 1, NaN, Infinity, -Infinity])
       assert.match(ageProtectionReason(action(kind, modified), undefined, now)!, /72-hour protection.*\/inert\/file/);
@@ -39,7 +39,7 @@ test('an age exception comes only from one unique explicit selection', () => {
 });
 
 test('single-file exceptions match only that file and do not waive group protection', () => {
-  for (const kind of ['delete-files'] as const) {
+  for (const kind of ['delete-files', 'slim-history'] as const) {
     const a = action(kind);
     assert.equal(ageProtectionReason(a, '/inert/file', now), null);
     assert.ok(ageProtectionReason(a, '/inert/other', now));
@@ -85,7 +85,7 @@ test('protected actions are excluded from savings while old and lossless actions
 });
 
 test('the execution guard can recheck eligibility after a clock or metadata change', () => {
-  const a = action('delete-files', cutoff - 1);
+  const a = action('slim-history', cutoff - 1);
   assert.equal(ageProtectionReason(a, undefined, now), null);
   assert.ok(ageProtectionReason(a, undefined, now - 1));
   a.files[0].mtimeMs = now;

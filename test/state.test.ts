@@ -57,6 +57,29 @@ test('receipts retain a bounded optional explicit age-exception target', () => {
     assert.throws(() => validateReceipt({...r, explicitTarget: target}), /receipt/);
 });
 
+test('history receipts validate lossy options and count files without recording session deletion', async t => {
+  const {base, state} = await fixture(t), r = receipt(base), action = r.actions[0];
+  action.kind = 'slim-history'; action.files[0].category = 'sessions'; action.afterBytes = 10;
+  action.beforeHash = 'a'.repeat(64); action.afterHash = 'b'.repeat(64);
+  action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 2, toolOutputs: 0};
+  r.confirmedReductionBytes = 9; r.rootAfterBytes = 91;
+  assert.equal(validateReceipt(r), r);
+  for (const invalid of [
+    {slimOptions: undefined}, {slimOptions: {removeImages: false, compactTools: false}},
+    {slimCounts: undefined}, {slimCounts: {images: -1, toolOutputs: 0}}, {slimCounts: {images: 1, toolOutputs: 1}},
+    {sessionIds: [randomUUID()]}, {beforeHash: undefined}, {afterBytes: 20},
+    {files: [{...action.files[0], category: 'images'}]},
+  ]) {
+    const copy = structuredClone(r); Object.assign(copy.actions[0], invalid);
+    assert.throws(() => validateReceipt(copy), /receipt/);
+  }
+  await recordCleanup(state, r);
+  const [log] = await readCleanupLog(state);
+  assert.equal(log.cleanedRecords, 1);
+  assert.deepEqual(log.cleanupTypes, [{type: 'slim-history', cleanedRecords: 1}]);
+  assert.equal((await readStats(state)).savedBytes, 9);
+});
+
 test('privateDir refuses an existing directory below a symlink ancestor', async t => {
   const {base} = await fixture(t);
   await mkdir(join(base, 'external', 'nested'), {recursive: true});

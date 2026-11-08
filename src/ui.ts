@@ -71,7 +71,7 @@ export function printReport(data: Analysis, view = 'directories') {
       { label: 'Embedded images', value: size(o.embeddedImageBytes) },
       { label: 'Duplicate image candidates', value: size(o.duplicateImageBytes) },
     ]);
-    section('Field sizes'); note('Serialized values; keys and separators excluded; no deletion rules enabled');
+    section('Field sizes'); note('Serialized values; keys and separators excluded. Slim history is available under Clean.');
     storageRows(o.fields.map(item => ({ name: `${item.path} (${item.count})`, bytes: item.bytes })), data.totalBytes);
     section('Record types'); storageRows(o.recordTypes.map(item => ({ name: `${item.type} (${item.count})`, bytes: item.bytes })), data.totalBytes);
   }
@@ -80,13 +80,18 @@ export function printReport(data: Analysis, view = 'directories') {
 }
 export function printPlan(p: Plan) {
   title(`${providerName(p.provider)} · ${p.actions.length} items`, p.root);
-  note('Bulk deletion requires files last modified more than 72 hours ago.');
+  note('Bulk deletion and history slimming require files last modified more than 72 hours ago.');
   if (p.explicitTarget) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
   if (!p.actions.length) note('No eligible cleanup items.');
   for (const a of p.actions) {
     section(`${a.kind} · ${a.targetId} · source size ${size(a.beforeBytes)}`);
     for (const f of a.files) line(`    ${f.path}`);
     if (a.sessionIds) line(`    Related sessions: ${a.sessionIds.join(', ')}`);
+    if (a.kind === 'slim-history') {
+      line(`    Remove inline images: ${a.slimOptions?.removeImages ? 'yes' : 'no'} · Compact shell output: ${a.slimOptions?.compactTools ? 'yes' : 'no'}`);
+      line(`    Images removed: ${a.slimCounts?.images ?? 0} · Tool outputs compacted: ${a.slimCounts?.toolOutputs ?? 0}`);
+      line('    Irreversible: original images and omitted output will be unavailable. No undo.');
+    }
     line(`    Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`);
   }
   rows([{ label: 'Estimated savings', value: estimatedSavings(p.actions) }]);
@@ -424,6 +429,7 @@ export async function menu(config: Config, signal?: AbortSignal) {
         const mode = action === 'clean' ? await select({ message: 'Clean', choices: [
           { name: 'Quick clean', description: 'Deep scan, review savings, then confirm cleanup', value: 'quick' },
           { name: 'Select files', description: 'Choose what to clean', value: 'files' },
+          { name: 'Slim history', description: 'Remove inline images or compact shell output (irreversible)', value: 'slim' },
         ] }, context(signal)) : 'analyze';
         if (!mode) continue;
         const selected = await chooseProvider(signal);
@@ -431,10 +437,15 @@ export async function menu(config: Config, signal?: AbortSignal) {
         if (mode === 'analyze') for (const provider of providerList(selected)) await analysisMenu(config, provider, signal);
         else if (mode === 'files') for (const provider of providerList(selected)) await filesMenu(config, provider, signal);
         else {
-          screen(); title('Quick Clean');
+          const fields = mode === 'slim' ? await checkbox({ message: 'Slim history (irreversible; no undo)', subtitle: 'Only history files last modified more than 72 hours ago.', choices: [
+            { name: 'Remove inline images', description: 'Replace Base64 image blocks with text', value: 'images' },
+            { name: 'Compact shell output', description: 'Use RTK filters on recognized successful commands', value: 'tools' },
+          ] }, context(signal)) : [];
+          if (mode === 'slim' && !fields.length) continue;
+          screen(); title(mode === 'slim' ? 'Slim History' : 'Quick Clean');
           let plans: Plan[] | null = [];
           for (const provider of providerList(selected)) {
-            const p = await scanPlan(config, provider, {}, signal);
+            const p = await scanPlan(config, provider, { removeImages: fields.includes('images'), compactTools: fields.includes('tools') }, signal);
             if (!p) { plans = null; break; }
             plans.push(p);
           }

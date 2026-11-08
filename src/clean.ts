@@ -3,6 +3,7 @@ import { join, dirname, relative, resolve, isAbsolute } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { constants } from 'node:fs';
 import type { FileEntry, Inventory, Provider, ScanProgress, Session } from './types.ts';
 import { scanRoot } from './scan.ts';
 import { privateDir, atomicJson, jsonFiles, within, existingDir, readOrdinaryFile } from './state.ts';
@@ -12,11 +13,13 @@ import { deleteCodexSession } from './codex-delete.ts';
 import { validateReceipt } from './state.ts';
 import { readCodexIndex, type IndexThread } from './providers/codex.ts';
 import { readCleanupLog, recordCleanup } from './history.ts';
+import { slimHistory, assertLegacyCodexMeta, MAX_HISTORY_BYTES, type SlimOptions, type SlimCounts } from './slim.ts';
 const exec=promisify(execFile);
 const hash=(data:Buffer)=>createHash('sha256').update(data).digest('hex');
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface Action {
-  id:string;kind:'delete-files'|'compress-png'|'codex-delete';targetId:string;files:FileEntry[];
+  id:string;kind:'delete-files'|'compress-png'|'codex-delete'|'slim-history';targetId:string;files:FileEntry[];
+  slimOptions?:SlimOptions;slimCounts?:SlimCounts;
   sessionIds?:string[];status:'planned'|'completed'|'skipped'|'failed';reason?:string;
   beforeBytes:number;afterBytes:number;recoveryState:'prepared'|'applied'|'finalized';
   estimatedSavingsBytes?:number|null;
@@ -33,7 +36,7 @@ export interface Receipt extends Plan {
   rootBeforeBytes:number|null;rootAfterBytes:number|null;confirmedReductionBytes:number;
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
-interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[]}
+interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions}
 export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'>):string|undefined {
   const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
   return targets.length===1?targets[0]:undefined;
@@ -56,11 +59,47 @@ export function protectRecentContent(plan:Plan,now=Date.now()):Plan {
   });
   return plan;
 }
+const replacement=(kind:Action['kind'])=>kind==='compress-png'||kind==='slim-history';
 function same(entry:FileEntry,s:Awaited<ReturnType<typeof lstat>>) {return s.isFile()&&!s.isSymbolicLink()&&s.nlink===1&&s.dev===entry.dev&&s.ino===entry.ino&&s.size===entry.size&&s.mtimeMs===entry.mtimeMs&&s.ctimeMs===entry.ctimeMs;}
 function referenced(inv:Inventory,path:string) {return inv.links.some(l=>{const target=isAbsolute(l.target)?resolve(l.target):resolve(dirname(l.path),l.target);return path===target||within(target,path)||within(path,target);});}
 function makeAction(kind:Action['kind'],id:string,files:FileEntry[],sessionIds?:string[]):Action {
   const bytes=files.reduce((n,f)=>n+f.size,0);
-  return {id:randomUUID(),kind,targetId:id,files,sessionIds,status:'planned',beforeBytes:bytes,afterBytes:bytes,estimatedSavingsBytes:kind==='compress-png'?null:bytes,recoveryState:'prepared'};
+  return {id:randomUUID(),kind,targetId:id,files,sessionIds,status:'planned',beforeBytes:bytes,afterBytes:bytes,estimatedSavingsBytes:replacement(kind)?null:bytes,recoveryState:'prepared'};
+}
+
+// Legacy rollouts can be referenced by another thread's byte offsets. Inspect
+// every header, not just selected files, and refuse materialized/shared layouts.
+export async function verifyCodexRewriteLayout(inv:Inventory,signal?:AbortSignal) {
+  if(!inv.complete||process.env.CODEX_SQLITE_HOME)throw new Error('Codex rewrite requires a complete scan and default SQLite location');
+  const protectedPath=(path:string)=>/^(?:(?:sessions|archived_sessions)(?:\/|$)|config\.toml$|thread_history_.*\.sqlite)/.test(path);
+  if(inv.links.some(l=>protectedPath(relative(inv.root,l.path)))||inv.files.some(f=>/^thread_history_.*\.sqlite/.test(f.relative)||/^(?:sessions|archived_sessions)\/.*\.jsonl\.zst$/.test(f.relative)))
+    throw new Error('Linked, compressed or materialized Codex history cannot be rewritten');
+  const config=inv.files.find(f=>f.relative==='config.toml');
+  if(config) {
+    if(config.size>64*1024)throw new Error('Codex config exceeds the rewrite inspection limit');
+    const text=(await readVerified(inv.root,config)).toString('utf8');
+    // Fail closed on custom/escaped TOML keys instead of guessing SQLite location.
+    if(/sqlite|\\|^\s*["']/im.test(text))throw new Error('Custom or unrecognized Codex SQLite configuration cannot be rewritten');
+  }
+  for(const f of inv.files.filter(f=>f.category==='sessions')) {
+    signal?.throwIfAborted();
+    await verifyFile(inv.root,f);
+    const handle=await open(f.path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try {
+      if(!same(f,await handle.stat()))throw new Error('Codex history changed before header inspection');
+      const buffer=Buffer.alloc(Math.min(f.size,1024*1024));
+      let length=0,newline=-1;
+      while(length<buffer.length&&newline<0) {
+        const {bytesRead}=await handle.read(buffer,length,buffer.length-length,length);
+        if(!bytesRead)break;
+        length+=bytesRead;newline=buffer.subarray(0,length).indexOf(10);
+      }
+      if(newline<0&&length<f.size)throw new Error('Codex history header exceeds the inspection limit');
+      assertLegacyCodexMeta(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(buffer.subarray(0,newline<0?length:newline))));
+      if(!same(f,await handle.stat()))throw new Error('Codex history changed during header inspection');
+    } finally {await handle.close();}
+    await verifyFile(inv.root,f);
+  }
 }
 function verifyCodexScope(action:Action,threads:IndexThread[],inventory:Inventory,sessions?:Session[]) {
   // Native deletion also removes compressed siblings; these have not been analyzed.
@@ -142,6 +181,17 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   }
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
+  if(options.slim?.removeImages||options.slim?.compactTools) {
+    if(inv.provider==='codex') {
+      try {await verifyCodexRewriteLayout(inv);}catch(error){plan.warnings.push((error as Error).message);return plan;}
+    }
+    for(const f of inv.files) {
+      if(f.category!=='sessions'||selected&&!selected.has(f.path))continue;
+      if(!eligible(f)||f.size>MAX_HISTORY_BYTES){plan.warnings.push(`${f.relative}: history is linked, referenced or exceeds 64 MiB; retained`);continue;}
+      plan.actions.push({...makeAction('slim-history',f.relative,[f]),slimOptions:{...options.slim}});
+    }
+    return protectRecentContent(plan,now);
+  }
   const stateValid=inv.provider==='codex'&&version==='0.167.0'&&await validState(inv.root);
   for(const f of inv.files) {
     if(selected&&!selected.has(f.path))continue;
@@ -177,9 +227,20 @@ export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:
         action.estimatedSavingsBytes=null;
         plan.warnings.push(`${action.targetId}: savings estimate unavailable: ${(error as Error).message}`);
       }
+    } else if(action.kind==='slim-history') {
+      try {
+        const input=await readVerified(plan.root,action.files[0]);
+        const {output,counts}=slimHistory(input,plan.provider,action.slimOptions!);
+        action.slimCounts=counts;action.estimatedSavingsBytes=output?input.length-output.length:0;
+        if(output){action.beforeHash=hash(input);action.afterHash=hash(output);}
+      } catch(error) {
+        action.estimatedSavingsBytes=0;
+        plan.warnings.push(`${action.targetId}: history retained: ${(error as Error).message}`);
+      }
     }
     signal?.throwIfAborted();
   }
+  plan.actions=plan.actions.filter(a=>a.kind!=='slim-history'||!!a.estimatedSavingsBytes);
   onProgress?.({phase:'estimating',completed:plan.actions.length,total:plan.actions.length});
 }
 async function verifyRoot(r:Plan) {
@@ -215,7 +276,7 @@ function workPath(stateDir:string,r:Plan,a:Action) {return join(stateDir,'provid
 async function verifyBackup(dir:string,a:Action,index:number) {
   if(!await existingDir(dir))throw new Error('Transaction directory is missing');
   const f=a.files[index],s=await lstat(join(dir,`${index}.original`));
-  if(!s.isFile()||s.isSymbolicLink()||s.dev!==f.dev||s.ino!==f.ino||s.size!==f.size||s.mtimeMs!==f.mtimeMs||s.nlink> (a.kind==='compress-png'?2:1))throw new Error('Original transaction file identity changed; retained for review');
+  if(!s.isFile()||s.isSymbolicLink()||s.dev!==f.dev||s.ino!==f.ino||s.size!==f.size||s.mtimeMs!==f.mtimeMs||s.nlink> (replacement(a.kind)?2:1))throw new Error('Original transaction file identity changed; retained for review');
 }
 async function cleanupWork(dir:string,a:Action) {
   if(!await existingDir(dir))return;
@@ -253,6 +314,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
     if(!r.actions.length){r.status=plan.scanComplete?'completed':'failed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
     const busy=await check(r.provider,r.root);
     if(busy){r.actions.forEach(a=>{a.status='skipped';a.reason=busy;a.recoveryState='finalized';});r.warnings.push(busy);r.status=r.source==='analyze'?'partial':'completed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
+    if(r.provider==='codex'&&r.actions.some(a=>a.kind==='slim-history'))await verifyCodexRewriteLayout(before,options.signal);
     r.status='needs-review';await save();
     for(const a of r.actions) {
       if(options.signal?.aborted){r.status='interrupted';break;}
@@ -280,11 +342,17 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
         await privateDir(dir);
         const workStat=await lstat(dir);if(a.files.some(f=>f.dev!==workStat.dev))throw new Error('Work and source directories must be on the same filesystem');
         const space=await statfs(dir);if(space.bavail*space.bsize<a.beforeBytes*2+1024*1024)throw new Error('Insufficient working space');
-        if(a.kind==='compress-png') {
+        if(replacement(a.kind)) {
           const f=a.files[0];
-          if(process.platform==='darwin'){const {stdout}=await exec('/usr/bin/xattr',[f.path],{timeout:5000});if(stdout.trim())throw new Error('Image has extended attributes; original retained');}
-          const input=await readVerified(r.root,f);const output=await recompressPng(input);
-          if(!output){a.status='skipped';a.reason='Compression did not reduce file size';a.recoveryState='finalized';await save();continue;}
+          if(process.platform==='darwin'){const {stdout}=await exec('/usr/bin/xattr',[f.path],{timeout:5000});if(stdout.trim())throw new Error('File has extended attributes; original retained');}
+          const input=await readVerified(r.root,f);
+          const slim=a.kind==='slim-history'?slimHistory(input,r.provider,a.slimOptions!):null;
+          const output=slim?slim.output:await recompressPng(input);
+          if(!output){a.status='skipped';a.reason='Transformation did not reduce file size';a.recoveryState='finalized';await save();continue;}
+          if(slim) {
+            if(a.beforeHash!==hash(input)||a.afterHash!==hash(output))throw new Error('History differs from its preview; original retained');
+            a.slimCounts=slim.counts;
+          }
           a.beforeHash=hash(input);a.afterHash=hash(output);a.afterBytes=output.length;
           const out=await open(join(dir,'output'),'wx',f.mode&0o777);
           try {await out.writeFile(output);await out.chmod(f.mode&0o777);await out.utimes(new Date(f.mtimeMs),new Date(f.mtimeMs));await out.sync();}finally{await out.close();}
@@ -326,7 +394,7 @@ async function rollbackPrepared(r:Plan,a:Action,dir:string):Promise<boolean> {
       await verifyBackup(dir,a,i);
       if(!within(r.root,f.path)||await realpath(dirname(f.path))!==dirname(f.path))return false;
       if(await exists(f.path)) {
-        if(a.kind!=='compress-png')return false;
+        if(!replacement(a.kind))return false;
         const current=await lstat(f.path);if(current.ino!==f.ino||current.dev!==f.dev||current.size!==f.size||current.mtimeMs!==f.mtimeMs||!current.isFile())return false;
         await unlink(backup);
       } else {await link(backup,f.path);await unlink(backup);}
@@ -353,16 +421,16 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
         if(a.kind==='codex-delete'){if(a.nativeStarted){pending=true;}else{a.status='skipped';a.reason='Previous operation did not start native deletion';a.recoveryState='finalized';}continue;}
         try {
           await verifyParents(r,a);
-          if(a.kind==='compress-png'&&a.recoveryState==='prepared') {
+          if(replacement(a.kind)&&a.recoveryState==='prepared') {
             const f=a.files[0],s=await lstat(f.path).catch(()=>null);
             if(s?.ino===f.ino&&s.dev===f.dev&&s.size===f.size&&s.mtimeMs===f.mtimeMs) {
-              if(await rollbackPrepared(r,a,dir)){a.status='skipped';a.reason='Previous operation was interrupted; original image was not replaced';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';continue;}
+              if(await rollbackPrepared(r,a,dir)){a.status='skipped';a.reason='Previous operation was interrupted; original file was not replaced';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';continue;}
             }
             if(a.afterHash&&s&&(await currentHash(r.root,f.path))===a.afterHash){a.status='completed';a.recoveryState='applied';}
           }
           if(a.recoveryState==='applied') {
             if(a.kind==='delete-files'&&(await Promise.all(a.files.map(f=>exists(f.path)))).some(Boolean)){pending=true;continue;}
-            if(a.kind==='compress-png'&&(!a.afterHash||(await currentHash(r.root,a.files[0].path))!==a.afterHash)){pending=true;continue;}
+            if(replacement(a.kind)&&(!a.afterHash||(await currentHash(r.root,a.files[0].path))!==a.afterHash)){pending=true;continue;}
             a.status='completed';updateTotal(r);await atomicJson(path,r);await cleanupWork(dir,a);a.recoveryState='finalized';
           } else if(await rollbackPrepared(r,a,dir)){a.status='skipped';a.reason='Previous operation was interrupted; original files restored';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';} else pending=true;
         }catch{pending=true;}

@@ -678,6 +678,22 @@ test('plan estimates distinguish source size, unknown savings and measured resul
   assert.match(lines.join('\n'), /session without descendants/);
 });
 
+test('history plan rendering shows irreversible choices, counts and savings using inert data', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = inertPlan(), action = p.actions[0];
+  action.kind = 'slim-history'; action.targetId = 'sessions/example.jsonl';
+  action.files[0].path = '/inert/codex/sessions/example.jsonl';
+  action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 3, toolOutputs: 0};
+  printPlan(p);
+  const text = lines.join('\n');
+  assert.match(text, /\/inert\/codex\/sessions\/example\.jsonl/);
+  assert.match(text, /Remove inline images: yes.*Compact shell output: no/);
+  assert.match(text, /Images removed: 3.*Tool outputs compacted: 0/);
+  assert.match(text, /Irreversible:.*No undo/);
+  assert.match(text, /Estimated savings: 1\.00 KiB/);
+});
+
 test('ordinary menus keep their default selection and abort restores the terminal', async t => {
   const term = await terminal(t);
   const answer = select({ message: 'Confirm', choices: [{ name: 'Cancel', value: false }, { name: 'Confirm', value: true }] }, term.context);
