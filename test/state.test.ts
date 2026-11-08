@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { privateDir, atomicJson, jsonFiles, existingDir, readOrdinaryFile, validateReceipt } from '../src/state.ts';
+import { readStats } from '../src/stats.ts';
+import { recordCleanup, readCleanupLog } from '../src/history.ts';
 import type { Receipt } from '../src/clean.ts';
 
 async function fixture(t: TestContext) {
@@ -122,6 +124,207 @@ test('ledger discovery refuses malformed JSON filenames and non-object receipts'
   await rm(join(dir, 'not-a-uuid.json'));
   await writeFile(join(dir, `${r.operationId}.json`), 'null');
   await assert.rejects(jsonFiles(dir), /record|receipt/i);
+});
+
+test('missing stats return zero without creating a state directory', async t => {
+  const {state} = await fixture(t);
+  const stats = await readStats(state);
+  assert.equal(stats.savedBytes, 0);
+  assert.equal(stats.cleanedRecords, 0);
+  await assert.rejects(lstat(state), {code: 'ENOENT'});
+});
+
+test('stats use recorded directory differences, not action estimates or cache sizes', async t => {
+  const {base, state} = await fixture(t);
+  const r = receipt(base); r.rootAfterBytes = 90;
+  await save(state, r);
+  assert.equal((await readStats(state)).savedBytes, 0, 'receipts alone do not create cleanup history');
+  await recordCleanup(state, r);
+  const stats = await readStats(state);
+  assert.equal(stats.providers.codex.savedBytes, 10);
+  assert.equal(stats.providers.claude.savedBytes, 0);
+  assert.equal(stats.savedBytes, 10);
+  assert.equal(stats.cleanedRecords, 1);
+});
+
+test('cleanup JSONL records execution timestamps, measured bytes and grouped record counts', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  r.actions[0].sessionIds = [randomUUID(), randomUUID()];
+  await recordCleanup(state, r);
+  const data = await readFile(join(state, 'cleanup.jsonl'), 'utf8');
+  assert.equal(data.trim().split('\n').length, 1);
+  assert.deepEqual(JSON.parse(data), {
+    schemaVersion: 1, operationId: r.operationId, provider: 'codex', root: r.root, source: 'clean',
+    startedAt: r.executionStartedAt, finishedAt: r.finishedAt, status: 'completed',
+    beforeBytes: 100, afterBytes: 81, savedBytes: 19, cleanedRecords: 2,
+    cleanupTypes: [{type: 'delete-sessions', cleanedRecords: 2}], needsReview: false,
+  });
+  assert.equal((await lstat(join(state, 'cleanup.jsonl'))).mode & 0o777, 0o600);
+});
+
+test('mixed cleanup counts include only completed sessions and files, and no-op executions record zero', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  const add = (suffix: string) => {
+    const action = structuredClone(r.actions[0]); action.id = randomUUID();
+    action.files[0].path += suffix; action.files[0].relative += suffix;
+    r.actions.push(action); return action;
+  };
+  const sessions = add('-sessions'); sessions.sessionIds = [randomUUID(), randomUUID()];
+  const png = add('-png'); png.kind = 'compress-png'; png.afterBytes = 10;
+  png.beforeHash = 'a'.repeat(64); png.afterHash = 'b'.repeat(64);
+  for (const status of ['skipped', 'failed'] as const) {
+    const action = add('-' + status); action.status = status; action.afterBytes = action.beforeBytes;
+  }
+  r.status = 'partial'; r.confirmedReductionBytes = 47; r.rootAfterBytes = 53;
+  await recordCleanup(state, r);
+  const [log] = await readCleanupLog(state);
+  assert.equal(log.cleanedRecords, 4);
+  assert.deepEqual(log.cleanupTypes, [
+    {type: 'delete-files', cleanedRecords: 1}, {type: 'delete-sessions', cleanedRecords: 2},
+    {type: 'compress-png', cleanedRecords: 1},
+  ]);
+  const empty = receipt(base); empty.actions = []; empty.confirmedReductionBytes = 0; empty.rootAfterBytes = empty.rootBeforeBytes;
+  await recordCleanup(state, empty);
+  const logs = await readCleanupLog(state);
+  assert.equal(logs.length, 2);
+  assert.equal(logs[1].savedBytes, 0); assert.equal(logs[1].cleanedRecords, 0);
+  assert.deepEqual(logs[1].cleanupTypes, []);
+  assert.equal((await readStats(state)).cleanedRecords, 4);
+});
+
+test('logging retains prior lines, updates recovered operations once, and never logs previews', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  r.status = 'needs-review'; r.actions[0].recoveryState = 'applied'; r.attributionComplete = false;
+  await recordCleanup(state, r);
+  assert.equal((await readStats(state)).savedBytes, 0);
+  const second = receipt(base); second.provider = 'claude';
+  await recordCleanup(state, second);
+  const before = (await readFile(join(state, 'cleanup.jsonl'), 'utf8')).trim().split('\n');
+  r.actions[0].recoveryState = 'finalized'; r.status = 'interrupted'; r.attributionComplete = true; r.rootAfterBytes = null;
+  await recordCleanup(state, r); await recordCleanup(state, r);
+  const after = (await readFile(join(state, 'cleanup.jsonl'), 'utf8')).trim().split('\n');
+  assert.equal(after.length, 2); assert.equal(after[1], before[1]);
+  assert.equal(JSON.parse(after[0]).savedBytes, null);
+  assert.equal((await readStats(state)).savedBytes, 19);
+  const preview = receipt(base); preview.status = 'dry-run';
+  await recordCleanup(state, preview);
+  assert.deepEqual(await readFile(join(state, 'cleanup.jsonl'), 'utf8'), after.join('\n') + '\n');
+  const legacy = receipt(base); delete legacy.executionStartedAt;
+  await recordCleanup(state, legacy);
+  assert.equal((await readCleanupLog(state)).length, 2);
+});
+
+test('unknown measurements and unfinished actions are excluded; real growth stays negative', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  r.rootAfterBytes = 105;
+  await recordCleanup(state, r);
+  assert.equal((await readStats(state)).savedBytes, -5);
+  const unknown = receipt(base); unknown.rootAfterBytes = null;
+  await recordCleanup(state, unknown);
+  const pending = receipt(base); pending.actions[0].recoveryState = 'applied';
+  await recordCleanup(state, pending); await save(state, pending);
+  const stats = await readStats(state);
+  assert.equal(stats.savedBytes, -5); assert.equal(stats.providers.codex.pending, 2);
+  assert.equal((await readCleanupLog(state)).find(r => r.operationId === pending.operationId)?.cleanedRecords, 0);
+});
+
+test('invalid or truncated cleanup history is rejected without overwriting it', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  await recordCleanup(state, r);
+  const path = join(state, 'cleanup.jsonl'), valid = await readFile(path, 'utf8');
+  const entry = JSON.parse(valid);
+  for (const invalid of [valid + '{', valid.trim(), valid + valid,
+    JSON.stringify({...entry, savedBytes: 999}) + '\n',
+    JSON.stringify({...entry, cleanedRecords: 999}) + '\n',
+    JSON.stringify({...entry, startedAt: 'bad'}) + '\n',
+    JSON.stringify({...entry, needsReview: 'false'}) + '\n']) {
+    await writeFile(path, invalid);
+    await assert.rejects(readStats(state), /cleanup|Duplicate/i);
+    await assert.rejects(recordCleanup(state, receipt(base)), /cleanup|Duplicate/i);
+    assert.equal(await readFile(path, 'utf8'), invalid);
+  }
+});
+
+test('cleanup history refuses linked destinations without changing their targets', async t => {
+  const {base, state} = await fixture(t), target = join(base, 'external'), path = join(state, 'cleanup.jsonl');
+  await mkdir(state); await writeFile(target, 'original');
+  for (const createLink of [symlink, link]) {
+    await createLink(target, path);
+    await assert.rejects(recordCleanup(state, receipt(base)));
+    await assert.rejects(readStats(state));
+    assert.equal(await readFile(target, 'utf8'), 'original');
+    await rm(path);
+  }
+});
+
+for (const [label, mutate] of [
+  ['inflated claimed savings', (r: Receipt) => { r.confirmedReductionBytes = 20; }],
+  ['truthy attribution flag', (r: Receipt) => { (r as any).attributionComplete = 'yes'; }],
+  ['invalid timestamp', (r: Receipt) => { r.startedAt = 'bad'; }],
+  ['duplicate action', (r: Receipt) => { r.actions.push(structuredClone(r.actions[0])); r.confirmedReductionBytes *= 2; }],
+  ['invalid byte total', (r: Receipt) => { r.actions[0].beforeBytes = -1; r.confirmedReductionBytes = -1; }],
+  ['file outside root', (r: Receipt) => { r.actions[0].files[0].path = '/outside-file'; }],
+  ['file relative path mismatch', (r: Receipt) => { r.actions[0].files[0].relative = '../../outside'; }],
+  ['invalid recovery state', (r: Receipt) => { (r.actions[0] as any).recoveryState = 'unknown'; }],
+  ['completed dry-run', (r: Receipt) => { r.status = 'dry-run'; }],
+] as const) {
+  test(`stats reject ${label}`, async t => {
+    const {base, state} = await fixture(t), r = receipt(base);
+    mutate(r); await save(state, r);
+    await assert.rejects(readStats(state), /record|receipt|statistics/);
+  });
+}
+
+test('pending or unfinalized operations never earn confirmed savings', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  r.status = 'needs-review'; r.actions[0].recoveryState = 'applied';
+  await save(state, r);
+  const stats = await readStats(state);
+  assert.equal(stats.providers.codex.savedBytes, 0);
+  assert.equal(stats.providers.codex.pending, 1);
+});
+
+for (const [status, recoveryState] of [['failed', 'prepared'], ['skipped', 'applied']] as const) {
+  test(`an unresolved ${status} action keeps the entire receipt pending`, async t => {
+    const {base, state} = await fixture(t), r = receipt(base);
+    r.status = 'interrupted';
+    const action = structuredClone(r.actions[0]); action.id = randomUUID();
+    action.files[0].path += '-other'; action.files[0].relative += '-other';
+    action.status = status; action.recoveryState = recoveryState; action.afterBytes = action.beforeBytes;
+    r.actions.push(action); await save(state, r);
+    const stats = await readStats(state);
+    assert.equal(stats.providers.codex.savedBytes, 0);
+    assert.equal(stats.providers.codex.pending, 1);
+  });
+}
+
+test('analysis caches alone do not create history or negative savings', async t => {
+  const {state} = await fixture(t);
+  const claude = join(state, 'providers', 'claude'), codex = join(state, 'providers', 'codex');
+  await mkdir(claude, {recursive: true}); await mkdir(codex, {recursive: true});
+  await writeFile(join(claude, 'cache.bin'), '123456789');
+  await link(join(claude, 'cache.bin'), join(codex, 'cache.bin'));
+  await link(join(claude, 'cache.bin'), join(state, 'common.bin'));
+  const stats = await readStats(state);
+  assert.equal(stats.savedBytes, 0);
+  assert.deepEqual(stats.providers.claude.operations, []);
+  assert.deepEqual(stats.providers.codex.operations, []);
+  await assert.rejects(lstat(join(state, 'cleanup.jsonl')), {code: 'ENOENT'});
+});
+
+test('stats reject a symlinked state ancestor without reading its ledger', async t => {
+  const {base, state} = await fixture(t);
+  const r = receipt(base), dir = await save(state, r);
+  await symlink(state, join(base, 'alias'));
+  await assert.rejects(readStats(join(base, 'alias')), /symlink/i);
+  assert.equal(JSON.parse(await readFile(join(dir, `${r.operationId}.json`), 'utf8')).operationId, r.operationId);
+});
+
+test('duplicate operation IDs across providers are rejected instead of counted twice', async t => {
+  const {base, state} = await fixture(t), r = receipt(base);
+  await save(state, r);
+  r.provider = 'claude'; await save(state, r);
+  await assert.rejects(readStats(state), /Duplicate/);
 });
 
 test('receipt validation accepts optional verified root and index identities', () => {
