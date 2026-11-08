@@ -26,6 +26,7 @@ export interface Plan {
   schemaVersion:1;operationId:string;provider:Provider;root:string;version:string;
   source:'clean'|'analyze';startedAt:string;actions:Action[];warnings:string[];scanComplete:boolean;
   rootIdentity?:{dev:number;ino:number};codexIndexFingerprint?:string;
+  explicitTarget?:string;
 }
 export interface Receipt extends Plan {
   status:'completed'|'partial'|'failed'|'interrupted'|'needs-review'|'dry-run';
@@ -33,6 +34,28 @@ export interface Receipt extends Plan {
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
 interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[]}
+export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'>):string|undefined {
+  const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
+  return targets.length===1?targets[0]:undefined;
+}
+export function ageProtectionReason(action:Action,explicitTarget?:string,now=Date.now()):string|null {
+  if(action.kind==='compress-png')return null;
+  // Descendants are additional targets, even when only the parent was selected.
+  const single=explicitTarget&&(action.sessionIds
+    ? action.sessionIds.length===1&&action.sessionIds[0]===explicitTarget
+    : action.files.length===1&&action.files[0].path===explicitTarget);
+  if(single)return null;
+  const recent=action.files.find(f=>!Number.isFinite(now)||!Number.isFinite(f.mtimeMs)||now-f.mtimeMs<=72*3600000);
+  return recent?`72-hour protection: ${recent.path}; all files in a bulk destructive operation must have a valid modification time more than 72 hours ago. Entire operation retained.`:null;
+}
+export function protectRecentContent(plan:Plan,now=Date.now()):Plan {
+  plan.actions=plan.actions.filter(action=>{
+    const reason=ageProtectionReason(action,plan.explicitTarget,now);
+    if(reason)plan.warnings.push(reason);
+    return !reason;
+  });
+  return plan;
+}
 function same(entry:FileEntry,s:Awaited<ReturnType<typeof lstat>>) {return s.isFile()&&!s.isSymbolicLink()&&s.nlink===1&&s.dev===entry.dev&&s.ino===entry.ino&&s.size===entry.size&&s.mtimeMs===entry.mtimeMs&&s.ctimeMs===entry.ctimeMs;}
 function referenced(inv:Inventory,path:string) {return inv.links.some(l=>{const target=isAbsolute(l.target)?resolve(l.target):resolve(dirname(l.path),l.target);return path===target||within(target,path)||within(path,target);});}
 function makeAction(kind:Action['kind'],id:string,files:FileEntry[],sessionIds?:string[]):Action {
@@ -86,7 +109,7 @@ async function validState(root:string) {
 }
 export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<Plan> {
   const now=options.now??Date.now();const version=options.version??'unknown';
-  const plan:Plan={schemaVersion:1,operationId:randomUUID(),provider:inv.provider,root:inv.root,version,source:options.source??'clean',startedAt:new Date(now).toISOString(),actions:[],warnings:[...inv.errors],scanComplete:inv.complete};
+  const plan:Plan={schemaVersion:1,operationId:randomUUID(),provider:inv.provider,root:inv.root,version,source:options.source??'clean',explicitTarget:singleSelectedTarget(options),startedAt:new Date(now).toISOString(),actions:[],warnings:[...inv.errors],scanComplete:inv.complete};
   if(!inv.exists)return plan;
   const rootStat=await lstat(inv.root);plan.rootIdentity={dev:rootStat.dev,ino:rootStat.ino};
   if((options.otherRoots??[]).some(r=>r===inv.root||within(r,inv.root)||within(inv.root,r)))throw new Error('Source directories overlap; mutations blocked');
@@ -115,7 +138,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
       for(const action of plan.actions)verifyCodexScope(action,index.threads,inv,groups);
       plan.codexIndexFingerprint=index.fingerprint;
     }
-    return plan;
+    return protectRecentContent(plan,now);
   }
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
@@ -125,10 +148,11 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
     if(!eligible(f))continue;
     if(/^generated_images\/.+\.png$/i.test(f.relative)&&inv.provider==='codex') {
       if(f.size<=MAX_PNG_BYTES)plan.actions.push(makeAction(options.deleteImages?'delete-files':'compress-png',f.relative,[f]));
-    } else if(stateValid&&/^\.\.codex-global-state\.json\.tmp-[^/]+$/.test(f.relative)&&now-f.mtimeMs>72*3600000) {
+    } else if(stateValid&&/^\.\.codex-global-state\.json\.tmp-[^/]+$/.test(f.relative)) {
       plan.actions.push(makeAction('delete-files',f.relative,[f]));
     }
   }
+  protectRecentContent(plan,now);
   if(selected&&plan.actions.length===0)plan.warnings.push('Selected files have no eligible operations');
   return plan;
 }
@@ -239,6 +263,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
         await verifyRoot(r);
         if(a.files.some(f=>referenced(before,f.path)))throw new Error('References or scan state changed');
         for(const f of a.files)await verifyFile(r.root,f);
+        const ageReason=ageProtectionReason(a,r.explicitTarget);if(ageReason)throw new Error(ageReason);
         if(a.kind==='codex-delete') {
           const pre=await scanRoot(r.root,r.provider);if(!pre.complete)throw new Error('Scan before native deletion is incomplete');
           const index=await readCodexIndex(pre);if(!index.complete||!expectedIndexFingerprint||index.fingerprint!==expectedIndexFingerprint)throw new Error('Session index or deletion scope changed; preview again');

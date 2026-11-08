@@ -70,7 +70,7 @@ async function main() {
   }
   if (files) {
     const eligible = new Set(plans.flatMap(p => p.actions.flatMap(a => a.files.map(f => f.path))));
-    if (files.some(path => !eligible.has(path))) throw new UsageError('Some selected files are not eligible; inspect clean --dry-run to discover supported targets');
+    if (files.some(path => !eligible.has(path))) throw new UsageError('Some selected files are not eligible. Bulk destructive changes require files last modified more than 72 hours ago; inspect clean --dry-run to discover supported targets');
   }
   if (interactive && !v['dry-run']) {
     if (!plans.some(p => p.actions.length)) {

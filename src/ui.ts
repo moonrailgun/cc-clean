@@ -80,6 +80,8 @@ export function printReport(data: Analysis, view = 'directories') {
 }
 export function printPlan(p: Plan) {
   title(`${providerName(p.provider)} · ${p.actions.length} items`, p.root);
+  note('Bulk deletion requires files last modified more than 72 hours ago.');
+  if (p.explicitTarget) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
   if (!p.actions.length) note('No eligible cleanup items.');
   for (const a of p.actions) {
     section(`${a.kind} · ${a.targetId} · source size ${size(a.beforeBytes)}`);

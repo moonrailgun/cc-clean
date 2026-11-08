@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, readdir, link } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, realpath, rm, symlink, readdir, link, utimes } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
@@ -184,6 +184,9 @@ test('installed Codex 0.167.0 deletes an isolated parent cascade and preserves a
     assert.deepEqual(new Set([...before.listed.data, ...before.archived.data].map((thread: any) => thread.id)), new Set(ids));
     let database = new DatabaseSync(join(root, 'state_5.sqlite'), { readOnly: true });
     try { assert.equal(database.prepare('SELECT * FROM thread_spawn_edges').all().length, 3); } finally { database.close(); }
+    const old = new Date(Date.now() - 73 * 3600000);
+    for (const [index, id] of ids.entries())
+      await utimes(join(index === 4 ? archivedDirectory : directory, `rollout-2026-11-08T00-00-00-${id}.jsonl`), old, old);
     const inventory = await scanRoot(root, 'codex');
     const analysis = await analyze(inventory, { deep: true });
     const plan = await createPlan(inventory, { version, sessions: analysis.sessions, sessionIds: [ids[0]] });

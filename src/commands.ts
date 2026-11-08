@@ -8,6 +8,7 @@ const common = ['provider', 'json', 'no-interactive', 'help', 'version'];
 export const commandSchema = {
   schemaVersion: 1, status: 'completed', name: 'cc-clean', version,
   stateDirectory: '~/.config/cc-clean/',
+  ageProtection: { hours: 72, basis: 'File modification time; strictly older than 72 hours', scope: 'Bulk deletion', exception: 'One explicitly selected file or one session without descendants; --yes and multi-selection do not bypass protection', losslessPng: 'Exempt' },
   commands: [
     { command: 'clean', description: 'Remove verified expired temporary files and losslessly compress eligible PNGs', mutates: true, options: [...common, 'file', 'dry-run', 'yes'] },
     { command: 'analyze', description: 'Report directory, project, session, usage and compression data', mutates: false, options: [...common, 'view', 'project'] },
@@ -54,6 +55,11 @@ Options:
 Interactive cleanup:
   Scan and deep scan, then list all targets and estimated savings.
   Press Enter to confirm cleanup; Q / Esc cancels. --yes does not skip this step.
+
+72-hour protection:
+  Bulk deletion only affects files last modified more than 72 hours ago.
+  One explicitly selected file or session without descendants may bypass this age limit.
+  Multiple selections and --yes do not bypass it. Lossless PNG compression is exempt.
 
 Agent usage:
   cc-clean --help --json

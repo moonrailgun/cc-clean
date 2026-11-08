@@ -47,6 +47,10 @@ test('read-only commands can disable interaction even in a terminal', () => {
   ]) assert.throws(() => parseCommand(args, false), UsageError);
 });
 test('machine discovery describes all commands and published flags in English', () => {
+  assert.equal(commandSchema.ageProtection.hours, 72);
+  assert.match(commandSchema.ageProtection.basis, /modification time; strictly older/);
+  assert.match(commandSchema.ageProtection.exception, /--yes and multi-selection do not bypass/);
+  assert.match(help, /Multiple selections and --yes do not bypass it/);
   assert.deepEqual(commandSchema.commands.map(item => item.command), ['clean', 'analyze', 'analyze delete', 'stats']);
   for (const command of commandSchema.commands) for (const option of command.options) assert.ok(option in commandSchema.options, option);
   assert.equal(/\p{Script=Han}/u.test(help + JSON.stringify(commandSchema)), false);

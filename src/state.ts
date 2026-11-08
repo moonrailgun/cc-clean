@@ -124,6 +124,8 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
   requireReceipt(data.schemaVersion === 1 && text(data.operationId) && uuid.test(data.operationId));
   requireReceipt((data.provider === 'claude' || data.provider === 'codex') && (!provider || data.provider === provider));
   requireReceipt(absolute(data.root) && data.root !== parse(data.root).root && text(data.version) && data.version.length > 0);
+  requireReceipt(data.explicitTarget === undefined || (text(data.explicitTarget) &&
+    (uuid.test(data.explicitTarget) || absolute(data.explicitTarget) && within(data.root, data.explicitTarget))));
   requireReceipt(data.rootIdentity === undefined || (object(data.rootIdentity) && bytes(data.rootIdentity.dev) && bytes(data.rootIdentity.ino)));
   requireReceipt(data.codexIndexFingerprint === undefined || (text(data.codexIndexFingerprint) && /^[0-9a-f]{64}$/.test(data.codexIndexFingerprint)));
   requireReceipt(['clean', 'analyze'].includes(data.source as string) && timestamp(data.startedAt) &&

@@ -100,7 +100,7 @@ A timeout or killed process may leave no complete JSON response. For mutations, 
 All JSON responses carry `schemaVersion` and `status`. Successful statistics responses use version `2`; other responses use version `1`:
 
 - Analysis: `reports`, each containing directories, categories, projects, sessions, usage, opportunities, warnings and completeness flags.
-- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts.
+- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
 - Statistics: `providers`, `savedBytes` and `cleanedRecords`. Each provider includes these totals, JSONL `operations`, a `pending` review count and `pendingOperations` recovery receipts. `--provider` limits both the returned providers and totals.
 - Errors: `error: { code, message }`, with `USAGE_ERROR`, `OPERATION_FAILED` or `INTERRUPTED`.
 
@@ -142,6 +142,14 @@ Every cleanup plan starts with a storage scan and deep session analysis. Interac
 
 Deletion estimates use the selected files' logical sizes. PNG estimates recompress verified source data in memory without replacing files. Failed estimates remain unknown instead of counting as zero. Estimates may differ from actual directory changes, especially when safety checks skip changed or active files. Actual savings are measured around execution.
 
+### 72-hour protection
+
+Quick clean, automatic selection and bulk operations only delete or irreversibly change files whose **last modification time is more than 72 hours ago**. This includes temporary files, generated-image deletion and session deletion. Session creation time does not determine eligibility. Recent files, files exactly 72 hours old, future timestamps and invalid timestamps are retained, with reasons shown and no estimated savings credited. Execution rechecks age and file identity before mutation.
+
+Only explicitly selecting **one file or one session without descendants** can bypass the age limit. Multiple selections, choosing a provider, `--yes`, or a scan finding only one candidate do not bypass it. A session deletion that includes descendants is protected as a group: any recent file retains the whole action. Other checks and confirmation still apply to a single target.
+
+Lossless PNG recompression that preserves image content and supported metadata is exempt from the age limit.
+
 ## Configuration and application data
 
 All application configuration, cleanup history, analysis caches, operation receipts and transaction files live in:
@@ -172,7 +180,7 @@ Precedence: configuration file → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` → defaul
 
 | Feature | First-version support |
 | --- | --- |
-| Temporary files | Codex **0.167.0** root files named `..codex-global-state.json.tmp-*`, strictly older than 72 hours with a valid final state file |
+| Temporary files | Codex **0.167.0** root files named `..codex-global-state.json.tmp-*`, with a valid final state file; subject to 72-hour protection and its explicit single-target exception |
 | PNG compression | Eligible static PNGs in Codex `generated_images/`; recompress IDAT losslessly, preserving inflated scanlines and supported metadata; replace only when smaller |
 | Claude session deletion | Complete **2.1.319** transcripts and verifiably owned subagent/tool-result files; retain memory, configuration, file-history and history.jsonl |
 | Codex session deletion | Installed **0.167.0**, through official `codex delete`; verify full spawn descendant scope; reject incomplete indexes, attached relationships and compressed rollouts |

@@ -47,6 +47,16 @@ test('receipt savings estimates are optional, bounded and separate from measured
   }
 });
 
+test('receipts retain a bounded optional explicit age-exception target', () => {
+  const r = receipt('/inert');
+  for (const target of [undefined, randomUUID(), r.actions[0].files[0].path]) {
+    r.explicitTarget = target;
+    assert.equal(validateReceipt(r), r);
+  }
+  for (const target of [null, '', 1, 'relative/file', '/outside/file', '/inert/source/../file', '/inert/source/file\0'])
+    assert.throws(() => validateReceipt({...r, explicitTarget: target}), /receipt/);
+});
+
 test('privateDir refuses an existing directory below a symlink ancestor', async t => {
   const {base} = await fixture(t);
   await mkdir(join(base, 'external', 'nested'), {recursive: true});

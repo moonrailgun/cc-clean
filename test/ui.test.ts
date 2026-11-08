@@ -664,12 +664,18 @@ test('plan estimates distinguish source size, unknown savings and measured resul
   assert.match(lines.join('\n'), /source size 4\.00 KiB/);
   assert.match(lines.join('\n'), /1\.00 KiB \+ unknown \(1 item\)\s+Estimated savings/);
   assert.match(lines.join('\n'), /Estimated savings: unknown/);
+  assert.match(lines.join('\n'), /last modified more than 72 hours ago/);
   assert.equal(p.actions[0].afterBytes, 4096, 'estimates must not overwrite measured sizes');
   lines.length = 0;
   p.actions = [];
   printPlan(p);
   assert.match(lines.join('\n'), /No eligible cleanup items/);
   assert.match(lines.join('\n'), /0 B\s+Estimated savings/);
+  lines.length = 0;
+  p.explicitTarget = '/inert/codex/selected.jsonl';
+  printPlan(p);
+  assert.match(lines.join('\n'), /Explicit single target: \/inert\/codex\/selected\.jsonl/);
+  assert.match(lines.join('\n'), /session without descendants/);
 });
 
 test('ordinary menus keep their default selection and abort restores the terminal', async t => {

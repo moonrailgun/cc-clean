@@ -191,7 +191,7 @@ async function nativePlanFixture() {
   const f=await fixture();await mkdir(join(f.root,'sessions'));
   const db=new DatabaseSync(join(f.root,'state_5.sqlite'));
   db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, archived INTEGER); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT, child_thread_id TEXT)');
-  for(const id of sessionIds){const path=join(f.root,'sessions',id+'.jsonl');await writeFile(path,JSON.stringify({type:'session_meta',payload:{id,cwd:'/project',cli_version:'0.167.0'}})+'\n');db.prepare('INSERT INTO threads VALUES(?,?,?,0)').run(id,path,'/project');}
+  for(const id of sessionIds){const path=join(f.root,'sessions',id+'.jsonl');await writeFile(path,JSON.stringify({type:'session_meta',payload:{id,cwd:'/project',cli_version:'0.167.0'}})+'\n');await utimes(path,new Date(f.now-73*3600000),new Date(f.now-73*3600000));db.prepare('INSERT INTO threads VALUES(?,?,?,0)').run(id,path,'/project');}
   db.close();const inventory=await scanRoot(f.root,'codex'),analysis=await analyze(inventory,{deep:true});
   return {...f,inventory,analysis};
 }
@@ -275,6 +275,7 @@ test('Claude deletion groups subagent files and preserves project memory and his
   await writeFile(join(project,id+'.jsonl'),JSON.stringify(record)+'\n');
   await writeFile(join(project,id,'subagents','agent-child.jsonl'),JSON.stringify({...record,agentId:'child',isSidechain:true})+'\n');
   await writeFile(join(project,id,'tool-results','output.txt'),'owned output');await writeFile(join(project,'memory','MEMORY.md'),'retained memory');await writeFile(join(root,'history.jsonl'),'retained history');
+  for(const path of [join(project,id+'.jsonl'),join(project,id,'subagents','agent-child.jsonl'),join(project,id,'tool-results','output.txt')])await utimes(path,new Date(f.now-73*3600000),new Date(f.now-73*3600000));
   const inv=await scanRoot(root,'claude'),analysis=await analyze(inv,{deep:true});
   const p=await createPlan(inv,{source:'analyze',sessions:analysis.sessions,sessionIds:[id]}),r=await executePlan(p,{stateDir:f.stateDir,checkActivity:inactive});
   assert.ok(r.confirmedReductionBytes>0);assert.deepEqual(new Set(p.actions[0].sessionIds),new Set([id,'child']));
