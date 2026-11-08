@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
+import { analysisMenu, menu, printReport, detailNodes, printPlan, confirmPlans, usageMenu } from '../src/ui.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
@@ -156,6 +157,29 @@ function sampleReport(): Analysis {
   };
 }
 
+test('usage reports use rows per model, project and date, keeping diagnostics in Details', t => {
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  Object.defineProperty(process.stdout, 'columns', { configurable: true, value: 160 });
+  t.after(() => { if (descriptor) Object.defineProperty(process.stdout, 'columns', descriptor); else delete process.stdout.columns; });
+  let lines: string[] = [];
+  t.mock.method(console, 'log', (text = '') => lines.push(stripVTControlCharacters(text)));
+  const report = sampleReport();
+  printReport(report, 'usage');
+  const output = lines.join('\n');
+  for (const label of ['claude-sonnet', '/project', '2026-11-08']) {
+    assert.match(lines.find(line => line.trimStart().startsWith(label))!, /9\s+541\s+29,135,711\s+278,512\s+29,134,657$/);
+  }
+  assert.match(output, /other-model\s+0\s+541\s+—/);
+  assert.match(output, /Some data is partial.*Details/);
+  assert.doesNotMatch(output, /Reasoning tokens|Usage: verified|Mixed session format|session\.jsonl/);
+  report.usage.byModel['other-model'].reasoningTokens = 0;
+  lines = []; printReport(report, 'usage');
+  assert.match(lines.join('\n'), /Reasoning tokens/);
+  assert.match(lines.find(line => line.includes('other-model'))!, /\s+0$/);
+  lines = []; printReport(report, 'opportunities');
+  assert.match(lines.join('\n'), /session\.jsonl: Mixed session format/);
+});
+
 test('tables preserve exact numeric columns at narrow widths and sanitize Unicode labels', () => {
   const headers = ['Model', 'Messages', 'Tools', 'Input tokens', 'Output tokens', 'Cached tokens'];
   const record = ['\x1b[2J模型👨‍👩‍👧‍👦 very long model name\n', '0', '541', '29,135,711', '278,512', '29,134,657'];
@@ -221,6 +245,43 @@ test('tabbed reports scroll within the viewport, retain positions and repaint on
   assert.ok(term.text().includes('\x1b[?25h'));
 });
 
+test('usage tabs preserve exact numbers in narrow windows and show empty states', async t => {
+  const term = await terminal(t);
+  Object.defineProperties(term.context.output, { columns: { value: 41 }, rows: { value: 12 } });
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, value });
+    t.after(() => Object.defineProperty(process, name, descriptor));
+  }
+  const data = sampleReport();
+  data.projects = []; data.usage.byDate = {};
+  const answer = usageMenu(data, term.context.signal);
+  void answer.catch(() => {});
+  const current = () => screenLines(term.text());
+  let seen = current().join('\n');
+  for (let i = 0; i < 20; i++) {
+    await term.key('j');
+    const lines = current();
+    assert.ok(lines.length <= 12);
+    assert.ok(lines.every(line => measure(line).width <= 40), JSON.stringify(lines));
+    seen += '\n' + lines.join('\n');
+  }
+  for (const value of ['29,135,711', '278,512', '29,134,657']) assert.ok(seen.includes(value), value);
+  assert.doesNotMatch(seen, /claude-sonnet|Mixed session format|\/synthetic/);
+  await term.key('\x1b[C');
+  assert.match(current().join('\n'), /No projects data available/);
+  await term.key('\x1b[C');
+  assert.match(current().join('\n'), /No dates data available/);
+  await term.key('\x1b[C');
+  let models = current().join('\n');
+  for (let i = 0; i < 20; i++) { await term.key('j'); models += '\n' + current().join('\n'); }
+  assert.match(models, /claude-sonnet/);
+  assert.match(models, /other-model/);
+  assert.match(models, /—/);
+  await term.key('\x1b'); await answer;
+  assert.equal(current().join('').trim(), '');
+});
+
 test('tabbed report abort restores input, cursor and resize listeners', async t => {
   const term = await terminal(t), listeners = process.stdout.listenerCount('resize');
   const answer = pager({ message: 'Usage breakdown', pages: [] }, term.context);
@@ -229,6 +290,42 @@ test('tabbed report abort restores input, cursor and resize listeners', async t 
   assert.equal(term.context.input.listenerCount('keypress'), 0);
   assert.equal(process.stdout.listenerCount('resize'), listeners);
   assert.ok(term.text().includes('\x1b[?25h'));
+});
+
+test('Details groups fields by parent, totals disjoint values and keeps duplicate images separate', () => {
+  const nodes = detailNodes(sampleReport()), fields = nodes[1];
+  assert.equal(fields.bytes, 652);
+  assert.equal(fields.children?.length, 2);
+  const group = fields.children![0];
+  assert.equal(group.name, 'wireToolInputs'); assert.equal(group.bytes, 602);
+  assert.deepEqual(group.children?.map(node => [node.name, node.bytes]), [['a', 500], ['b', 100], ['(other values)', 2]]);
+  assert.match(group.children![0].detail!, /10 occurrences/);
+  assert.equal(nodes[0].bytes, undefined, 'duplicate image candidates must not inflate a group total');
+  assert.deepEqual(nodes[2].children?.map(node => node.name), ['assistant', 'user']);
+  assert.equal(nodes[3].children![0].name, 'Mixed session format versions');
+  assert.equal(nodes[3].children![0].detail, sampleReport().warnings[0]);
+});
+
+test('Details tree expands, collapses and moves to parents without printing all fields', async t => {
+  const term = await terminal(t), listeners = process.stdout.listenerCount('resize');
+  const answer = tree({ message: 'Details', nodes: detailNodes(sampleReport()) }, term.context);
+  const current = () => stripVTControlCharacters(term.text());
+  assert.match(current(), /▸ Field sizes/); assert.doesNotMatch(current(), /wireToolInputs/);
+  const press = async (key: string) => {
+    const from = term.text().length; await term.key(key); return stripVTControlCharacters(term.text().slice(from));
+  };
+  await press('j');
+  assert.match(await press('\x1b[C'), /▸ wireToolInputs/);
+  await press('\x1b[C');
+  assert.match(await press('\r'), /· a\s+500 B/);
+  await press('j');
+  assert.match(await press('\x1b[D'), /➤\s+▾ wireToolInputs/);
+  assert.doesNotMatch(await press('\x1b[D'), /· a\s/);
+  await press('\x1b[D');
+  assert.doesNotMatch(await press('\x1b[D'), /wireToolInputs/);
+  await press('q'); await answer;
+  assert.equal(process.stdout.listenerCount('resize'), listeners);
+  assert.equal(term.context.input.listenerCount('keypress'), 0);
 });
 
 test('tree pages long groups, adapts to resize and opens scrollable full notes', async t => {
@@ -370,6 +467,105 @@ test('menus show descriptions once and reserve the footer for additional details
   await term.key('q'); await answer;
 });
 
+test('merged analysis reuses snapshots and shares persistent caches with session insights', { timeout: 10000 }, async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output], ['stderr', term.context.output]] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, value });
+    t.after(() => Object.defineProperty(process, name, descriptor));
+  }
+  t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
+  const base = await realpath(await mkdtemp(join(tmpdir(), 'cc-clean-menu-')));
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const root = join(base, 'claude'), project = join(root, 'projects/p');
+  await mkdir(project, { recursive: true });
+  const transcript = (id: string, tokens: number) => [
+    { type: 'user', sessionId: id, cwd: '/project', uuid: id, message: { content: 'synthetic' } },
+    { type: 'assistant', message: { id, model: 'test', usage: { input_tokens: tokens, output_tokens: 2 } } },
+  ].map(record => JSON.stringify(record)).join('\n') + '\n';
+  await writeFile(join(project, 'one.jsonl'), transcript('one', 7));
+  await writeFile(join(project, 'two.jsonl'), transcript('two', 11));
+  const config = { roots: { claude: root, codex: join(base, 'codex') }, stateDir: join(base, 'state') };
+  const cache = join(config.stateDir, 'providers/claude/cache');
+  const entries = async () => new Map(await Promise.all((await readdir(cache)).map(async name => [name, (await stat(join(cache, name))).ino] as const)));
+  const waitFor = async (pattern: RegExp, from = 0) => {
+    for (let i = 0; i < 300; i++) {
+      const text = stripVTControlCharacters(term.text().slice(from));
+      if (pattern.test(text)) return text;
+      await setTimeout(10);
+    }
+    assert.fail(`Missing ${pattern}: ${stripVTControlCharacters(term.text().slice(from))}`);
+  };
+  const press = async (key: string, pattern: RegExp) => {
+    const from = term.text().length;
+    await term.key(key);
+    return waitFor(pattern, from);
+  };
+  const running = analysisMenu(config, 'claude', term.context.signal);
+  void running.catch(() => {});
+  const home = await waitFor(/3\. Insights/);
+  assert.match(home, /1\. Storage/);
+  assert.match(home, /2\. Projects/);
+  assert.doesNotMatch(home, /\d\. (Sessions|Compression|Select files|Back)/);
+  await press('2', /All sessions/);
+  await press('1', /sorted by size/);
+  await press('1', /Analyze Sessions/);
+  await press('1', /Preview deletion/); // Opens the session; never selects deletion.
+  assert.equal((await entries()).size, 2, 'project browsing caches metadata');
+  const session = await press('1', /Usage breakdown/);
+  assert.doesNotMatch(session, /Field sizes|Record types|Parsed \d/);
+  const sessionCache = await entries();
+  assert.equal(sessionCache.size, 3, 'session insights persist their deep parse');
+  const snapshotStart = term.text().length;
+  await press('2', /Field sizes/);
+  await press('q', /Usage breakdown/);
+  const usagePage = await press('1', /Input tokens/);
+  assert.match(usagePage, /\[Overview\]/);
+  assert.doesNotMatch(usagePage, /By project|By date|By model|Continue/);
+  await press('\x1b[C', /\[Projects\]/);
+  await press('\x1b[C', /\[Dates\]/);
+  await press('\x1b[C', /\[Models\]/);
+  await press('q', /Usage breakdown/);
+  assert.doesNotMatch(term.text().slice(snapshotStart), /Deep Scan/, 'report views share one scan');
+  await press('q', /Preview deletion/);
+  await press('q', /sorted by size/);
+  await press('q', /Analyze Storage/);
+  await press('3', /Usage breakdown/);
+  const fullCache = await entries();
+  assert.equal(fullCache.size, 4);
+  for (const [name, ino] of sessionCache) assert.equal(fullCache.get(name), ino, 'full analysis reuses session caches');
+  // The open report remains one snapshot; Refresh incorporates changed files.
+  await writeFile(join(project, 'two.jsonl'), transcript('two', 21));
+  assert.match(await press('1', /Input tokens/), /Total\s+2\s+0\s+18\s+4/);
+  await press('q', /Usage breakdown/);
+  assert.match(await press('3', /Usage breakdown/), /28 input/);
+  const refreshedCache = await entries();
+  assert.equal(refreshedCache.size, 5, 'only the changed file needs a new parse');
+  for (const [name, ino] of fullCache) assert.equal(refreshedCache.get(name), ino);
+  await press('q', /Analyze Storage/);
+  await press('3', /Usage breakdown/);
+  assert.deepEqual(await entries(), refreshedCache, 'reopening reuses persisted results');
+  await press('q', /Analyze Storage/);
+  await term.key('q'); await running;
+
+  const main = menu(config, term.context.signal);
+  void main.catch(() => {});
+  const clean = await press('1', /Select files/);
+  assert.match(clean, /Quick clean/);
+  assert.doesNotMatch(clean, /Scanning|Preview only|Confirmed reduction/);
+  await press('q', /cc-clean/);
+  const stats = await press('3', /No cleanup history yet/);
+  assert.match(stats, /Total space saved\s+0 B/);
+  assert.doesNotMatch(stats, /Application overhead|Shared overhead|Net savings|−/);
+  await press('/', /Filter:/);
+  await press('missing', /No matching items/);
+  await press('\x1b', /No cleanup history yet/);
+  await press('q', /cc-clean/);
+  await term.key('q'); await main;
+  assert.equal(await readdir(join(config.stateDir, 'providers/claude')).then(names => names.includes('operations')), false);
+  assert.equal((await readdir(config.stateDir)).includes('cleanup.jsonl'), false);
+});
+
 test('filter accepts q, digits, spaces and Unicode without activating menu shortcuts', async t => {
   const term = await terminal(t);
   const answer = select({ message: 'Browse', choices, searchable: true }, term.context);
@@ -426,6 +622,55 @@ function inertPlan(): Plan {
       beforeBytes: 4096, afterBytes: 4096, estimatedSavingsBytes: 1024, status: 'planned', recoveryState: 'prepared' }],
   };
 }
+
+test('cleanup confirmation lists scope and totals, and only Enter can approve', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const original = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, get: () => value });
+    t.after(() => Object.defineProperty(process, name, original));
+  }
+  t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
+  const first = inertPlan(), second = { ...inertPlan(), provider: 'claude' as const };
+  let settled = false;
+  let answer = confirmPlans([first, second], term.context.signal);
+  void answer.then(() => { settled = true; }, () => {});
+  await setImmediate();
+  const text = stripVTControlCharacters(term.text());
+  assert.match(text, /\/inert\/codex\/generated_images\/图片\.png/);
+  assert.match(text, /2\.00 KiB\s+Total estimated savings/);
+  for (const key of ['1', '2', ' ', 'y', '\x1b[B']) {
+    await term.key(key);
+    assert.equal(settled, false, 'a non-Enter key must never approve cleanup');
+  }
+  await term.key('\r'); assert.equal(await answer, true);
+  for (const key of ['q', '\x1b']) {
+    answer = confirmPlans([first], term.context.signal);
+    await term.key(key); assert.equal(await answer, false);
+  }
+  assert.equal(await confirmPlans([{ ...first, actions: [] }], term.context.signal), false);
+  const aborted = confirmPlans([first], term.context.signal);
+  const rejected = assert.rejects(aborted, { name: 'AbortPromptError' });
+  term.abort(); await rejected;
+  assert.ok(term.text().includes('\x1b[?25h'));
+});
+
+test('plan estimates distinguish source size, unknown savings and measured results', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = inertPlan();
+  p.actions.push({ ...p.actions[0], id: 'unknown', targetId: 'unknown.png', estimatedSavingsBytes: null });
+  printPlan(p);
+  assert.match(lines.join('\n'), /source size 4\.00 KiB/);
+  assert.match(lines.join('\n'), /1\.00 KiB \+ unknown \(1 item\)\s+Estimated savings/);
+  assert.match(lines.join('\n'), /Estimated savings: unknown/);
+  assert.equal(p.actions[0].afterBytes, 4096, 'estimates must not overwrite measured sizes');
+  lines.length = 0;
+  p.actions = [];
+  printPlan(p);
+  assert.match(lines.join('\n'), /No eligible cleanup items/);
+  assert.match(lines.join('\n'), /0 B\s+Estimated savings/);
+});
 
 test('ordinary menus keep their default selection and abort restores the terminal', async t => {
   const term = await terminal(t);
