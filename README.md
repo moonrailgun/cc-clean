@@ -212,3 +212,9 @@ Hard links count once. These are logical bytes, not physical free space on APFS 
 Quick clean and analysis-driven cleanup share one executor. Detailed receipts remain alongside the JSONL history for safe recovery. Before the next mutation, unfinished direct-file transactions are reconciled. A delayed recovery cannot reconstruct the original after-size, so it records an unknown measurement rather than crediting a later scan. Uncertain native deletions remain `needs-review`, receive no savings credit, are not automatically retried, and block new mutations for that provider. Inspect `stats --json`; removing receipts is not a recovery procedure. Whole-machine power-loss recovery is unverified.
 
 Metadata analysis reads bounded record prefixes; usage and field analysis parse deeply on request. Missing, oversized, damaged, forked or imported data can produce partial or unknown usage, which is not a complete bill. Deleting sessions changes current usage reports while preserving historical cleanup savings.
+
+## Third-party attribution
+
+This project includes modified TypeScript ports of selected [RTK CLI](https://github.com/rtk-ai/rtk) filters, copyright **2026 RTK AI Labs**, licensed under **Apache License 2.0**. The pinned upstream revision is [`653efb6ed02bd287d686c50e830dd1009356904f`](https://github.com/rtk-ai/rtk/tree/653efb6ed02bd287d686c50e830dd1009356904f). Only the Apache-2.0 CLI `src/` code is used; RTK's BUSL-1.1 engine/proxy code is not included.
+
+See the distributed [Apache-2.0 license](third_party/rtk/LICENSE) and [source/function mapping and modifications](third_party/rtk/UPSTREAM.md). This port implements the grep, find, cargo-test and pytest subset listed in the source mapping, not all RTK filters or its runtime.
