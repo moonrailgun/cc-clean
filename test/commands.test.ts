@@ -1,0 +1,55 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { commandSchema, help, parseCommand, UsageError } from '../src/commands.ts';
+
+// Parser-only checks: these never plan or execute cleanup.
+const id = '12345678-1234-1234-1234-123456789abc';
+test('noninteractive cleanup requires explicit confirmation or preview', () => {
+  for (const flags of [[], ['--json'], ['--no-interactive']]) {
+    assert.throws(() => parseCommand(['clean', ...flags], false), UsageError);
+  }
+  assert.equal(parseCommand(['clean', '--yes', '--json'], true).interactive, false);
+  assert.equal(parseCommand(['clean', '--dry-run'], false).values['dry-run'], true);
+  assert.equal(parseCommand(['clean'], true).interactive, true);
+  assert.equal(parseCommand(['clean', '--yes'], true).interactive, true);
+  assert.throws(() => parseCommand(['clean', '--no-interactive'], true), /--yes/);
+});
+test('explicit file lists require a single provider and absolute paths', () => {
+  const parsed = parseCommand(['clean', '--provider', 'codex', '--file', '/tmp/a b.png', '--file', '/tmp/unicode-图片.png', '--yes'], false);
+  assert.deepEqual(parsed.values.file, ['/tmp/a b.png', '/tmp/unicode-图片.png']);
+  for (const args of [
+    ['clean', '--file', '/tmp/a', '--yes'],
+    ['clean', '--provider', 'codex', '--file', './a', '--yes'],
+    ['analyze', 'delete', '--provider', 'codex', '--file', '/tmp/a', '--session', id, '--yes'],
+  ]) assert.throws(() => parseCommand(args, false), UsageError);
+  assert.equal(parseCommand(['analyze', 'delete', '--provider', 'codex', '--file', '/tmp/a', '--dry-run'], false).deleting, true);
+});
+test('deletion requires explicit UUIDs or file paths with valid command-specific flags', () => {
+  assert.deepEqual(parseCommand(['analyze', 'delete', '--provider', 'claude', '--session', id, '--session', id, '--yes'], false).values.session, [id, id]);
+  for (const args of [
+    ['analyze', 'delete', '--yes'],
+    ['analyze', 'delete', '--provider', 'claude', '--yes'],
+    ['analyze', 'delete', '--provider', 'claude', '--session', '../file', '--yes'],
+    ['stats', '--yes'], ['analyze', '--dry-run'], ['stats', '--file', '/tmp/a'],
+    ['analyze', '--session', id], ['clean', '--view', 'usage', '--yes'],
+    ['analyze', 'delete', '--provider', 'claude', '--session', id, '--view', 'sessions', '--yes'],
+  ]) assert.throws(() => parseCommand(args, false), UsageError);
+});
+test('read-only commands can disable interaction even in a terminal', () => {
+  assert.equal(parseCommand(['analyze', '--no-interactive'], true).interactive, false);
+  assert.equal(parseCommand(['stats', '--json'], true).interactive, false);
+  assert.equal(parseCommand(['--json'], true).command, undefined);
+  assert.equal(parseCommand(['analyze', '--view', 'sessions', '--project', '/tmp/project'], false).values.project, '/tmp/project');
+  for (const args of [
+    ['analyze', '--provider', 'unknown'], ['analyze', '--view', 'unknown'],
+    ['analyze', '--project', '/tmp/project'], ['analyze', '--view', 'sessions', '--project', './relative'],
+    ['analyze', 'unexpected'], ['unknown'], ['--provider', 'codex'],
+  ]) assert.throws(() => parseCommand(args, false), UsageError);
+});
+test('machine discovery describes all commands and published flags in English', () => {
+  assert.deepEqual(commandSchema.commands.map(item => item.command), ['clean', 'analyze', 'analyze delete', 'stats']);
+  for (const command of commandSchema.commands) for (const option of command.options) assert.ok(option in commandSchema.options, option);
+  assert.equal(/\p{Script=Han}/u.test(help + JSON.stringify(commandSchema)), false);
+  assert.equal(parseCommand(['--help', '--json'], false).values.help, true);
+  assert.equal(parseCommand(['--version', '--json'], false).values.version, true);
+});
