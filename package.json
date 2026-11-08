@@ -8,7 +8,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
-    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/analyze.test.ts test/state.test.ts test/commands.test.ts",
+    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/analyze.test.ts test/state.test.ts test/commands.test.ts test/ui.test.ts",
     "prepack": "npm run build"
   },
   "dependencies": { "@inquirer/core": "^12.0.6", "fast-string-truncated-width": "^3.0.3" },
