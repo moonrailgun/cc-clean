@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { directoryEntries, scanRoot } from '../src/scan.ts';
+import { analyze } from '../src/analyze.ts';
 import { readCodexIndex } from '../src/providers/codex.ts';
+import { report } from '../src/app.ts';
 import type { ScanProgress } from '../src/types.ts';
 
 async function fixture(t: test.TestContext) {
@@ -22,6 +24,72 @@ async function file(root: string, path: string, content: string) {
 function jsonl(records: unknown[]) { return records.map(record => JSON.stringify(record)).join('\n') + '\n'; }
 const stamp = '2026-11-01T10:00:00.000Z';
 
+test('analysis progress counts unique session files and bytes, including cache hits', async t => {
+  const base = await fixture(t), root = join(base, 'root');
+  const content = jsonl([{ type: 'user', sessionId: 'one', message: { content: 'x'.repeat(200_000) } }]);
+  const first = await file(root, 'projects/p/one.jsonl', content);
+  await file(root, 'projects/p/two.jsonl', content.replace('"one"', '"two"'));
+  await link(first, join(root, 'projects/p/z-alias.jsonl'));
+  await file(root, 'settings.json', '{}');
+  const config = { roots: { claude: root, codex: root }, stateDir: join(base, 'state') };
+  for (let run = 0; run < 2; run++) {
+    const events: ScanProgress[] = [];
+    const data = await report(config, 'claude', true, undefined, p => events.push(p));
+    assert.equal(data.usage.parsedFiles, 2);
+    assert.ok(events.some(p => p.phase === 'discovering' && p.completed > 0 && p.total === null));
+    const parsing = events.filter(p => p.phase === 'sessions');
+    assert.equal(parsing[0]?.completed, 0);
+    assert.ok(parsing.length > 2, 'progress is reported while files are read');
+    assert.ok(parsing.every(p => p.total === 2));
+    assert.deepEqual([...new Set(parsing.map(p => p.completed))], [0, 1, 2]);
+    assert.equal(parsing.at(-1)?.processedBytes, Buffer.byteLength(content) * 2);
+    assert.equal(parsing.at(-1)?.totalBytes, Buffer.byteLength(content) * 2);
+    for (let i = 1; i < parsing.length; i++) assert.ok(parsing[i].processedBytes! >= parsing[i - 1].processedBytes!);
+    assert.equal(events.at(-1)?.phase, 'finalizing');
+    assert.equal((await readdir(join(config.stateDir, 'providers/claude/cache'))).length, 2);
+    if (run) assert.equal(parsing.length, 5, 'cached files each report their size once');
+  }
+});
+
+test('deep scan can stop inside a large file without finishing it or caching partial data', { timeout: 5000 }, async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  const content = jsonl([{ type: 'user', sessionId: 'large', uuid: 'one', message: { content: 'x'.repeat(4096) } }]).repeat(1024);
+  const path = await file(root, 'projects/p/large.jsonl', content);
+  const controller = new AbortController(), events: ScanProgress[] = [];
+  let scheduled = false;
+  const result = await report({ roots: { claude: root, codex: root }, stateDir }, 'claude', true, controller.signal, p => {
+    events.push(p);
+    if (p.phase === 'sessions' && p.processedBytes! > 0 && !scheduled) {
+      scheduled = true;
+      setImmediate(() => controller.abort());
+    }
+  });
+  assert.equal(scheduled, true);
+  assert.equal(result.scanComplete, false);
+  const last = events.filter(p => p.phase === 'sessions').at(-1)!;
+  assert.equal(last.completed, 0);
+  assert.ok(last.processedBytes! < last.totalBytes!);
+  assert.deepEqual(await readdir(join(stateDir, 'providers/claude/cache')).catch(() => []), []);
+  assert.equal(await readFile(path, 'utf8'), content);
+});
+
+test('scan excludes symlink targets and counts hardlinked storage once', async t => {
+  const base = await fixture(t), root = join(base, 'root');
+  const source = await file(root, 'generated_images/image.png', '12345');
+  await link(source, join(root, 'alias.png'));
+  const external = await file(base, 'outside/secret', 'outside-content');
+  await symlink(dirname(external), join(root, 'linked'));
+  const inventory = await scanRoot(root, 'codex');
+  assert.equal(inventory.totalBytes, 5);
+  assert.equal(inventory.files.length, 2);
+  assert.equal(inventory.links.length, 1);
+  assert.equal(inventory.complete, true);
+  const result = await analyze(inventory);
+  assert.equal(result.sharedBytes, 5);
+  assert.equal(result.categories.reduce((sum, item) => sum + item.bytes, 0), 5);
+  assert.equal(result.projects.reduce((sum, item) => sum + item.bytes, 0) + result.sharedBytes + result.unattributedBytes, 5);
+});
+
 test('directory browsing reconciles nested totals and does not count hardlinks twice', async t => {
   const root = await fixture(t);
   const a = await file(root, 'large/nested/a', '1234567890');
@@ -35,6 +103,335 @@ test('directory browsing reconciles nested totals and does not count hardlinks t
   assert.deepEqual(directoryEntries(inventory, 'large/nested/').map(e => [e.name, e.bytes, e.directory]), [['a', 10, false]]);
   assert.equal(directoryEntries(inventory, 'small/').reduce((n, e) => n + e.bytes, 0), 3);
   assert.deepEqual(directoryEntries(inventory, 'missing/'), []);
+});
+
+test('deep project usage aggregates sessions without counting duplicate assistant messages twice', async t => {
+  const root = await fixture(t);
+  const message = {id:'message-1', usage:{input_tokens:10, output_tokens:4}, content:[]};
+  await file(root, 'projects/p/one.jsonl', jsonl([
+    {type:'user', sessionId:'one', cwd:'/project-a', uuid:'u1', message:{content:'synthetic'}},
+    {type:'assistant', message}, {type:'assistant', message},
+  ]));
+  await file(root, 'projects/p/two.jsonl', jsonl([
+    {type:'user', sessionId:'two', cwd:'/project-b', uuid:'u2', message:{content:'synthetic'}},
+    {type:'assistant', message:{...message, id:'message-2', usage:{input_tokens:20, output_tokens:8}}},
+  ]));
+  await file(root, 'projects/p/imported.jsonl', jsonl([
+    {type:'user', sessionId:'imported', cwd:'/project-a', isImported:true, uuid:'u3', message:{content:'synthetic'}},
+    {type:'assistant', message:{...message, id:'message-3'}},
+  ]));
+  const data = await analyze(await scanRoot(root,'claude'),{deep:true});
+  assert.equal(data.projects.find(p => p.path === '/project-a')?.usage.inputTokens, 10);
+  assert.equal(data.projects.find(p => p.path === '/project-b')?.usage.inputTokens, 20);
+  assert.equal(data.projects.find(p => p.path === '/project-a')?.usage.verified, false);
+  assert.equal(data.projects.find(p => p.path === '/project-b')?.usage.verified, true);
+  assert.equal(data.projects.reduce((n, p) => n + (p.usage.inputTokens ?? 0), 0), data.usage.inputTokens);
+});
+
+test('Claude metadata retains actual cwd and groups only owned files', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/-cannot-decode/main.jsonl', jsonl([
+    { type: 'user', sessionId: 'main', uuid: 'u1', cwd: '/missing/project-a', timestamp: stamp, message: { role: 'user', content: 'private body' } },
+    { type: 'assistant', sessionId: 'main', cwd: '/missing/project-b', message: { id: 'm1', model: 'claude-test', usage: { input_tokens: 10, output_tokens: 4 } } },
+  ]));
+  await file(root, 'projects/-cannot-decode/main/subagents/agent-child.jsonl', jsonl([
+    { type: 'user', sessionId: 'main', agentId: 'child', isSidechain: true, cwd: '/missing/project-a', message: { content: 'child' } },
+  ]));
+  await file(root, 'projects/-cannot-decode/main/tool-results/result.txt', 'owned');
+  await file(root, 'projects/-cannot-decode/memory/MEMORY.md', 'retained');
+  const result = await analyze(await scanRoot(root, 'claude'));
+  const main = result.sessions.find(item => item.id === 'main')!;
+  assert.equal(main.project, '/missing/project-a');
+  assert.deepEqual(main.observedProjects, ['/missing/project-a', '/missing/project-b']);
+  assert.equal(main.files.length, 2);
+  assert.equal(main.usage.inputTokens, null);
+  assert.equal(main.usage.userMessages, null);
+  assert.equal(result.sessions.find(item => item.id === 'child')?.parentId, 'main');
+  assert.equal(result.projects.reduce((sum, item) => sum + item.bytes, 0) + result.sharedBytes + result.unattributedBytes, result.totalBytes);
+});
+
+test('Claude deduplicates message usage and reports field and embedded-image bytes without retaining body', async t => {
+  const root = await fixture(t), stateDir = join(root, 'state');
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } };
+  const message = { id: 'm1', model: 'claude-test', usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 11, cache_creation_input_tokens: 3 }, content: [{ type: 'tool_use', id: 'tool1', name: 'x', input: {} }] };
+  await file(root, 'projects/p/main.jsonl', jsonl([
+    { type: 'user', uuid: 'u1', sessionId: 'main', cwd: '/project', timestamp: stamp, message: { role: 'user', content: [image, image, { type: 'text', text: 'DO_NOT_CACHE_BODY' }] } },
+    { type: 'assistant', uuid: 'a1', timestamp: stamp, message },
+    { type: 'assistant', uuid: 'a2', timestamp: stamp, message: { ...message, usage: { ...message.usage, output_tokens: 9 } } },
+    { type: 'user', uuid: 'result1', timestamp: stamp, message: { content: [{ type: 'tool_result', tool_use_id: 'tool1', content: 'tool output' }] } },
+  ]));
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true, stateDir });
+  assert.equal(result.usage.inputTokens, 24);
+  assert.equal(result.usage.outputTokens, 9);
+  assert.equal(result.usage.cachedTokens, 14);
+  assert.equal(result.usage.userMessages, 1);
+  assert.equal(result.usage.toolCalls, 1);
+  assert.equal(result.usage.byModel['claude-test'].outputTokens, 9);
+  assert.equal(result.opportunities.embeddedImageBytes, 16);
+  assert.equal(result.opportunities.duplicateImageBytes, 8);
+  assert.ok(result.opportunities.fields.some(item => item.path === 'message.content'));
+  assert.equal(result.opportunities.recordTypes.find(item => item.type === 'assistant')?.count, 2);
+  const cache = join(stateDir, 'providers/claude/cache');
+  for (const name of await readdir(cache)) {
+    const content = await readFile(join(cache, name), 'utf8');
+    assert.ok(!content.includes('DO_NOT_CACHE_BODY'));
+    assert.ok(!content.includes('aGVsbG8='));
+  }
+});
+
+test('Codex cumulative usage uses deltas across models, handles reset, and ignores last-usage duplication', async t => {
+  const root = await fixture(t);
+  const usage = (input: number, output: number) => ({ input_tokens: input, output_tokens: output, cached_input_tokens: 3, reasoning_output_tokens: 2 });
+  const tokens = (input: number, output: number) => ({ timestamp: stamp, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: usage(input, output), last_token_usage: usage(input, output) } } });
+  await file(root, 'sessions/rollout-test.jsonl', jsonl([
+    { type: 'session_meta', payload: { id: 's1', cwd: '/project', timestamp: stamp, cli_version: '0.167.0' } },
+    { type: 'turn_context', payload: { model: 'model-a', cwd: '/project' } },
+    { timestamp: stamp, type: 'event_msg', payload: { type: 'user_message', message: 'hello' } },
+    { timestamp: stamp, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] } },
+    tokens(10, 5), tokens(10, 5), tokens(20, 8),
+    { type: 'turn_context', payload: { model: 'model-b', cwd: '/worktree' } },
+    tokens(30, 12), tokens(4, 2),
+    { type: 'response_item', payload: { type: 'function_call', call_id: 'c1' } },
+    { type: 'response_item', payload: { type: 'function_call', call_id: 'c1' } },
+  ]));
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.usage.inputTokens, 34);
+  assert.equal(result.usage.outputTokens, 14);
+  assert.equal(result.usage.byModel['model-a'].inputTokens, 20);
+  assert.equal(result.usage.byModel['model-b'].inputTokens, 14);
+  assert.equal(result.usage.userMessages, 1);
+  assert.equal(result.usage.toolCalls, 1);
+  assert.deepEqual(result.sessions[0].observedProjects, ['/project', '/worktree']);
+  assert.equal(result.sessions[0].usage.verified, true);
+});
+
+test('Codex merges a live WAL index with files and keeps index-only rows visible', async t => {
+  const root = await fixture(t);
+  const rollout = await file(root, 'sessions/rollout-test.jsonl', jsonl([
+    { type: 'session_meta', payload: { id: 'disk', cwd: '/disk', timestamp: stamp } },
+  ]));
+  const dbPath = join(root, 'state_5.sqlite');
+  const db = new DatabaseSync(dbPath);
+  t.after(() => db.close());
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)').run('disk', rollout, '/disk', 1, 2, 0);
+  db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)').run('missing', join(root, 'sessions/missing.jsonl'), '/missing', 1, 3, 1);
+  const beforeDb = await readFile(dbPath), beforeWal = await readFile(dbPath + '-wal');
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.sessions.length, 2);
+  assert.equal(result.sessions.find(item => item.id === 'disk')?.files.length, 1);
+  const missing = result.sessions.find(item => item.id === 'missing')!;
+  assert.equal(missing.indexOnly, true);
+  assert.equal(missing.archived, true);
+  assert.equal(missing.bytes, 0);
+  assert.equal(missing.usage.inputTokens, null);
+  assert.equal(result.scanComplete, false);
+  assert.deepEqual(await readFile(dbPath), beforeDb);
+  assert.deepEqual(await readFile(dbPath + '-wal'), beforeWal);
+  assert.equal(result.projects.reduce((sum, item) => sum + item.bytes, 0) + result.sharedBytes + result.unattributedBytes, result.totalBytes);
+});
+
+test('malformed and oversized lines preserve later records but mark analysis incomplete', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/s1.jsonl', jsonl([{ type: 'user', sessionId: 's1', cwd: '/project', uuid: 'u1', message: { content: 'first' } }]) + '{bad\n' + 'x'.repeat(9 * 1024 * 1024) + '\n' + jsonl([{ type: 'user', uuid: 'u2', message: { content: 'last' } }]) + '{"unfinished":');
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(result.scanComplete, false);
+  assert.equal(result.sessions[0].usage.userMessages, 2);
+  assert.ok(result.warnings.some(message => /line/.test(message)));
+  assert.equal(result.usage.verified, false);
+});
+
+test('changed fingerprints invalidate cached usage', async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  const path = await file(root, 'projects/p/s1.jsonl', jsonl([{ type: 'assistant', sessionId: 's1', message: { id: 'a1', usage: { input_tokens: 7, output_tokens: 2 } } }]));
+  const first = await analyze(await scanRoot(root, 'claude'), { deep: true, stateDir });
+  assert.equal(first.usage.inputTokens, 7);
+  await writeFile(path, jsonl([{ type: 'assistant', sessionId: 's1', message: { id: 'a1', usage: { input_tokens: 21, output_tokens: 4 } } }]));
+  const second = await analyze(await scanRoot(root, 'claude'), { deep: true, stateDir });
+  assert.equal(second.usage.inputTokens, 21);
+});
+
+test('cancelled inventory and analysis stay explicitly incomplete', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/s1.jsonl', '{}\n');
+  const signal = AbortSignal.abort();
+  const inventory = await scanRoot(root, 'claude', signal);
+  assert.equal(inventory.complete, false);
+  const result = await analyze(inventory, { deep: true, signal });
+  assert.equal(result.scanComplete, false);
+  assert.equal(result.usage.inputTokens, null);
+});
+
+test('bounded metadata mode marks unsampled session content incomplete', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/s1.jsonl', jsonl([{ type: 'user', sessionId: 's1', cwd: '/project', message: { content: 'hello' } }]) + jsonl([{ type: 'assistant', message: { content: 'x'.repeat(2 * 1024 * 1024) } }]));
+  const result = await analyze(await scanRoot(root, 'claude'));
+  assert.equal(result.sessions[0].project, '/project');
+  assert.equal(result.sessions[0].complete, false);
+  assert.equal(result.scanComplete, false);
+  assert.equal(result.usage.userMessages, null);
+});
+
+test('cache does not hide source replacement after inventory collection', async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  const path = await file(root, 'projects/p/s1.jsonl', jsonl([{ type: 'assistant', sessionId: 's1', message: { id: 'a1', usage: { input_tokens: 7, output_tokens: 2 } } }]));
+  const inventory = await scanRoot(root, 'claude');
+  await analyze(inventory, { deep: true, stateDir });
+  await rm(path);
+  await symlink(await file(base, 'outside.jsonl', '{}\n'), path);
+  const result = await analyze(inventory, { deep: true, stateDir });
+  assert.equal(result.scanComplete, false);
+  assert.equal(result.sessions[0].usage.inputTokens, null);
+});
+
+test('Codex spawn edges merge while attached relationships block affected sessions', async t => {
+  const root = await fixture(t);
+  const rollout = await file(root, 'sessions/parent.jsonl', jsonl([{ type: 'session_meta', payload: { id: 'parent', cwd: '/project' } }]));
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT, attached_thread_parent_id TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)');
+  db.prepare('INSERT INTO threads VALUES (?, ?, ?)').run('parent', rollout, null);
+  db.prepare('INSERT INTO threads VALUES (?, ?, ?)').run('child', join(root, 'sessions/child.jsonl'), null);
+  db.prepare('INSERT INTO threads VALUES (?, ?, ?)').run('attached', join(root, 'sessions/attached.jsonl'), 'parent');
+  db.prepare('INSERT INTO thread_spawn_edges VALUES (?, ?, ?)').run('parent', 'child', 'running');
+  db.close();
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.sessions.find(item => item.id === 'child')?.parentId, 'parent');
+  assert.equal(result.sessions.find(item => item.id === 'attached')?.parentId, undefined);
+  assert.equal(result.sessions.find(item => item.id === 'parent')?.complete, false);
+  assert.ok(result.sessions.find(item => item.id === 'parent')?.warnings.some(warning => warning.includes('Attached')));
+  assert.equal(result.scanComplete, false);
+});
+
+test('forked usage stays visible in session but is excluded from aggregate totals', async t => {
+  const root = await fixture(t);
+  await file(root, 'sessions/fork.jsonl', jsonl([
+    { type: 'session_meta', payload: { id: 'fork', cwd: '/project', forked_from_id: 'parent' } },
+    { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 50, output_tokens: 9 } } } },
+  ]));
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.sessions[0].usage.inputTokens, 50);
+  assert.equal(result.sessions[0].parentId, undefined);
+  assert.equal(result.sessions[0].usage.verified, false);
+  assert.equal(result.usage.inputTokens, null);
+});
+
+test('model keys cannot pollute prototypes and remain visible in usage', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/s1.jsonl', jsonl([{ type: 'assistant', sessionId: 's1', message: { id: 'm1', model: '__proto__', usage: { input_tokens: 7, output_tokens: 2 } } }]));
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.ok(Object.hasOwn(result.usage.byModel, '__proto__'));
+  assert.equal(({} as {inputTokens?: number}).inputTokens, undefined);
+  assert.equal(result.usage.byModel['__proto__'].inputTokens, 7);
+});
+
+test('cache evicts old entries to a fixed capacity', async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  await file(root, 'projects/p/s1.jsonl', '{}\n');
+  const cache = join(stateDir, 'providers/claude/cache');
+  await mkdir(cache, { recursive: true });
+  for (let i = 0; i < 514; i++) await writeFile(join(cache, i.toString(16).padStart(64, '0') + '.json'), '{}');
+  await analyze(await scanRoot(root, 'claude'), { stateDir });
+  assert.ok((await readdir(cache)).length <= 512);
+});
+
+test('unknown SQLite schema falls back to disk and stays incomplete', async t => {
+  const root = await fixture(t);
+  await file(root, 'sessions/s1.jsonl', jsonl([{ type: 'session_meta', payload: { id: 's1', cwd: '/project' } }]));
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE unsupported (value TEXT)');
+  db.close();
+  const result = await analyze(await scanRoot(root, 'codex'));
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].complete, false);
+  assert.equal(result.scanComplete, false);
+  assert.ok(result.warnings.some(warning => warning.includes('unknown threads schema')));
+});
+
+test('absent provider root is a complete empty report', async t => {
+  const root = join(await fixture(t), 'absent');
+  const result = await analyze(await scanRoot(root, 'codex'));
+  assert.equal(result.scanComplete, true);
+  assert.equal(result.totalBytes, 0);
+  assert.equal(result.sessions.length, 0);
+});
+
+test('orphaned index spawn edges remain visible as incomplete children', async t => {
+  const root = await fixture(t);
+  const rollout = await file(root, 'sessions/parent.jsonl', jsonl([{ type: 'session_meta', payload: { id: 'parent', cwd: '/project' } }]));
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  db.prepare('INSERT INTO threads VALUES (?, ?)').run('parent', rollout);
+  db.prepare('INSERT INTO thread_spawn_edges VALUES (?, ?)').run('parent', 'missing');
+  db.close();
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.sessions.find(item => item.id === 'missing')?.parentId, 'parent');
+  assert.equal(result.sessions.find(item => item.id === 'missing')?.complete, false);
+  assert.equal(result.scanComplete, false);
+});
+
+test('external Codex SQLite configuration is reported as incomplete coverage', async t => {
+  const root = await fixture(t);
+  await file(root, 'config.toml', 'sqlite_home = "/elsewhere"\n');
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  db.close();
+  const result = await analyze(await scanRoot(root, 'codex'));
+  assert.equal(result.scanComplete, false);
+  assert.ok(result.warnings.some(warning => /external.*SQLite/i.test(warning)));
+});
+
+test('valid JSON with no provider session identity is not a validated session', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/s1.jsonl', '{}\n');
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(result.sessions[0].complete, false);
+  assert.equal(result.scanComplete, false);
+});
+
+test('empty existing Codex root reports complete zero storage', async t => {
+  const root = await fixture(t);
+  const result = await analyze(await scanRoot(root, 'codex'));
+  assert.equal(result.scanComplete, true);
+  assert.equal(result.totalBytes, 0);
+});
+
+test('analysis cache never writes or evicts through a symlinked state ancestor', async t => {
+  const base = await fixture(t), root = join(base, 'root');
+  await file(root, 'projects/p/s1.jsonl', jsonl([{ type: 'user', sessionId: 's1', cwd: '/project', message: { content: 'hello' } }]));
+  const outside = join(base, 'outside');
+  const cache = join(outside, 'nested/providers/claude/cache');
+  await mkdir(cache, { recursive: true });
+  for (let i = 0; i < 514; i++) await writeFile(join(cache, i.toString(16).padStart(64, '0') + '.json'), '{}');
+  await symlink(outside, join(base, 'state-link'));
+  const result = await analyze(await scanRoot(root, 'claude'), { stateDir: join(base, 'state-link/nested') });
+  assert.equal(result.sessions.length, 1);
+  assert.equal((await readdir(cache)).length, 514);
+});
+
+test('mixed Claude format versions cannot be validated by only the last record', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/s1.jsonl', jsonl([
+    { type: 'user', sessionId: 's1', version: 'unknown-new-format', message: { content: 'first' } },
+    { type: 'user', sessionId: 's1', version: '2.1.319', message: { content: 'second' } },
+  ]));
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(result.sessions[0].complete, false);
+  assert.match(result.sessions[0].warnings.join(' '), /versions/);
+});
+
+test('cyclic session graphs are incomplete instead of an empty deletion root set', async t => {
+  const root = await fixture(t);
+  const first = await file(root, 'sessions/first.jsonl', jsonl([{ type: 'session_meta', payload: { id: 'first', source: { subagent: { thread_spawn: { parent_thread_id: 'second' } } } } }]));
+  const second = await file(root, 'sessions/second.jsonl', jsonl([{ type: 'session_meta', payload: { id: 'second', source: { subagent: { thread_spawn: { parent_thread_id: 'first' } } } } }]));
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  db.prepare('INSERT INTO threads VALUES (?, ?)').run('first', first);
+  db.prepare('INSERT INTO threads VALUES (?, ?)').run('second', second);
+  db.close();
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.scanComplete, false);
+  assert.ok(result.sessions.every(session => !session.complete));
+  assert.ok(result.warnings.some(warning => /cycle/i.test(warning)));
 });
 
 test('scanner canonicalizes link targets through another directory alias', async t => {
