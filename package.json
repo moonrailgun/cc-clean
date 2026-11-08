@@ -3,12 +3,15 @@
   "version": "1.0.0",
   "description": "Analyze and clean local Claude Code and Codex storage",
   "type": "module",
+  "bin": { "cc-clean": "dist/cli.js" },
+  "files": ["dist", "README.md", "AGENTS.md", "docs/native-compatibility.md"],
   "engines": { "node": ">=24.0.0" },
   "scripts": {
-    "build": "tsc",
+    "dev": "node --disable-warning=ExperimentalWarning src/cli.ts",
+    "build": "tsc && chmod +x dist/cli.js",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
-    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/analyze.test.ts test/state.test.ts test/commands.test.ts test/ui.test.ts",
+    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/commands.test.ts test/agent.test.ts test/analyze.test.ts test/state.test.ts test/ui.test.ts",
     "prepack": "npm run build"
   },
   "dependencies": { "@inquirer/core": "^12.0.6", "fast-string-truncated-width": "^3.0.3" },
