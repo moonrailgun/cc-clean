@@ -527,7 +527,7 @@ test('session temporary receipts bind the creation scope and direct-file identit
 
 
 test('Claude slimming receipts validate enabled operations, provider and exact category savings', () => {
-  for (const [option, count] of [['removeRequestArchives', 'requestRecords'], ['compactHooks', 'hooks']] as const) {
+  for (const [option, count] of [['removeRequestArchives', 'requestRecords'], ['compactHooks', 'hooks'], ['compactToolDefinitions', 'toolDefinitions']] as const) {
     const r = receipt('/inert'), a = r.actions[0]; r.provider = 'claude';
     a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
     a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64);

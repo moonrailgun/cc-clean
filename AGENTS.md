@@ -22,7 +22,7 @@
 
 ## 三天保护（后续迭代的基本要求）
 
-- Quick clean、自动选择和批量操作中的一切有损或不可逆修改（包括删除、移除内嵌图片、精简工具输出、移除 Codex 加密推理状态、移除 Claude 请求存档、精简成功 hook），只允许处理最后修改时间严格早于当前时间 72 小时的内容。按文件 `mtime` 判断，不按会话创建时间；最近修改、恰好 72 小时、未来或无效时间均保留。
+- Quick clean、自动选择和批量操作中的一切有损或不可逆修改（包括删除、移除内嵌图片、精简工具输出、移除 Codex 加密推理状态、移除 Claude 请求存档、精简成功 hook、工具定义），只允许处理最后修改时间严格早于当前时间 72 小时的内容。按文件 `mtime` 判断，不按会话创建时间；最近修改、恰好 72 小时、未来或无效时间均保留。
 - 唯一年龄例外是用户主动明确选定一个文件或一个不含子会话的会话进行单独操作。多选、选择整个 provider、批量扫描最后只剩一个候选、`--yes` 均不构成例外；会话展开后包含子会话时，整个删除范围按批量保护，范围内任一文件受保护则保留整个操作。
 - 无损且保留图片内容和元数据的 PNG 重压缩不受此年龄限制。单目标例外只豁免年龄，仍须通过格式兼容性、活动状态、引用、完整性及确认等既有检查。
 - 规划时排除受保护内容，不计入预计节省空间，并说明保留原因；执行前复核年龄与文件状态。不得通过新增入口或参数绕过此规则。年龄规则测试使用纯内存元数据，不运行清理规划器或执行器。
@@ -36,11 +36,12 @@
 
 ## 历史瘦身操作
 
-- 用户已接受移除会话内嵌 Base64 图片后无法再查看原图，以及精简命令输出后无法恢复被省略内容；也接受无法重建精确历史 API 请求、丢失成功 hook 的命令/输出/注入上下文，以及恢复后可能增加成本或缺少非关键上下文。目标是保留可追溯信息和继续聊天的能力，不要求完全还原当时场景；这不代表授权开发期间实际执行清理。
-- Claude Code 和 Codex 的 `Clean → Quick clean` 均默认将 `Remove inline images` 和 `Compact shell output` 纳入预估，与既有临时文件清理、无损 PNG 压缩合并展示，遵守三天保护及活动保护并等待用户主动按 Enter 才执行。Codex 另默认纳入 `Remove encrypted reasoning (Codex)`；Claude 另默认纳入 `Remove API request archives (Claude)`、`Compact successful hooks (Claude)`。独立的 `Clean → Slim history` 所有选项默认不勾选，仅展示所选 provider 支持的操作；CLI 通过显式 `--remove-images` / `--compact-tools` / `--remove-reasoning` / `--remove-request-archives` / `--compact-hooks` 启用历史瘦身。
+- 用户已接受移除会话内嵌 Base64 图片后无法再查看原图，以及精简命令输出后无法恢复被省略内容；也接受无法重建精确历史 API 请求、丢失成功 hook 的命令/输出/注入上下文和历史工具定义，以及恢复后可能增加成本或缺少非关键上下文。目标是保留可追溯信息和继续聊天的能力，不要求完全还原当时场景；这不代表授权开发期间实际执行清理。
+- Claude Code 和 Codex 的 `Clean → Quick clean` 均默认将 `Remove inline images` 和 `Compact shell output` 纳入预估，与既有临时文件清理、无损 PNG 压缩合并展示，遵守三天保护及活动保护并等待用户主动按 Enter 才执行。Codex 另默认纳入 `Remove encrypted reasoning (Codex)`；Claude 另默认纳入 `Remove API request archives (Claude)`、`Compact successful hooks (Claude)`、`Compact tool definitions (Claude)`。独立的 `Clean → Slim history` 所有选项默认不勾选，仅展示所选 provider 支持的操作；CLI 通过显式 `--remove-images` / `--compact-tools` / `--remove-reasoning` / `--remove-request-archives` / `--compact-hooks` / `--compact-tool-definitions` 启用历史瘦身。
 - 操作顺序固定为扫描、深度扫描、按操作分类展示数量及预计节省空间（图片移除、输出精简和推理密文移除单独统计）、展示总额及不可逆提示，再等待用户主动按 Enter。默认不逐条展示文件；完整路径及逐文件预估保留在 `View files` 和 JSON 中。交互模式的 `--yes` 不得跳过回车确认；非交互和 JSON 模式通过显式 `--yes` 执行，不得弹出提示。
-- 分类预估必须合并本次选中的所有 provider 和临时目录，每种操作与总额只展示一次；图片移除、无损 PNG 压缩、终端输出精简、Codex 推理密文移除、Claude 请求存档移除、成功 hook 精简及各类临时文件分别统计，不重复计入历史瘦身总额，未知预估不得显示为零。
+- 分类预估必须合并本次选中的所有 provider 和临时目录，每种操作与总额只展示一次；图片移除、无损 PNG 压缩、终端输出精简、Codex 推理密文移除、Claude 请求存档移除、成功 hook 精简、工具定义精简及各类临时文件分别统计，不重复计入历史瘦身总额，未知预估不得显示为零。
 - Claude 请求存档仅在存在独立对话记录且整个存档族结构已识别时，一起移除 `api-request`、`api-request-shape`、`api-request-blob`；未知存档类型或字段保留整个存档族。成功 hook 仅清空已识别 `hook_success` 且 `exitCode=0` 的 `command`、`content`、`stdout`、`stderr` 及已记录 `rendered`；保留整条记录的 UUID、parentUuid、时间、状态及其他未修改字节。此 hook 操作保留失败或未知 hook、`prompt_snapshot`、instructions、`skill_listing`。原生验证及组合操作的合成验证边界见兼容性文档。
+- Claude 工具定义精简纳入 Quick clean 默认项，仅清空已识别 `prompt_snapshot.attachment.tools`，保留系统提示词、记录身份和关联字段；未知结构保留。单独预估并沿用保护、原子替换及恢复流程；有限原生继续对话证据见兼容性文档。
 - 按已验证的 provider 格式替换图片块或精简成功的命令输出；保留会话/工具调用身份、签名、关联信息及未修改字段的原始字节。无法识别、失败、仍在运行的输出保持原样。Codex 独立的普通 legacy/paginated JSONL 可瘦身，须同步更新已识别的 SQLite 字节偏移和缓存项；跨 rollout 共享引用及未知偏移结构在实现关联更新前禁止重写。
 - Claude Code 和 Codex 历史瘦身、Claude 整会话删除及 Codex 临时文件规则按实际结构、身份及引用关系判断，不得仅因版本号未知、缺失或混用而拦截；版本字段原样保留。格式兼容性必须有合成测试覆盖并记录在 `docs/native-compatibility.md`，合成测试不等于原生恢复验证。
 - Codex 原生整会话删除按 CLI 能力及删除范围契约校验，不使用精确版本白名单；必须验证 UUID/force/config 支持、禁用 daemon 和后台历史迁移/压缩，并绑定数据目录。能力校验不等于所有版本均经过原生验证。普通及 zstd 历史首行均需检查归属和引用；无关的压缩文件或硬链接不得阻断独立目标，目标自身的未预览副本、硬链接及共享引用仍须保留并解释原因。

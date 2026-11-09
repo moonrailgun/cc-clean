@@ -847,13 +847,14 @@ test('Quick clean selects all supported history operations alongside file cleanu
   const term = await terminal(t);
   assert.deepEqual(await cleanOptions(false, term.context.signal), {
     includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: true, removeRequestArchives: true, compactHooks: true,
-
+    compactToolDefinitions: true,
   });
   assert.equal(term.text(), '');
   assert.equal((await cleanOptions(false, term.context.signal, false))?.removeReasoning, false);
   const codexOnly = await cleanOptions(false, term.context.signal, true, false);
   assert.equal(codexOnly?.removeRequestArchives, false);
   assert.equal(codexOnly?.compactHooks, false);
+  assert.equal(codexOnly?.compactToolDefinitions, false);
 });
 
 test('standalone Slim history starts unchecked and only includes the selected operations', async t => {
@@ -865,16 +866,16 @@ test('standalone Slim history starts unchecked and only includes the selected op
   }
   let answer = cleanOptions(true, term.context.signal);
   await term.key('\r'); assert.equal(await answer, null);
-  for (const keys of ["1", "2", "3", "4", "5", "12", "12345"]) {
+  for (const keys of ["1", "2", "3", "4", "5", "6", "12", "123456"]) {
     answer = cleanOptions(true, term.context.signal);
     for (const key of keys) await term.key(key);
     await term.key('\r');
     assert.deepEqual(await answer, { removeImages: keys.includes('1'), compactTools: keys.includes('2'),
       removeReasoning: keys.includes('3'), removeRequestArchives: keys.includes('4'), compactHooks: keys.includes('5'),
-      });
+      compactToolDefinitions: keys.includes('6')});
   }
   answer = cleanOptions(true, term.context.signal, false, true);
-  await term.key('3'); await term.key('\r');
+  await term.key('3'); await term.key('4'); await term.key('5'); await term.key('\r');
   answer = cleanOptions(true, term.context.signal, true, false);
   await term.key('3'); await term.key('\r');
   answer = cleanOptions(true, term.context.signal);
@@ -975,10 +976,10 @@ test('cleanup categories combine providers and temporary roots without double-co
   const first = inertPlan(), second = {...inertPlan(), provider: 'claude' as const, root: '/inert/claude'};
   first.actions.push({...first.actions[0], estimatedSavingsBytes: null});
   const history = {...second.actions[0], kind: 'slim-history' as const,
-    estimatedSavingsBytes: 2048,
-    slimOptions: {removeImages: true, compactTools: true, removeRequestArchives: true, compactHooks: true},
-    slimCounts: {images: 2, toolOutputs: 4, requestRecords: 3, hooks: 1},
-    slimSavingsBytes: {images: 768, toolOutputs: 256, requestRecords: 768, hooks: 256}};
+    estimatedSavingsBytes: 2816,
+    slimOptions: {removeImages: true, compactTools: true, removeRequestArchives: true, compactHooks: true, compactToolDefinitions: true},
+    slimCounts: {images: 2, toolOutputs: 4, requestRecords: 3, hooks: 1, toolDefinitions: 14},
+    slimSavingsBytes: {images: 768, toolOutputs: 256, requestRecords: 768, hooks: 256, toolDefinitions: 768}};
   second.actions = [history];
   first.actions.push({...history, estimatedSavingsBytes: 1024, slimOptions: {removeImages: true, compactTools: true, removeReasoning: true},
     slimCounts: {images: 3, toolOutputs: 2, reasoning: 2}, slimSavingsBytes: {images: 512, toolOutputs: 256, reasoning: 256}});
@@ -998,14 +999,17 @@ test('cleanup categories combine providers and temporary roots without double-co
   assert.match(text, /256 B\s+Remove encrypted reasoning \(Codex\) · 2 blocks/);
   assert.match(text, /768 B\s+Remove API request archives \(Claude\) · 3 records/);
   assert.match(text, /256 B\s+Compact successful hooks \(Claude\) · 1 hooks/);
+  assert.match(text, /768 B\s+Compact tool definitions \(Claude\) · 14 definitions/);
+  assert.match(text, /Historical tool definitions.*unavailable/);
+  assert.match(text, /Resume may use current definitions.*cost more/);
   assert.match(text, /exact historical requests cannot be reconstructed/);
   assert.match(text, /Resumed context may differ/);
   assert.match(text, /1\.00 KiB \+ unknown \(1 item\)\s+Compress PNGs \(lossless\) · 2 files/);
   assert.match(text, /2\.00 KiB\s+Remove temporary task outputs · 2 files/);
   assert.match(text, /1\.00 KiB\s+Remove temporary hook outputs · 1 files/);
   assert.match(text, /2\.00 KiB\s+Remove session-created temporary outputs · 2 files/);
-  assert.match(text, /9\.00 KiB \+ unknown \(1 item\)\s+Total estimated savings/);
-  for (const label of ['Estimated savings by operation', 'Remove inline images', 'Compact shell output', 'Remove encrypted reasoning', 'Remove API request archives', 'Compact successful hooks', 'Remove temporary task outputs', 'Remove session-created temporary outputs', 'Total estimated savings', 'Scan notes ·']) {
+  assert.match(text, /9\.75 KiB \+ unknown \(1 item\)\s+Total estimated savings/);
+  for (const label of ['Estimated savings by operation', 'Remove inline images', 'Compact shell output', 'Remove encrypted reasoning', 'Remove API request archives', 'Compact successful hooks', 'Compact tool definitions', 'Remove temporary task outputs', 'Remove session-created temporary outputs', 'Total estimated savings', 'Scan notes ·']) {
     assert.equal(text.split(label).length - 1, 1, `${label} appears once across all roots`);
   }
   assert.match(text, /2 × Kept unchanged/);

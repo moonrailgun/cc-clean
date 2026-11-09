@@ -2,9 +2,9 @@ import type { Provider } from './types.ts';
 import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
-export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean }
-export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number }
-export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number }
+export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean }
+export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
@@ -35,6 +35,31 @@ function knownSuccessfulHook(row: Row): boolean {
     Object.keys(hook).every(key => ['type', 'hookName', 'hookEvent', 'toolUseID', 'command', 'content', 'stdout', 'stderr', 'exitCode', 'durationMs'].includes(key)) &&
     (row.rendered === undefined || Array.isArray(row.rendered) && row.rendered.every((item: unknown) =>
       object(item) && Object.keys(item).every(key => key === 'content') && typeof item.content === 'string'));
+}
+
+function knownContextAttachment(row: Row): boolean {
+  return row.type === 'attachment' && object(row.attachment) &&
+    typeof row.uuid === 'string' && !!row.uuid && typeof row.sessionId === 'string' && !!row.sessionId &&
+    (row.parentUuid === null || typeof row.parentUuid === 'string') &&
+    (row.rendered === undefined || Array.isArray(row.rendered) && row.rendered.every((item: unknown) =>
+      object(item) && Object.keys(item).every(key => key === 'content') && typeof item.content === 'string'));
+}
+
+function knownToolSnapshot(row: Row): boolean {
+  if (!knownContextAttachment(row)) return false;
+  const snapshot = row.attachment;
+  const flags = ['reminderFold', 'systemTurns', 'toolChangeHeader', 'inlineTools', 'keptReminders', 'echoWireToolInputs'];
+  return snapshot.type === 'prompt_snapshot' &&
+    Object.keys(snapshot).every(key => ['type', 'systemPrompt', 'tools', 'cliPrefix', 'contextRendering', ...flags].includes(key)) &&
+    flags.every(key => snapshot[key] === undefined || typeof snapshot[key] === 'boolean') &&
+    ['cliPrefix', 'contextRendering'].every(key => snapshot[key] === undefined || typeof snapshot[key] === 'string') &&
+    Array.isArray(snapshot.systemPrompt) && snapshot.systemPrompt.every((part: unknown) => typeof part === 'string') &&
+    Array.isArray(snapshot.tools) && snapshot.tools.length > 0 && snapshot.tools.every((tool: unknown) =>
+      object(tool) && Object.keys(tool).every(key => ['name', 'description', 'schema'].includes(key)) &&
+      typeof tool.name === 'string' && !!tool.name && typeof tool.description === 'string' && object(tool.schema) &&
+      tool.schema.name === tool.name && typeof tool.schema.description === 'string' && object(tool.schema.input_schema) &&
+      (tool.schema.eager_input_streaming === undefined || typeof tool.schema.eager_input_streaming === 'boolean') &&
+      Object.keys(tool.schema).every(key => ['name', 'description', 'input_schema', 'eager_input_streaming'].includes(key)));
 }
 
 // Record value spans so untouched fields (including signatures and large numeric
@@ -204,6 +229,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   if (options.removeReasoning) { counts.reasoning = 0; savingsBytes.reasoning = 0; }
   if (options.removeRequestArchives) { counts.requestRecords = 0; savingsBytes.requestRecords = 0; }
   if (options.compactHooks) { counts.hooks = 0; savingsBytes.hooks = 0; }
+  if (options.compactToolDefinitions) { counts.toolDefinitions = 0; savingsBytes.toolDefinitions = 0; }
   const requestLines = new Set<number>();
   let requestsKnown = true, conversationRecords = 0;
   const calls = new Map<string, RtkFilter | undefined>();
@@ -248,6 +274,8 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
         if (row.rendered !== undefined && parsed.replace(row, 'rendered', [], 'hooks')) changed = true;
         if (changed) counts.hooks!++;
       }
+      if (options.compactToolDefinitions && knownToolSnapshot(row) && parsed.replace(row.attachment, 'tools', [], 'toolDefinitions'))
+        counts.toolDefinitions! += row.attachment.tools.length;
       if (['user', 'assistant'].includes(row.type) && object(row.message) && Array.isArray(row.message.content)) {
         const content = row.message.content;
         replaceImages(content, false);
@@ -320,6 +348,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     savingsBytes.toolOutputs += parsed.savingsBytes.toolOutputs;
     if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
     if (options.compactHooks) savingsBytes.hooks! += parsed.savingsBytes.hooks ?? 0;
+    if (options.compactToolDefinitions) savingsBytes.toolDefinitions! += parsed.savingsBytes.toolDefinitions ?? 0;
   }
   if (!records || !session) throw new Error('History format or session identity could not be established');
   // Remove the entire known archive family together; unknown siblings may still reference it.
