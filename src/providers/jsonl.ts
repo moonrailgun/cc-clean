@@ -5,7 +5,7 @@ import { basename, isAbsolute } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import type { FileEntry, Provider, Usage } from '../types.ts';
 
-export const PARSER_VERSION = 5;
+export const PARSER_VERSION = 6;
 const MAX_LINE = 8 * 1024 * 1024;
 const METADATA_BYTES = 1024 * 1024;
 const MAX_IDENTITIES = 100_000;
@@ -54,7 +54,7 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
   const toolEvents = new Map<string, {date: string; model: string}>();
   const requests = new Map<string, {tokens: Tokens; date: string; model: string}>();
   const tokenEvents = new Map<string, {tokens: Tokens; date: string; model: string}>();
-  let previousTokens: Tokens | undefined, malformed = 0, oversized = 0, validRecords = 0, identified = false;
+  let previousTokens: Tokens | undefined, malformed = 0, oversized = 0, validRecords = 0, identified = false, readFailed = false;
   let model = 'unknown', lineNumber = 0;
   const warn = (message: string) => { if (!result.warnings.includes(message)) result.warnings.push(message); };
   const incomplete = (message: string) => { result.complete = false; warn(message); };
@@ -91,7 +91,9 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
   }
   function fieldsFor(row: Row) {
     for (const [key, value] of Object.entries(row)) {
-      const children = value && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value).map(([name, item]) => [`${key}.${name}`, item] as const) : [[key, value] as const];
+      // These maps are keyed by tool-call IDs, not schema fields.
+      const toolMap = provider === 'claude' && ['wireToolInputs', 'wireIngestContext'].includes(key);
+      const children = !toolMap && value && typeof value === 'object' && !Array.isArray(value) ? Object.entries(value).map(([name, item]) => [`${key}.${name}`, item] as const) : [[key, value] as const];
       for (const [path, item] of children) {
         if (fields.size >= MAX_GROUPS && !fields.has(path)) { incomplete('Field group limit reached'); continue; }
         const existing = fields.get(path) ?? { path, bytes: 0, count: 0 };
@@ -221,13 +223,13 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
     if (!deep && !onRecord && file.size > METADATA_BYTES) incomplete('Metadata sample covers first 1 MiB only; full session structure is unverified');
     const after = await handle.stat();
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) incomplete('File changed during analysis');
-  } catch (error) { incomplete(`Cannot read session: ${(error as NodeJS.ErrnoException).code ?? 'read failed'}`); }
+  } catch (error) { readFailed = true; incomplete(`Cannot read session: ${(error as NodeJS.ErrnoException).code ?? 'read failed'}`); }
   finally { await handle?.close().catch(() => {}); }
   if (signal?.aborted) { incomplete('Analysis interrupted'); return result; }
   if (malformed) incomplete(`${malformed} malformed JSONL line(s)`);
   if (oversized) incomplete(`${oversized} oversized JSONL line(s) skipped (8 MiB limit)`);
-  if (!validRecords) incomplete('No readable session records');
-  if (!identified) incomplete('No recognized provider session identity');
+  if (!readFailed && !validRecords) incomplete('No readable session records');
+  if (!readFailed && !identified) incomplete('No recognized provider session identity');
   for (let i = 0; i < result.observedProjects.length; i++) result.observedProjects[i] = await realpath(result.observedProjects[i]).catch(() => result.observedProjects[i]);
   result.observedProjects = [...new Set(result.observedProjects)];
   result.project = result.observedProjects[0] ?? null;

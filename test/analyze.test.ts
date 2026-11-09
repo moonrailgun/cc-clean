@@ -496,3 +496,53 @@ test('Codex metadata versions do not hide identity conflicts or block consistent
     assert.equal(await readFile(path, 'utf8'), content);
   }
 });
+
+
+test('Claude workflow journals remain inventoried without being parsed as conversations', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main' }]));
+  const journal = await file(root, 'projects/p/main/subagents/workflows/wf-one/journal.jsonl', jsonl([{ event: 'started' }]));
+  await file(root, 'projects/p/main/subagents/agent-child.jsonl', jsonl([{ type: 'user', sessionId: 'main', agentId: 'child' }]));
+  const inventory = await scanRoot(root, 'claude');
+  assert.equal(inventory.files.find(f => f.path === journal)?.category, 'attachments');
+  const result = await analyze(inventory, { deep: true });
+  assert.equal(result.scanComplete, true);
+  assert.deepEqual(result.sessions.map(s => s.id).sort(), ['child', 'main']);
+  assert.ok(result.sessions.every(s => s.files.every(f => f.path !== journal)));
+  assert.equal(result.fileCount, 3);
+  await file(root, 'projects/p/unknown.jsonl', jsonl([{ event: 'unknown' }]));
+  const unknown = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(unknown.scanComplete, false, 'unrecognized transcript files must still be reported');
+});
+
+
+test('Claude tool-ID maps are counted as fields without exhausting the field group limit', async t => {
+  const root = await fixture(t);
+  const wireToolInputs = Object.fromEntries(Array.from({ length: 1100 }, (_, i) => [`toolu_${i}`, { command: 'private command' }]));
+  const wireIngestContext = Object.fromEntries(Array.from({ length: 1100 }, (_, i) => [`toolu_${i}`, { source: 'private context' }]));
+  await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main', wireToolInputs, wireIngestContext, message: { content: 'hello' } }]));
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(result.scanComplete, true);
+  for (const [path, value] of Object.entries({ wireToolInputs, wireIngestContext })) {
+    assert.deepEqual(result.opportunities.fields.find(f => f.path === path), { path, bytes: Buffer.byteLength(JSON.stringify(value)), count: 1 });
+  }
+  assert.ok(result.opportunities.fields.some(f => f.path === 'message.content'));
+  assert.ok(result.opportunities.fields.every(f => !f.path.includes('toolu_')));
+});
+
+
+test('changed or unreadable transcripts report the read failure without cascading identity warnings', async t => {
+  const root = await fixture(t);
+  const path = await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main' }]));
+  const inventory = await scanRoot(root, 'claude');
+  await writeFile(path, 'changed');
+  const changed = await parseSession(inventory.files[0], 'claude', true);
+  assert.equal(changed.complete, false);
+  assert.deepEqual(changed.warnings, ['Cannot read session: FILE_CHANGED']);
+  const unreadable = await parseSession({ ...inventory.files[0], path: join(root, 'missing.jsonl') }, 'claude', true);
+  assert.equal(unreadable.complete, false);
+  assert.deepEqual(unreadable.warnings, ['Cannot read session: ENOENT']);
+  const malformed = await parseSession((await scanRoot(root, 'claude')).files[0], 'claude', true);
+  assert.equal(malformed.complete, false);
+  assert.ok(malformed.warnings.some(w => w.includes('malformed JSONL')));
+});
