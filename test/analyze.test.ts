@@ -589,7 +589,7 @@ test('orphaned index spawn edges remain visible as incomplete children', async t
 
 test('external Codex SQLite configuration is reported as incomplete coverage', async t => {
   const root = await fixture(t);
-  await file(root, 'config.toml', 'sqlite_home = "/elsewhere"\n');
+  await file(root, 'config.toml', '"sqlite_home" = "/elsewhere"\n');
   const db = new DatabaseSync(join(root, 'state_5.sqlite'));
   db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
   db.close();
