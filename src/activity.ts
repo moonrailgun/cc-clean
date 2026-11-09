@@ -2,13 +2,21 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { Provider } from './types.ts';
 import { claudeActiveSessions, claudeSessionOwner, type ActivityCommand, type ActivityMetadata } from './claude-activity.ts';
+import { codexActiveSessions, codexSessionOwners } from './codex-activity.ts';
 const exec=promisify(execFile);
-export type ActivityResult=string|null|{sessionIds:string[];openFiles:string[]};
+export type ActivityResult=string|null|{sessionIds:string[];openFiles:string[];codexOwners?:Record<string,string[]>};
 export type ActivityCheck=(provider:Provider,root:string,files?:string[])=>Promise<ActivityResult>;
 export function activityReason(result:ActivityResult,root:string,files:string[],sessionIds:string[]=[],ownershipPaths=files):string|null {
   if(typeof result==='string'||result===null)return result;
   if(result.openFiles.some(path=>files.includes(path)))return 'Candidate contains open files; close the writer first';
   if(!result.sessionIds.length)return null;
+  if(result.codexOwners) {
+    const owners=files.map(path=>result.codexOwners![path]??[]);
+    const active=[...sessionIds.map(id=>id.toLowerCase()),...owners.flat()].find(id=>result.sessionIds.includes(id));
+    if(active)return `Codex active session ${active} owns this operation; idle open sessions remain protected`;
+    if(!owners.length||owners.some(ids=>!ids.length))return 'Cannot associate candidate files with a Codex session while clients are running';
+    return null;
+  }
   const owners=ownershipPaths.map(path=>claudeSessionOwner(root,path));
   const active=[...sessionIds.map(id=>id.toLowerCase()),...owners].find(id=>id&&result.sessionIds.includes(id));
   if(active)return `Claude active session ${active} owns this operation; idle open sessions remain protected`;
@@ -33,10 +41,9 @@ export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platf
     }
     let sessionIds:string[]=[];
     if(running) {
-      if(provider==='codex')return `${provider} client or service is running and may own idle open sessions; close it and retry`;
-      try {sessionIds=await claudeActiveSessions(run,root,readMetadata);}
-      catch {return 'Cannot reliably associate every Claude client or service with its idle open session; provider retained';}
-      if(!files)return 'Claude clients are running; candidate paths are required for session activity checks';
+      try {sessionIds=provider==='codex'?await codexActiveSessions(run,root):await claudeActiveSessions(run,root,readMetadata);}
+      catch {return `Cannot reliably associate every ${provider==='codex'?'Codex':'Claude'} client or service with its idle open session; provider retained`;}
+      if(!files)return 'Clients are running; candidate paths are required for session activity checks';
     }
     // Explicit files must never fall back to a recursive scan of a shared system temp directory.
     const targets = files ? Array.from({length: Math.ceil(files.length / 100)}, (_, i) => ['--', ...files.slice(i * 100, (i + 1) * 100)]) : [['+D', root]];
@@ -61,7 +68,7 @@ export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platf
         openFiles.push(...names);
       }
     }
-    return sessionIds.length||openFiles.length?{sessionIds,openFiles:[...new Set(openFiles)]}:null;
+    return sessionIds.length||openFiles.length?{sessionIds,openFiles:[...new Set(openFiles)],...provider==='codex'?{codexOwners:await codexSessionOwners(sessionIds.length?files??[]:[])}:{}}:null;
   } catch {return 'Cannot reliably check client activity';}
 };
 export const checkActivity=createActivityCheck();

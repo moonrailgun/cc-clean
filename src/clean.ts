@@ -338,10 +338,7 @@ async function planActivity(p:Plan,check:ActivityCheck,actions=p.actions,openPat
   for(const provider of p.systemTemp?.session?['claude','codex'] as const:[p.provider]) {
     const root=p.systemTemp?.session?.roots[provider]??p.root;
     const paths=openPaths??actions.flatMap(a=>a.files.map(f=>f.path));
-    const codexRoot=provider==='codex'&&!p.systemTemp;
-    let result=await check(provider,root,codexRoot?undefined:paths).catch(()=>'Cannot reliably check client activity');
-    // Codex still protects the whole root, including index writers; transaction copies can be outside it.
-    if(!result&&codexRoot&&openPaths?.length)result=await check(provider,root,openPaths).catch(()=>'Cannot reliably check client activity');
+    const result=await check(provider,root,paths).catch(()=>'Cannot reliably check client activity');
     for(const a of actions) {
       const ownedPaths=p.systemTemp?.session?[p.systemTemp.session.source]:a.files.map(f=>f.path);
       const reason=activityReason(result,root,openPaths??a.files.map(f=>f.path),a.sessionIds,ownedPaths);

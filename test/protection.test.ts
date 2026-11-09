@@ -123,7 +123,7 @@ test('external system temps retain strict bulk age protection even for one or an
 
 
 test('activity protection excludes all estimates and cannot be bypassed by a single target or lossless operation', async () => {
-  for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'compress-png'] as const) {
+  for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'compress-png', 'deduplicate-history'] as const) {
     const p = plan([action(kind, cutoff - 1)], '/inert/file');
     p.warnings.push('Existing warning');
     await protectActiveContent(p, async () => 'Client still owns an idle session');
@@ -155,15 +155,16 @@ test('activity filtering supplies only candidate paths for external temporary fi
 });
 
 
-test('ordinary Codex activity retains the provider directory inspection', async () => {
-  const p = plan([action('slim-history', cutoff - 1)]);
+test('Codex checks candidate files and protects only their open session identities', async () => {
+  const active = action('slim-history', cutoff - 1), closed = action('slim-history', cutoff - 1, '/inert/sessions/closed.jsonl');
+  const p = plan([active,closed]);
   await protectActiveContent(p, async (provider, root, files) => {
     assert.equal(provider, 'codex'); assert.equal(root, p.root);
-    assert.equal(files, undefined);
-    return 'Index has an open writer';
+    assert.deepEqual(files, [active.files[0].path,closed.files[0].path]);
+    return {sessionIds:[session],openFiles:[],codexOwners:{[active.files[0].path]:[session],[closed.files[0].path]:['closed']}};
   });
-  assert.deepEqual(p.actions, []);
-  assert.match(p.warnings.join('\n'), /Index has an open writer/);
+  assert.deepEqual(p.actions, [closed]);
+  assert.match(p.warnings.join('\n'), /Codex active session/);
 });
 
 const sessionTemp: SessionTempEvidence = {path: '/inert', kind: 'directory', callId: 'exec-1', startedAt: 1, completedAt: 1,

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createActivityCheck, activityReason } from '../src/activity.ts';
 import { readActivityMetadata } from '../src/claude-activity.ts';
+import { codexActiveSessions, codexSessionOwners } from '../src/codex-activity.ts';
+import { zstdCompressSync } from 'node:zlib';
 
 // Mock OS results and disposable metadata only; never run cleanup or native clients.
 function fixture(commands = '/bin/zsh\n', args = '', opened = '') {
@@ -92,6 +94,107 @@ test('open-file inspection excludes its own transaction but retains external wri
 
 const active = '11111111-1111-4111-8111-111111111111', source = '22222222-2222-4222-8222-222222222222';
 const start = 'Mon Nov  9 02:40:18 2026', uid = process.getuid!();
+function codexFixture() {
+  const rows = [{pid: 10, ppid: 1, uid, start, comm: '/tools/codex', args: '/tools/codex'}];
+  let locks = [active], version = 'codex-cli 0.167.0', changing = false, snapshots = 0;
+  const run = async (file: string, args: string[]) => {
+    if (file === '/tools/codex') return {stdout: version};
+    if (args.includes('comm=')) return {stdout:rows.map(p=>p.comm).join('\n')};
+    if (file.endsWith('stat')) return {stdout: '1:2'};
+    if (file.endsWith('lsof')) {
+      if(args.includes('--'))throw Object.assign(new Error('No open candidates'),{code:1,stdout:'',stderr:''});
+      return {stdout: rows.map(p => `p${p.pid}\nftxt\nD0x1\ni2\nn${p.comm}\n` + (p.pid === 10 ? locks.map(id => `f20\nn/codex/thread-writer-locks/${id}.lock\n`).join('') : '')).join('')};
+    }
+    if (args.some(a => a.includes('lstart'))) {
+      snapshots++;
+      return {stdout: rows.map(p => `${p.pid} ${p.ppid} ${p.uid} ${changing && snapshots > 1 ? 'Tue Nov 10 02:40:18 2026' : p.start} ${p.comm}`).join('\n')};
+    }
+    return {stdout: rows.map(p => `${p.pid} ${p.args}`).join('\n')};
+  };
+  return {rows, run, setLocks: (ids: string[]) => {locks = ids;}, setVersion: (s: string) => {version = s;}, change: () => {changing = true;}};
+}
+
+test('Codex writer locks protect idle sessions and empty modern services do not protect all history', async () => {
+  const f = codexFixture();
+  f.rows.push({pid: 20, ppid: 1, uid, start, comm: '/tools/codex', args: '/tools/codex app-server --listen stdio://'});
+  f.rows.push({pid: 30, ppid: 10, uid, start, comm: '/tools/codex-code-mode-host', args: '/tools/codex-code-mode-host'});
+  f.rows[0].ppid = 40;
+  f.rows.push({pid: 40, ppid: 1, uid, start, comm: '/tools/node', args: 'node /tools/node_modules/@openai/codex/bin/codex.js'});
+  assert.deepEqual(await codexActiveSessions(f.run, '/codex'), [active]);
+  f.setLocks([]);
+  f.setVersion('codex-cli 0.164.0-alpha.11.1');
+  assert.deepEqual(await codexActiveSessions(f.run, '/codex'), []);
+});
+
+test('Codex unknown protocols, helpers, changing processes and lock transitions fail closed', async () => {
+  for (const change of [
+    (f: ReturnType<typeof codexFixture>) => {f.setLocks([]); f.setVersion('codex-cli 0.100.0');},
+    f => {f.setLocks([]); f.setVersion('codex-cli unknown');},
+    f => {f.setLocks([]); f.setVersion('codex-cli 0.164.0-alpha.10');},
+    f => f.change(),
+    f => f.setLocks(['.coordination']),
+    f => f.setLocks(['invalid']),
+    f => {f.rows[0].uid++;},
+    f => {f.rows.push({pid: 30, ppid: 1, uid, start, comm: '/tools/codex-code-mode-host', args: '/tools/codex-code-mode-host'});},
+  ] as ((f: ReturnType<typeof codexFixture>) => void)[]) {
+    const f = codexFixture(); change(f);
+    await assert.rejects(codexActiveSessions(f.run, '/codex'));
+  }
+});
+
+test('held native session locks survive npm upgrades, but empty services require the loaded executable', async () => {
+  const f = codexFixture();
+  const run = async (file: string, args: string[]) => {
+    if(file.endsWith('stat')||args.includes('--version'))throw new Error('Old executable was removed');
+    const result = await f.run(file,args);
+    return file.endsWith('lsof') ? {stdout:result.stdout.replace('n/tools/codex\n','n/tools/.old-package/codex\n')} : result;
+  };
+  assert.deepEqual(await codexActiveSessions(run, '/codex'), [active]);
+  f.setLocks([]);
+  await assert.rejects(codexActiveSessions(run, '/codex'));
+});
+
+test('Codex rollout and stable session identities protect original files and transaction copies', () => {
+  const closed = '/codex/sessions/closed.jsonl', backup = '/state/work/0.original';
+  const result = {sessionIds: [active], openFiles: [], codexOwners: {[closed]: [source], [backup]: ['rollout-id', active]}};
+  assert.equal(activityReason(result, '/codex', [closed]), null);
+  assert.match(activityReason(result, '/codex', [backup])!, /Codex active session/);
+  assert.match(activityReason(result, '/codex', ['/codex/unknown.png'])!, /Cannot associate/);
+});
+
+test('Codex activity reads stable identities from plain, compressed and renamed transaction copies', async t => {
+  const root=await realpath(await mkdtemp(join(tmpdir(),'cc-clean-codex-activity-')));
+  t.after(()=>rm(root,{recursive:true,force:true}));
+  const data=Buffer.from(JSON.stringify({type:'session_meta',payload:{id:source,session_id:active}})+'\n');
+  const files=[join(root,'rollout.jsonl'),join(root,'rollout.jsonl.zst'),join(root,'0.original'),join(root,'output')];
+  for(const [i,path] of files.entries())await writeFile(path,i%2?zstdCompressSync(data):data);
+  const unknown=join(root,'unknown'),linked=join(root,'linked.jsonl'),closed=join(root,'closed.jsonl');
+  await writeFile(unknown,'unrecognized metadata');await symlink(files[0],linked);
+  await writeFile(closed,JSON.stringify({type:'session_meta',payload:{id:source}})+'\n');
+  const owners=await codexSessionOwners([...files,unknown,linked,closed]);
+  for(const path of files)assert.deepEqual(owners[path],[source,active]);
+  for(const path of [unknown,linked])assert.deepEqual(owners[path],[]);
+  const f=codexFixture(),result=await createActivityCheck(f.run,'darwin')('codex','/codex',[...files,unknown,closed]);
+  for(const path of files)assert.match(activityReason(result,'/codex',[path])!,/Codex active session/);
+  assert.match(activityReason(result,'/codex',[unknown])!,/Cannot associate/);
+  assert.equal(activityReason(result,'/codex',[closed]),null);
+});
+
+test('Codex incomplete descriptors, changed executables and unaccounted wrappers remain protected', async () => {
+  for(const alter of [
+    (s:string)=>s.replaceAll('ftxt','fmem'),
+    (s:string)=>s.replaceAll('i2','i3'),
+    (s:string)=>s+'invalid field\n',
+  ]) {
+    const f=codexFixture();f.setLocks([]);
+    await assert.rejects(codexActiveSessions(async(file,args)=>{
+      const result=await f.run(file,args);return file.endsWith('lsof')?{stdout:alter(result.stdout)}:result;
+    },'/codex'));
+  }
+  const f=codexFixture();
+  f.rows.push({pid:50,ppid:1,uid,start,comm:'/tools/node',args:'node /tools/node_modules/@openai/codex/bin/codex.js'});
+  await assert.rejects(codexActiveSessions(f.run,'/codex'));
+});
 function registeredFixture() {
   const rows = [{pid: 10, ppid: 1, uid, start, comm: 'claude', args: 'claude'}];
   const metadata: Record<string, any> = {'sessions/10.json': {pid: 10, procStart: start, sessionId: active, kind: 'interactive', pidDomain: 'darwin'}};

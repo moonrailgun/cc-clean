@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, utimes, symlink, link, access } fr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { scanRoot } from '../src/scan.ts';
-import { createPlan, executePlan, recoverOperations } from '../src/clean.ts';
+import { createPlan as createPlanWithActivity, executePlan, recoverOperations } from '../src/clean.ts';
 import { readStats } from '../src/stats.ts';
 import { readCleanupLog } from '../src/history.ts';
 
@@ -18,6 +18,8 @@ async function fixture() {
   return {base, root, stateDir, path, now};
 }
 const inactive = async () => null;
+const createPlan: typeof createPlanWithActivity = (inventory, options = {}) =>
+  createPlanWithActivity(inventory, {...options, checkActivity: inactive});
 
 test('Quick clean combines history slimming with existing rules while standalone slimming stays scoped', async () => {
   const f = await fixture(), history = join(f.root, 'sessions', 'example.jsonl');

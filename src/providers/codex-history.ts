@@ -39,12 +39,13 @@ export async function decodeDuplicateHistory(compressed: Buffer, limit: number, 
   }
   return Buffer.concat(chunks, size);
 }
+
+type HeaderFile=Pick<FileEntry,'path'|'dev'|'ino'|'size'|'mtimeMs'|'ctimeMs'|'nlink'>;
 const snapshotKeys=['dev','ino','size','mtimeMs','ctimeMs','nlink'] as const;
-export async function readCodexHeader(file: FileEntry, signal?: AbortSignal, options:{allowAppend?:boolean}={}): Promise<Record<string, any>> {
+export async function readCodexHeader(file: HeaderFile, signal?: AbortSignal, options:{allowAppend?:boolean;detectCompression?:boolean}={}): Promise<Record<string, any>> {
   if (await realpath(file.path) !== file.path) throw new Error('Codex history path changed');
   const handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  const compressed=file.path.endsWith('.zst');
-  let size=file.size;
+  let compressed=file.path.endsWith('.zst'),size=file.size;
   const unchanged = async (strict=false) => {
     for (const stat of [await handle.stat(), await lstat(file.path)]) {
       const append=options.allowAppend&&!compressed&&!strict;
@@ -54,6 +55,10 @@ export async function readCodexHeader(file: FileEntry, signal?: AbortSignal, opt
     }
   };
   try {
+    if(options.detectCompression) {
+      const magic=Buffer.alloc(4);await handle.read(magic,0,4,0);
+      compressed=magic.readUInt32LE(0)===0xfd2fb528;
+    }
     await unchanged();
     const source = handle.createReadStream({autoClose: false, start:0, highWaterMark: 16 * 1024, signal});
     const decoder = compressed ? createZstdDecompress({chunkSize: 16 * 1024}) : undefined;

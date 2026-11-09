@@ -48,7 +48,7 @@ export const readActivityMetadata:ActivityMetadata=async(root,path)=>{
 };
 
 interface Process {pid:number;ppid:number;uid:number;start:string;comm:string;args:string}
-async function processes(run:ActivityCommand):Promise<Process[]> {
+export async function readActivityProcesses(run:ActivityCommand,nativePattern=native,npmPattern=npm):Promise<Process[]> {
   const options={timeout:5000,maxBuffer:4*1024*1024,env:{...process.env,TZ:'UTC',LC_ALL:'C'}};
   const {stdout}=await run('/bin/ps',['-axo','pid=,ppid=,uid=,lstart=,comm='],options);
   if(!stdout.trim())fail();
@@ -56,17 +56,17 @@ async function processes(run:ActivityCommand):Promise<Process[]> {
     const m=/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+?)\s*$/.exec(line);
     if(!m)fail();
     return {pid:Number(m[1]),ppid:Number(m[2]),uid:Number(m[3]),start:normalize(m[4]),comm:m[5],args:''};
-  }).filter(p=>native.test(p.comm)||runtime.test(p.comm));
+  }).filter(p=>nativePattern.test(p.comm)||runtime.test(p.comm));
   const {stdout:args}=await run('/bin/ps',['-axww','-o','pid=,args='],options);
   const byPid=new Map(args.trim().split('\n').map(line=>{
     const m=/^\s*(\d+)\s+(.+)$/.exec(line);if(!m)fail();return [Number(m[1]),m[2]];
   }));
   for(const p of rows){const args=byPid.get(p.pid);if(!args)fail();p.args=args;}
-  return rows.filter(p=>native.test(p.comm)||npm.test(p.args)).sort((a,b)=>a.pid-b.pid);
+  return rows.filter(p=>nativePattern.test(p.comm)||npmPattern.test(p.args)).sort((a,b)=>a.pid-b.pid);
 }
 
 async function snapshot(run:ActivityCommand,root:string,read:ActivityMetadata) {
-  const rows=await processes(run),uid=process.getuid?.(),ids=new Set<string>(),owned=new Map<number,string>(),proof:unknown[]=[];
+  const rows=await readActivityProcesses(run),uid=process.getuid?.(),ids=new Set<string>(),owned=new Map<number,string>(),proof:unknown[]=[];
   if(rows.some(p=>p.uid!==uid))fail();
   const matching=(pid:unknown,start:unknown)=>rows.find(p=>p.pid===pid&&p.start===normalize(start));
   const add=(id:unknown)=>{if(typeof id!=='string'||!uuid.test(id))fail();ids.add(id.toLowerCase());return id.toLowerCase();};
