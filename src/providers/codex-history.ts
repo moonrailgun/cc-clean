@@ -7,6 +7,7 @@ import { createZstdDecompress } from 'node:zlib';
 import { Readable } from 'node:stream';
 import type { FileEntry, Inventory } from '../types.ts';
 import { assertCodexMeta, slimCodexItem, MAX_HISTORY_BYTES, type SlimOptions } from '../slim.ts';
+import { physicalKey } from '../scan.ts';
 import { existingDir } from '../state.ts';
 import { verifyCodexSqliteLocation } from './codex.ts';
 
@@ -38,19 +39,24 @@ export async function decodeDuplicateHistory(compressed: Buffer, limit: number, 
   }
   return Buffer.concat(chunks, size);
 }
-export async function readCodexHeader(file: FileEntry, signal?: AbortSignal): Promise<Record<string, any>> {
+const snapshotKeys=['dev','ino','size','mtimeMs','ctimeMs','nlink'] as const;
+export async function readCodexHeader(file: FileEntry, signal?: AbortSignal, options:{allowAppend?:boolean}={}): Promise<Record<string, any>> {
   if (await realpath(file.path) !== file.path) throw new Error('Codex history path changed');
   const handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  const unchanged = async () => {
+  const compressed=file.path.endsWith('.zst');
+  let size=file.size;
+  const unchanged = async (strict=false) => {
     for (const stat of [await handle.stat(), await lstat(file.path)]) {
-      if (!stat.isFile() || stat.isSymbolicLink() || ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'nlink'].some(k => stat[k as keyof typeof stat] !== file[k as keyof FileEntry]))
+      const append=options.allowAppend&&!compressed&&!strict;
+      if (!stat.isFile() || stat.isSymbolicLink() || (append?(['dev','ino'] as const):snapshotKeys).some(k => stat[k] !== file[k]) || append&&stat.size<size)
         throw new Error('Codex history changed during header inspection');
+      size=stat.size;
     }
   };
   try {
     await unchanged();
-    const source = handle.createReadStream({autoClose: false, highWaterMark: 16 * 1024, signal});
-    const decoder = file.path.endsWith('.zst') ? createZstdDecompress({chunkSize: 16 * 1024}) : undefined;
+    const source = handle.createReadStream({autoClose: false, start:0, highWaterMark: 16 * 1024, signal});
+    const decoder = compressed ? createZstdDecompress({chunkSize: 16 * 1024}) : undefined;
     const stream = decoder ? source.pipe(decoder) : source;
     if (decoder) source.on('error', error => decoder.destroy(error));
     let buffer = Buffer.alloc(0), found = false;
@@ -63,7 +69,14 @@ export async function readCodexHeader(file: FileEntry, signal?: AbortSignal): Pr
         if (newline >= 0) { found = true; break; }
       }
       if (!found && !buffer.length) throw new Error('Codex history header is empty');
-      await unchanged();
+      if(options.allowAppend&&!compressed) {
+        // Growth or link changes are safe to inspect only while the identity/reference header stays identical.
+        if(!found)await unchanged(true);
+        const expected=found?Buffer.concat([buffer,Buffer.from('\n')]):buffer,again=Buffer.alloc(expected.length);
+        const {bytesRead}=await handle.read(again,0,again.length,0);
+        if(bytesRead!==expected.length||!again.equals(expected))throw new Error('Codex history header changed during inspection');
+      }
+      await unchanged(!found);
       const row = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(buffer));
       if (row.type !== 'session_meta' || typeof row.payload?.id !== 'string' || !row.payload.id)
         throw new Error('Codex history header has no recognized identity');
@@ -78,11 +91,20 @@ export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSig
   if (inv.links.some(l => /^(?:(?:sessions|archived_sessions)(?:\/|$)|config\.toml$|thread_history_.*\.sqlite)/.test(relative(inv.root, l.path))))
     throw new Error('Linked Codex history or configuration prevents complete reference inspection');
   await verifyCodexSqliteLocation(inv);
+  const physical = new Map<string, FileEntry[]>();
+  for (const f of inv.files) physical.set(physicalKey(f), [...physical.get(physicalKey(f)) ?? [], f]);
   const blocked = new Map<string, string>(), owners = new Map<string, string[]>(), aliases = new Map<string, string[]>(), references = new Set<string>();
   for (const file of inv.files.filter(f => historyPath.test(f.relative))) {
     signal?.throwIfAborted();
     let row;
-    try { row = await readCodexHeader(file, signal); }
+    try {
+      row = await readCodexHeader(file, signal, {allowAppend:true});
+      const stat=await lstat(file.path);
+      if(!stat.isFile()||stat.isSymbolicLink()||(['dev','ino'] as const).some(k=>stat[k]!==file[k])||stat.size<file.size||file.path.endsWith('.zst')&&stat.nlink!==file.nlink)
+        throw new Error('Codex history changed during header inspection');
+      if(snapshotKeys.some(k=>stat[k]!==file[k]))for(const alias of physical.get(physicalKey(file))!)
+        blocked.set(alias.path,'History changed since scan; only its stable header was inspected');
+    }
     catch (error) { throw new Error(`${file.relative}: cannot inspect inbound history references: ${(error as Error).message}`); }
     const meta = row.payload;
     owners.set(meta.id, [...(owners.get(meta.id) ?? []), file.path]);

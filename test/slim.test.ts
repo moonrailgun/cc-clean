@@ -435,7 +435,7 @@ test('Codex layout checks all synthetic headers and config without changing file
   await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
   const stale = await scanRoot(root, 'codex');
   await writeFile(current, jsonl(meta, codex({type: 'message', content: []})));
-  await assert.rejects(verifyCodexRewriteLayout(stale), /changed/);
+  assert.equal((await verifyCodexRewriteLayout(stale)).has(current), true);
 });
 
 test('Codex layout parses TOML keys and strings without unrelated config false positives', async t => {
