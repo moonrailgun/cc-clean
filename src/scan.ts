@@ -7,7 +7,7 @@ function category(path: string, provider: Provider): string {
   if (top === 'plugins' || top === 'packages' || top === 'skills') return 'plugins';
   if (/\.(?:sqlite|db)(?:-wal|-shm)?$/.test(path)) return 'databases';
   if (provider === 'claude' && /^projects\/[^/]+\/[^/]+\/subagents\/workflows\/[^/]+\/journal\.jsonl$/.test(path)) return 'attachments';
-  if ((provider === 'claude' && top === 'projects' || provider === 'codex' && ['sessions', 'archived_sessions'].includes(top)) && path.endsWith('.jsonl')) return 'sessions';
+  if (provider === 'claude' && top === 'projects' && path.endsWith('.jsonl') || provider === 'codex' && ['sessions', 'archived_sessions'].includes(top) && /\.jsonl(?:\.zst)?$/.test(path)) return 'sessions';
   if (/(?:^|\/)memory\//.test(path) || ['memories', 'config', 'rules'].includes(top)) return 'config';
   if (/\.(?:png|jpe?g|webp|gif|avif)$/i.test(path)) return 'images';
   if (top === '.tmp' || /^\.\.codex-global-state\.json\.tmp-/.test(top)) return 'temporary';

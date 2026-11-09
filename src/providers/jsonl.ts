@@ -3,9 +3,11 @@ import { open, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { basename, isAbsolute } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
+import { Readable } from 'node:stream';
+import { createZstdDecompress } from 'node:zlib';
 import type { FileEntry, Provider, Usage } from '../types.ts';
 
-export const PARSER_VERSION = 6;
+export const PARSER_VERSION = 8;
 const MAX_LINE = 8 * 1024 * 1024;
 const METADATA_BYTES = 1024 * 1024;
 const MAX_IDENTITIES = 100_000;
@@ -45,7 +47,8 @@ function claudeTokens(value: Row): Tokens {
 
 export async function parseSession(file: FileEntry, provider: Provider, deep: boolean, signal?: AbortSignal, onBytes?: (processed: number) => void, onRecord?: (row: Row) => void): Promise<ParsedSession> {
   const child = file.relative.match(/\/([^/]+)\/subagents\/agent-([^/]+)\.jsonl$/);
-  const result: ParsedSession = { id: child?.[2] ?? basename(file.path, '.jsonl'), project: null, observedProjects: [], parentId: child?.[1], complete: true, inherited: false, usage: unknownUsage(), byDate: Object.create(null), byModel: Object.create(null), warnings: [], fields: [], recordTypes: [], images: [] };
+  const compressed = provider === 'codex' && file.path.endsWith('.jsonl.zst');
+  const result: ParsedSession = { id: child?.[2] ?? basename(file.path, compressed ? '.jsonl.zst' : '.jsonl'), project: null, observedProjects: [], parentId: child?.[1], complete: true, inherited: false, usage: unknownUsage(), byDate: Object.create(null), byModel: Object.create(null), warnings: [], fields: [], recordTypes: [], images: [] };
   const fields = new Map<string, {path: string; bytes: number; count: number}>();
   const types = new Map<string, {type: string; bytes: number; count: number}>();
   const images = new Map<string, {digest: string; bytes: number; count: number}>();
@@ -184,8 +187,36 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
     handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const before = await handle.stat();
     if (!before.isFile() || before.dev !== file.dev || before.ino !== file.ino || before.size !== file.size || before.mtimeMs !== file.mtimeMs || before.ctimeMs !== file.ctimeMs || await realpath(file.path) !== file.path) throw Object.assign(new Error(), { code: 'FILE_CHANGED' });
-    const stream = handle.createReadStream({ autoClose: false, signal, highWaterMark: 64 * 1024, ...(deep || onRecord ? {} : { end: METADATA_BYTES - 1 }) });
+    const sampled = !deep && !onRecord;
+    let readBytes = 0;
+    async function* readChunks(): AsyncGenerator<Buffer> {
+      let frameStart = 0;
+      const end = sampled && !compressed ? Math.min(file.size, METADATA_BYTES) : file.size;
+      do {
+        async function* raw(): AsyncGenerator<Buffer> {
+          for (let position = frameStart; position < end;) {
+            signal?.throwIfAborted();
+            const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, end - position));
+            const { bytesRead } = await handle!.read(buffer, 0, buffer.length, position);
+            if (!bytesRead) throw Object.assign(new Error(), { code: 'FILE_CHANGED' });
+            position += bytesRead; readBytes = Math.max(readBytes, position);
+            yield buffer.subarray(0, bytesRead);
+          }
+        }
+        if (!compressed) { yield* raw(); return; }
+        const source = Readable.from(raw(), { objectMode: false, highWaterMark: 64 * 1024 });
+        const decoder = createZstdDecompress();
+        source.on('error', error => decoder.destroy(error));
+        try {
+          yield* source.pipe(decoder);
+          // Node stops at the first zstd frame; resume at the consumed offset to validate all input.
+          if (!decoder.bytesWritten) throw Object.assign(new Error(), { code: 'INVALID_ZSTD_FRAME' });
+          frameStart += decoder.bytesWritten;
+        } finally { source.destroy(); decoder.destroy(); }
+      } while (frameStart < file.size);
+    }
     let pieces: Buffer[] = [], length = 0, skipping = false, processed = 0;
+    let limited = false, reported = 0;
     const consume = (newline: boolean) => {
       lineNumber++;
       if (!skipping && length) {
@@ -200,9 +231,9 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
       }
       pieces = []; length = 0; skipping = false;
     };
-    for await (const chunk of stream) {
+    for await (const chunk of readChunks()) {
       if (signal?.aborted) { incomplete('Analysis interrupted'); break; }
-      const data = chunk as Buffer;
+      const data = sampled ? chunk.subarray(0, METADATA_BYTES - processed) : chunk;
       processed += data.length;
       let start = 0;
       for (let i = 0; i <= data.length; i++) {
@@ -215,12 +246,17 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
         if (i < data.length) consume(true);
         start = i + 1;
       }
-      onBytes?.(processed);
+      reported = readBytes; onBytes?.(reported);
       // Buffered reads can otherwise starve keyboard and signal handlers.
       await setImmediate();
+      if (sampled && processed === METADATA_BYTES && (!compressed || data.length < chunk.length)) {
+        limited = compressed || file.size > METADATA_BYTES;
+        break;
+      }
     }
-    if (!signal?.aborted && (deep || onRecord || processed < METADATA_BYTES || file.size <= METADATA_BYTES) && (length || skipping)) consume(false);
-    if (!deep && !onRecord && file.size > METADATA_BYTES) incomplete('Metadata sample covers first 1 MiB only; full session structure is unverified');
+    if (readBytes !== reported) onBytes?.(readBytes);
+    if (!signal?.aborted && !limited && (length || skipping)) consume(false);
+    if (limited) incomplete('Metadata sample covers first 1 MiB only; full session structure is unverified');
     const after = await handle.stat();
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) incomplete('File changed during analysis');
   } catch (error) { readFailed = true; incomplete(`Cannot read session: ${(error as NodeJS.ErrnoException).code ?? 'read failed'}`); }

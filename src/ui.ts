@@ -73,9 +73,10 @@ export function printReport(data: Analysis, view = 'directories') {
       { label: 'Embedded images', value: size(o.embeddedImageBytes) },
       { label: 'Duplicate image candidates', value: size(o.duplicateImageBytes) },
     ]);
-    section('Field sizes'); note('Serialized values; keys and separators excluded. Slim history is available under Clean.');
-    storageRows(o.fields.map(item => ({ name: `${item.path} (${item.count})`, bytes: item.bytes })), data.totalBytes);
-    section('Record types'); storageRows(o.recordTypes.map(item => ({ name: `${item.type} (${item.count})`, bytes: item.bytes })), data.totalBytes);
+    const decodedBytes = o.recordTypes.reduce((sum, item) => sum + item.bytes, 0);
+    section('Field sizes'); note('Decoded JSONL values; keys and separators excluded. Percentages use decoded history bytes, not disk usage or cleanup savings.');
+    storageRows(o.fields.map(item => ({ name: `${item.path} (${item.count})`, bytes: item.bytes })), decodedBytes);
+    section('Record types'); storageRows(o.recordTypes.map(item => ({ name: `${item.type} (${item.count})`, bytes: item.bytes })), decodedBytes);
   }
   for (const warning of data.warnings.slice(0, 12)) note(warning);
   if (data.warnings.length > 12) note(`Plus ${data.warnings.length - 12} more notes; use --json to see all`);
@@ -231,12 +232,12 @@ export function detailNodes(data: Analysis): TreeNode[] {
   return [
     { name: 'Images', children: [
       { name: 'Standalone PNGs', bytes: o.pngBytes, detail: `${o.pngCount} files · ${size(o.pngBytes)}` },
-      { name: 'Chat images', bytes: o.embeddedImageBytes },
-      { name: 'Duplicate image candidates', bytes: o.duplicateImageBytes, detail: 'Included in chat images; potential savings only.' },
+      { name: 'Chat images', bytes: o.embeddedImageBytes, detail: 'Decoded history bytes; not disk usage or cleanup savings.' },
+      { name: 'Duplicate image candidates', bytes: o.duplicateImageBytes, detail: 'Included in decoded chat image bytes; not estimated disk savings.' },
     ] },
     { name: 'Field sizes', bytes: fields.reduce((sum, field) => sum + field.bytes!, 0), children: fields,
-      detail: `${o.fields.length} fields · Serialized values only; keys and separators excluded.` },
-    { name: 'Record types', bytes: o.recordTypes.reduce((sum, item) => sum + item.bytes, 0), children: o.recordTypes.map(item => ({
+      detail: `${o.fields.length} fields · Decoded JSONL values; keys and separators excluded. Not disk savings.` },
+    { name: 'Record types', detail: 'Decoded JSONL bytes; not disk usage or cleanup savings.', bytes: o.recordTypes.reduce((sum, item) => sum + item.bytes, 0), children: o.recordTypes.map(item => ({
       name: item.type, bytes: item.bytes, detail: `${item.type} · ${item.count.toLocaleString('en-US')} records · ${size(item.bytes)}`,
     })).sort((a, b) => b.bytes - a.bytes) },
     { name: `Scan notes (${data.warnings.length})`, detail: `${data.scanComplete ? 'Complete' : 'Partial'} scan · Parsed ${data.usage.parsedFiles}/${data.usage.totalFiles} record files · Usage ${data.usage.verified ? 'verified' : 'partial or unknown'}`,

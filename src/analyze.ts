@@ -90,7 +90,11 @@ export async function analyze(inventory: Inventory, options: { deep?: boolean; s
     }
     if (file.category === 'images' && /\.png$/i.test(file.path)) { result.opportunities.pngBytes += file.size; result.opportunities.pngCount++; }
   }
-  const sessionFiles = [...files.values()].filter(file => file.category === 'sessions');
+  const histories = [...files.values()].filter(file => file.category === 'sessions');
+  const historyPaths = new Set(histories.map(file => file.path));
+  const shadowed = inventory.provider === 'codex' ? histories.filter(file => file.path.endsWith('.jsonl.zst') && historyPaths.has(file.path.slice(0, -4))) : [];
+  const shadowedPaths = new Set(shadowed.map(file => file.path));
+  const sessionFiles = histories.filter(file => !shadowedPaths.has(file.path));
   result.usage.totalFiles = sessionFiles.length;
   let completed = 0, processedBytes = 0;
   const totalBytes = sessionFiles.reduce((sum, file) => sum + file.size, 0);
@@ -126,16 +130,26 @@ export async function analyze(inventory: Inventory, options: { deep?: boolean; s
       existing.files.push(file); existing.complete = false; existing.usage.verified = false;
       existing.warnings.push('Multiple distinct files claim the same session ID; usage excluded from totals');
       byPath.set(file.path, existing);
+      if (inventory.provider === 'codex' && file.path.endsWith('.jsonl.zst')) byPath.set(file.path.slice(0, -4), existing);
       result.scanComplete = false;
       continue;
     }
     const session: Session = { id: value.id, provider: inventory.provider, project: value.project, parentId: value.parentId, files: [file], bytes: 0, updatedAt: value.updatedAt ?? new Date(file.mtimeMs).toISOString(), createdAt: value.createdAt, model: value.model, version: value.version, archived: file.relative.startsWith('archived_sessions/'), complete: value.complete, observedProjects: value.observedProjects, usage: value.usage, warnings: [...value.warnings] };
     byId.set(session.id, session); byPath.set(file.path, session);
+    if (inventory.provider === 'codex' && file.path.endsWith('.jsonl.zst')) byPath.set(file.path.slice(0, -4), session);
     result.scanComplete &&= session.complete;
     result.warnings.push(...value.warnings.map(warning => `${file.relative}: ${warning}`));
     for (const item of value.fields) { const prior = fields.get(item.path) ?? { ...item, bytes: 0, count: 0 }; prior.bytes += item.bytes; prior.count += item.count; fields.set(item.path, prior); }
     for (const item of value.recordTypes) { const prior = types.get(item.type) ?? { ...item, bytes: 0, count: 0 }; prior.bytes += item.bytes; prior.count += item.count; types.set(item.type, prior); }
     for (const item of value.images) { const prior = images.get(item.digest) ?? { bytes: 0, count: 0, firstBytes: item.bytes / item.count }; prior.bytes += item.bytes; prior.count += item.count; images.set(item.digest, prior); }
+  }
+  for (const file of shadowed) {
+    const session = byPath.get(file.path.slice(0, -4));
+    if (!session) continue;
+    const warning = 'Plain history preferred; compressed sibling is retained and has not been checked for equivalence';
+    session.files.push(file); byPath.set(file.path, session);
+    session.complete = false; result.scanComplete = false;
+    session.warnings.push(warning); result.warnings.push(`${file.relative}: ${warning}`);
   }
   if (inventory.provider === 'claude') {
     for (const file of files.values()) {

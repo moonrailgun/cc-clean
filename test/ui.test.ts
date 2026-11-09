@@ -176,8 +176,15 @@ test('usage reports use rows per model, project and date, keeping diagnostics in
   lines = []; printReport(report, 'usage');
   assert.match(lines.join('\n'), /Reasoning tokens/);
   assert.match(lines.find(line => line.includes('other-model'))!, /\s+0$/);
+  report.totalBytes = 100;
+  const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+  Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+  t.after(() => { if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete process.stdout.isTTY; });
   lines = []; printReport(report, 'opportunities');
   assert.match(lines.join('\n'), /session\.jsonl: Mixed session format/);
+  assert.match(lines.join('\n'), /Percentages use decoded history bytes/);
+  assert.match(lines.find(line => line.includes('assistant (8)'))!, /60\.0%/);
+  assert.match(lines.find(line => line.includes('wireToolInputs.a (10)'))!, /50\.0%/);
 });
 
 test('tables preserve exact numeric columns at narrow widths and sanitize Unicode labels', () => {
