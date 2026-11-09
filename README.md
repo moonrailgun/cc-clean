@@ -261,3 +261,5 @@ See the distributed [Apache-2.0 license](third_party/rtk/LICENSE) and [source/fu
 Quick clean and ordinary CLI `clean` also check known system temporary layouts for Claude task outputs/cwd records and Codex hook outputs/leftover installers. Only matching files owned by the current user and last modified strictly more than 72 hours ago qualify. Configuration roots, application state, source, images, scratchpads, locks and sockets are retained; directories are never deleted wholesale. Review the combined category estimates before confirming.
 
 See [native compatibility](docs/native-compatibility.md#system-temporary-files-source-and-metadata-checks-only) for layout sources and verification limits.
+
+Session history also supplies successful creation evidence for temporary output paths, including `$TMPDIR`/`${TMPDIR}`, expanded paths and macOS `/private` aliases. Only allowlisted text outputs with verified creation, file identity and no other-session references qualify, always after strictly more than 72 hours. Unsupported scripts and incomplete evidence are retained; discovery is not comprehensive.

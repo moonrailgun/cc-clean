@@ -912,16 +912,16 @@ test('system temps show category estimates and selective accounting without list
   t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
   const p = inertPlan(), base = p.actions[0];
   p.root = '/inert/temp'; p.systemTemp = {uid: 501, excludedRoots: []};
-  p.actions = ['task-output', 'cwd-record', 'hook-output', 'installer'].flatMap(category => Array.from({length: 50}, (_, i) => ({
+  p.actions = ['task-output', 'cwd-record', 'hook-output', 'installer', 'session-output'].flatMap(category => Array.from({length: 50}, (_, i) => ({
     ...base, kind: 'delete-files' as const, targetId: `${category}-${i}`,
     files: [{...base.files[0], path: `/inert/temp/${category}-${i}`, category}],
   })));
   printPlan(p);
   const text = lines.join('\n');
   assert.match(text, /System temporary files/);
-  for (const label of ['Remove temporary task outputs', 'Remove temporary cwd records', 'Remove temporary hook outputs', 'Remove leftover installers'])
+  for (const label of ['Remove temporary task outputs', 'Remove temporary cwd records', 'Remove temporary hook outputs', 'Remove leftover installers', 'Remove session-created temporary outputs'])
     assert.ok(text.includes(`50.00 KiB  ${label} · 50 files`));
-  assert.match(text, /200\.00 KiB\s+Total estimated savings/);
+  assert.match(text, /250\.00 KiB\s+Total estimated savings/);
   assert.match(text, /Irreversible:.*No undo/);
   assert.doesNotMatch(text, /\/inert\/temp\/|Delete files/); assert.ok(lines.length < 25);
   lines.length = 0;

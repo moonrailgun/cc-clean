@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { constants } from 'node:fs';
 import type { FileEntry, Inventory, Provider, ScanProgress, Session } from './types.ts';
 import { scanRoot } from './scan.ts';
+import { verifySessionTempEvidence } from './session-temp.ts';
 import { scanSystemTemp, scopedTempKind, tempExcluded, verifySystemTempParents, type SystemTempScope } from './system-temp.ts';
 import { privateDir, atomicJson, jsonFiles, within, existingDir, readOrdinaryFile } from './state.ts';
 import { recompressPng, MAX_PNG_BYTES } from './png.ts';
@@ -239,6 +240,7 @@ async function verifyRoot(r:Plan) {
 }
 async function verifyParents(r:Plan,a:Action) {
   await verifyRoot(r);
+  if(r.systemTemp?.session)await verifySessionTempEvidence(r.systemTemp.session,r.provider,true);
   for(const f of a.files)if(!within(r.root,f.path)||!await existingDir(dirname(f.path))||await realpath(dirname(f.path))!==dirname(f.path))throw new Error('Source parent directory changed');
   if(r.systemTemp)for(const f of a.files)await verifySystemTempParents(r.root,f.path,r.provider,r.systemTemp);
 }
@@ -292,8 +294,8 @@ function updateTotal(r:Receipt) {r.confirmedReductionBytes=r.actions.reduce((n,a
 const scanPlanScope=(p:Plan)=>p.systemTemp?scanSystemTemp(p.root,p.provider,p.systemTemp):scanRoot(p.root,p.provider);
 async function planActivity(p:Plan,check:ActivityCheck,actions=p.actions,openPaths?:string[]) {
   const reasons=new Map<Action,string>();
-  for(const provider of [p.provider]) {
-    const root=p.root;
+  for(const provider of p.systemTemp?.session?['claude','codex'] as const:[p.provider]) {
+    const root=p.systemTemp?.session?.roots[provider]??p.root;
     const paths=openPaths??actions.flatMap(a=>a.files.map(f=>f.path));
     const codexRoot=provider==='codex'&&!p.systemTemp;
     let result=await check(provider,root,codexRoot?undefined:paths).catch(()=>'Cannot reliably check client activity');

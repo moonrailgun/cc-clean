@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ageProtectionReason, protectRecentContent, protectActiveContent, singleSelectedTarget, type Action, type Plan } from '../src/clean.ts';
 
+import { cleanupExecutionOrder, includesSystemTemp } from '../src/app.ts';
+import type { SessionTempEvidence } from '../src/session-temp.ts';
+
 // In-memory metadata only: never invoke cleanup planning, estimation or execution.
 const now = Date.parse('2026-11-09T12:00:00Z'), cutoff = now - 72 * 3600000;
 const session = '12345678-1234-1234-1234-123456789abc';
@@ -161,4 +164,38 @@ test('ordinary Codex activity retains the provider directory inspection', async 
   });
   assert.deepEqual(p.actions, []);
   assert.match(p.warnings.join('\n'), /Index has an open writer/);
+});
+
+const sessionTemp: SessionTempEvidence = {path: '/inert', kind: 'directory', callId: 'exec-1', startedAt: 1, completedAt: 1,
+  roots: {claude: '/claude', codex: '/codex'}, source: '/codex/sessions/s1.jsonl', sessionId: 's1', fingerprint: 'a'.repeat(64), dev: 1, ino: 1, birthtimeMs: 1};
+
+
+test('session temporary files require strict age and both providers closed', async () => {
+  for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
+    const p = plan([action('delete-files', mtime)], '/inert/file');
+    p.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
+    protectRecentContent(p, now);
+    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+  }
+  for (const active of ['claude', 'codex', null]) {
+    const p = plan([action('delete-files', cutoff - 1)]), seen: string[] = [];
+    p.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
+    await protectActiveContent(p, async (provider, root, paths) => {
+      seen.push(provider); assert.equal(root, sessionTemp.roots[provider]); assert.deepEqual(paths, ['/inert/file']);
+      return provider === active ? 'Idle client remains open' : null;
+    });
+    assert.equal(p.actions.length, active ? 0 : 1);
+    assert.deepEqual(seen, active === 'claude' ? ['claude'] : ['claude', 'codex']);
+  }
+});
+
+
+test('temporary scopes run before evidence-changing history plans without mutating the list', () => {
+  const history = plan([action('slim-history')]), temp = plan([action()]), fixed = plan([action()]);
+  temp.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
+  fixed.systemTemp = {uid: 501, excludedRoots: []};
+  const plans = [history, temp, fixed];
+  assert.deepEqual(cleanupExecutionOrder(plans), [temp, history, fixed]);
+  assert.deepEqual(plans, [history, temp, fixed]);
+  assert.equal(includesSystemTemp({includeFileCleanup: true, removeImages: true}), true);
 });

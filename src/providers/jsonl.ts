@@ -43,7 +43,7 @@ function claudeTokens(value: Row): Tokens {
   return { inputTokens: input === null ? null : input + (read ?? 0) + (write ?? 0), outputTokens: number(value.output_tokens), cachedTokens: read === null && write === null ? null : (read ?? 0) + (write ?? 0), reasoningTokens: number(value.reasoning_tokens) };
 }
 
-export async function parseSession(file: FileEntry, provider: Provider, deep: boolean, signal?: AbortSignal, onBytes?: (processed: number) => void): Promise<ParsedSession> {
+export async function parseSession(file: FileEntry, provider: Provider, deep: boolean, signal?: AbortSignal, onBytes?: (processed: number) => void, onRecord?: (row: Row) => void): Promise<ParsedSession> {
   const child = file.relative.match(/\/([^/]+)\/subagents\/agent-([^/]+)\.jsonl$/);
   const result: ParsedSession = { id: child?.[2] ?? basename(file.path, '.jsonl'), project: null, observedProjects: [], parentId: child?.[1], complete: true, inherited: false, usage: unknownUsage(), byDate: Object.create(null), byModel: Object.create(null), warnings: [], fields: [], recordTypes: [], images: [] };
   const fields = new Map<string, {path: string; bytes: number; count: number}>();
@@ -100,6 +100,7 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
     }
   }
   function record(row: Row, bytes: number) {
+    onRecord?.(row);
     validRecords++;
     const payload = row.payload && typeof row.payload === 'object' ? row.payload as Row : {};
     const time = timestamp(row.timestamp) ?? timestamp(payload.timestamp);
@@ -183,7 +184,7 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
     handle = await open(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const before = await handle.stat();
     if (!before.isFile() || before.dev !== file.dev || before.ino !== file.ino || before.size !== file.size || before.mtimeMs !== file.mtimeMs || before.ctimeMs !== file.ctimeMs || await realpath(file.path) !== file.path) throw Object.assign(new Error(), { code: 'FILE_CHANGED' });
-    const stream = handle.createReadStream({ autoClose: false, signal, highWaterMark: 64 * 1024, ...(deep ? {} : { end: METADATA_BYTES - 1 }) });
+    const stream = handle.createReadStream({ autoClose: false, signal, highWaterMark: 64 * 1024, ...(deep || onRecord ? {} : { end: METADATA_BYTES - 1 }) });
     let pieces: Buffer[] = [], length = 0, skipping = false, processed = 0;
     const consume = (newline: boolean) => {
       lineNumber++;
@@ -218,8 +219,8 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
       // Buffered reads can otherwise starve keyboard and signal handlers.
       await setImmediate();
     }
-    if (!signal?.aborted && (deep || processed < METADATA_BYTES || file.size <= METADATA_BYTES) && (length || skipping)) consume(false);
-    if (!deep && file.size > METADATA_BYTES) incomplete('Metadata sample covers first 1 MiB only; full session structure is unverified');
+    if (!signal?.aborted && (deep || onRecord || processed < METADATA_BYTES || file.size <= METADATA_BYTES) && (length || skipping)) consume(false);
+    if (!deep && !onRecord && file.size > METADATA_BYTES) incomplete('Metadata sample covers first 1 MiB only; full session structure is unverified');
     const after = await handle.stat();
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) incomplete('File changed during analysis');
   } catch (error) { incomplete(`Cannot read session: ${(error as NodeJS.ErrnoException).code ?? 'read failed'}`); }

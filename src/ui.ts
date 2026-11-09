@@ -124,7 +124,7 @@ export function printPlans(plans: Plan[]) {
   }
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
   if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
-  if (temporary.length) note('Irreversible: full temporary task/hook outputs, cwd records and listed installers will be deleted. No undo.');
+  if (temporary.length) note('Irreversible: session-created outputs, full temporary task/hook outputs, cwd records and listed installers will be deleted. No undo.');
   if (actions.length) note('Full file paths and per-file estimates: View files in the review menu, or use --json.');
   const groups = new Map<string, number>();
   for (const warning of warnings) {

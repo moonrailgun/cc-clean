@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import type { Provider } from './types.ts';
 import type { Receipt } from './clean.ts';
 import { scopedTempKind, tempExcluded, type SystemTempScope } from './system-temp.ts';
+import { validSessionTempEvidence } from './session-temp.ts';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_JSON_BYTES = 64 * 1024 * 1024;
@@ -131,6 +132,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
   requireReceipt(data.codexIndexFingerprint === undefined || (text(data.codexIndexFingerprint) && /^[0-9a-f]{64}$/.test(data.codexIndexFingerprint)));
   if (data.systemTemp !== undefined) {
     requireReceipt(object(data.systemTemp) && bytes(data.systemTemp.uid) && Array.isArray(data.systemTemp.excludedRoots) && data.systemTemp.excludedRoots.every(absolute));
+    requireReceipt(data.systemTemp.session === undefined || validSessionTempEvidence(data.systemTemp.session, data.root, data.provider));
     requireReceipt(data.explicitTarget === undefined && data.codexIndexFingerprint === undefined && data.source === 'clean');
   }
   const tempScope = data.systemTemp as SystemTempScope | undefined;
@@ -169,6 +171,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       requireReceipt(file.uid === undefined || bytes(file.uid));
       if (tempScope) requireReceipt(file.uid === tempScope.uid && !(file.mode & 0o022) && (file.mode & 0o170000) === 0o100000 &&
         !tempExcluded(file.path, tempScope) && scopedTempKind(data.root, file.path, data.provider, tempScope) === file.category);
+      if (tempScope?.session?.kind === 'file') requireReceipt(file.dev === tempScope.session.dev && file.ino === tempScope.session.ino);
       fileBytes += file.size; requireReceipt(Number.isSafeInteger(fileBytes));
     }
     requireReceipt(action.kind === 'codex-delete' || action.beforeBytes === fileBytes);

@@ -3,13 +3,15 @@ import type { Stats } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Inventory, Provider, ScanProgress } from './types.ts';
+import { temporaryOutput, temporarySubdirectory, validSessionTempEvidence, verifySessionTempEvidence, verifyTemporaryLocation, type SessionTempEvidence } from './session-temp.ts';
 
-export interface SystemTempScope { uid: number; excludedRoots: string[] }
+export interface SystemTempScope { uid: number; excludedRoots: string[]; session?: SessionTempEvidence }
 export const systemTempLabels = {
   'task-output': 'Remove temporary task outputs',
   'cwd-record': 'Remove temporary cwd records',
   'hook-output': 'Remove temporary hook outputs',
   installer: 'Remove leftover installers',
+  'session-output': 'Remove session-created temporary outputs',
 } as const;
 const uuid = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}';
 const hookFile = new RegExp(`^hook_outputs/${uuid}/${uuid}\\.txt$`, 'i');
@@ -17,7 +19,10 @@ const hookDir = new RegExp(`^hook_outputs/${uuid}$`, 'i');
 const childOf = (root: string, path: string) => { const r = relative(root, path); return r !== '' && r !== '..' && !r.startsWith('../') && !isAbsolute(r); };
 export const tempExcluded = (path: string, scope: SystemTempScope) => scope.excludedRoots.some(root => path === root || childOf(root, path));
 export function scopedTempKind(root: string, path: string, provider: Provider, scope: SystemTempScope): keyof typeof systemTempLabels | null {
-  return systemTempKind(relative(root, path), provider, scope.uid);
+  if (!scope.session) return systemTempKind(relative(root, path), provider, scope.uid);
+  const e = scope.session;
+  return validSessionTempEvidence(e, root, provider) && childOf(root, path) &&
+    (e.kind === 'directory' || path === e.path) && temporaryOutput(relative(root, path)) ? 'session-output' : null;
 }
 
 /** Exact known layouts only; a provider-like directory name is not a deletion rule. */
@@ -54,6 +59,10 @@ export async function systemTempBases(provider: Provider, env: NodeJS.ProcessEnv
 }
 export async function verifySystemTempParents(root: string, path: string, provider: Provider, scope: SystemTempScope) {
   if (scope.uid !== process.getuid?.() || !childOf(root, path) || tempExcluded(path, scope) || !scopedTempKind(root, path, provider, scope)) throw new Error('Temporary file is outside the allowed scope');
+  if (scope.session) {
+    await verifySessionTempEvidence(scope.session, provider);
+    await verifyTemporaryLocation(dirname(path));
+  }
   if (await realpath(root) !== root || !safeDirectory(await lstat(root), scope.uid, true)) throw new Error('Temporary base directory is unsafe');
   let cursor = root;
   for (const part of relative(root, dirname(path)).split('/').filter(Boolean)) {
@@ -69,6 +78,10 @@ export async function scanSystemTemp(root: string, provider: Provider, scope: Sy
   const fail = (path: string, error: unknown) => { inv.complete = false; inv.errors.push(`${path}: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}`); };
   try {
     if (scope.uid !== process.getuid?.() || root === '/' || await realpath(root) !== root || !safeDirectory(await lstat(root), scope.uid, true)) throw new Error('Unsafe temporary base or owner');
+    if (scope.session) {
+      if (!validSessionTempEvidence(scope.session, root, provider)) throw new Error('Invalid temporary creation scope');
+      await verifySessionTempEvidence(scope.session, provider, true, signal);
+    }
     inv.exists = true;
     const directories = [root];
     while (directories.length) {
@@ -80,16 +93,19 @@ export async function scanSystemTemp(root: string, provider: Provider, scope: Sy
         signal?.throwIfAborted();
         const path = join(directory, entry.name), rel = relative(root, path);
         if (tempExcluded(path, scope)) continue;
-        const kind = scopedTempKind(root, path, provider, scope), descend = tempDirectory(rel, provider, scope.uid);
+        const kind = scopedTempKind(root, path, provider, scope), descend = scope.session
+          ? scope.session.kind === 'directory' && temporarySubdirectory(rel) : tempDirectory(rel, provider, scope.uid);
         if (!kind && !descend && !entry.isSymbolicLink()) continue;
         try {
           const s = await lstat(path);
           if (s.isSymbolicLink()) { inv.links.push({ path, target: await realpath(path).catch(async () => resolve(dirname(path), await readlink(path))) }); continue; }
           if (descend && s.isDirectory()) {
+            if (scope.session) await verifyTemporaryLocation(path);
             if (safeDirectory(s, scope.uid)) directories.push(path);
             else inv.errors.push(`${rel}: unsafe temporary directory ownership or permissions; retained`);
           } else if (kind && s.isFile()) {
             if (s.uid !== scope.uid || s.nlink !== 1 || s.mode & 0o022) { inv.errors.push(`${rel}: temporary file is shared or has unsafe ownership or permissions; retained`); continue; }
+            if (scope.session?.kind === 'file' && (s.dev !== scope.session.dev || s.ino !== scope.session.ino || s.birthtimeMs !== scope.session.birthtimeMs)) { inv.errors.push(`${rel}: temporary file identity changed; retained`); continue; }
             inv.files.push({path, relative: rel, size: s.size, allocatedBytes: s.blocks * 512, mtimeMs: s.mtimeMs, ctimeMs: s.ctimeMs, dev: s.dev, ino: s.ino, nlink: s.nlink, mode: s.mode, uid: s.uid, category: kind});
             inv.totalBytes += s.size; inv.allocatedBytes += s.blocks * 512;
             onProgress?.({phase: 'discovering', completed: inv.files.length, total: null, currentFile: path});

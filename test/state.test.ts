@@ -493,3 +493,34 @@ test('system-temp receipts enforce the allowlist and keep selective accounting i
   assert.equal(log.scope, 'system-temp'); assert.equal(log.savedBytes, 19);
   assert.equal(log.cleanedRecords, 1); assert.equal(log.cleanupTypes[0].type, 'delete-files');
 });
+
+test('session temporary receipts bind the creation scope and direct-file identity', () => {
+  const r = receipt('/inert'), a = r.actions[0], f = a.files[0];
+  r.root = '/tmp/generated-abc123'; r.rootIdentity = {dev: 1, ino: 2};
+  r.systemTemp = {uid: 501, excludedRoots: ['/inert/state'], session: {
+    path: r.root, kind: 'directory', callId: 'creation', startedAt: 1000, completedAt: 2000,
+    roots: {claude: '/inert/claude', codex: '/inert/codex'}, source: '/inert/codex/sessions/example.jsonl',
+    sessionId: 'example', fingerprint: 'a'.repeat(64), dev: 1, ino: 2, birthtimeMs: 1500,
+  }};
+  Object.assign(f, {path: join(r.root, 'report.md'), relative: 'report.md', uid: 501, category: 'session-output'});
+  a.targetId = f.relative;
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    {path: '/tmp/unrelated'}, {source: '/inert/codex/cache/example.jsonl'}, {fingerprint: ''},
+    {startedAt: 3000}, {birthtimeMs: 9000}, {roots: {claude: '/tmp', codex: '/inert/codex'}},
+  ]) {
+    const invalid = structuredClone(r); Object.assign(invalid.systemTemp!.session!, changes);
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  for (const name of ['image.png', 'code.ts', 'README.md', 'src/report.md', '../report.md']) {
+    const invalid = structuredClone(r);
+    Object.assign(invalid.actions[0].files[0], {path: join(r.root, name), relative: name});
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  Object.assign(r.systemTemp.session!, {path: f.path, kind: 'file', dev: f.dev, ino: f.ino});
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [{dev: 99}, {ino: 99}, {path: join(r.root, 'other.md'), relative: 'other.md'}]) {
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0].files[0], changes);
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+});
