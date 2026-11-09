@@ -2,7 +2,7 @@ import { lstat, realpath } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
 import { readOrdinaryFile } from './state.ts';
 
-export type ActivityCommand = (file:string,args:string[],options:{timeout:number;maxBuffer:number;env?:NodeJS.ProcessEnv}) => Promise<{stdout:string}>;
+export type ActivityCommand = (file:string,args:string[],options:{timeout:number;maxBuffer:number;env?:NodeJS.ProcessEnv}) => Promise<{stdout:string;stderr?:string}>;
 export type ActivityMetadata = (root:string,path:string) => Promise<Record<string, any>|null>;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const native = /(?:^|\/)claude(?:$|\s|[-_])|\/(?:Claude|ClaudeCode)\.app\/|\/claude\/versions\/[^/\s]+$/i;

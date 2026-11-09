@@ -41,16 +41,26 @@ export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platf
     // Explicit files must never fall back to a recursive scan of a shared system temp directory.
     const targets = files ? Array.from({length: Math.ceil(files.length / 100)}, (_, i) => ['--', ...files.slice(i * 100, (i + 1) * 100)]) : [['+D', root]];
     const openFiles:string[]=[];
-    for (const target of targets) try {
+    for (const target of targets) {
+      let opened:string;
       // The current process may hold the coordinated SQLite write transaction.
-      const {stdout:opened}=await run('/usr/sbin/lsof',['-nP','-a','-p',`^${process.pid}`,'-F','n',...target],{timeout:10000,maxBuffer:4*1024*1024});
+      try {
+        const result=await run('/usr/sbin/lsof',['-nP','-a','-p',`^${process.pid}`,'-F','n',...target],{timeout:10000,maxBuffer:4*1024*1024});
+        if(result.stderr?.trim())return 'Cannot reliably check open files';
+        opened=result.stdout;
+      } catch(e) {
+        // lsof also exits 1 when only some requested files have matching descriptors.
+        const error=e as {code?:number;stdout?:string;stderr?:string};
+        if(error.code!==1||error.stderr?.trim())return 'Cannot reliably check open files';
+        opened=error.stdout??'';
+      }
       if(opened.trim()) {
-        if(provider!=='claude'||!files)return 'Source directory contains open files; close the writer first';
+        if(!files)return 'Source directory contains open files; close the writer first';
         const names=opened.split('\n').filter(line=>line.startsWith('n')).map(line=>line.slice(1));
         if(!names.length||names.some(path=>!files.includes(path)))return 'Cannot reliably check open files';
         openFiles.push(...names);
       }
-    } catch(e) { const error=e as {code?:number;stdout?:string;stderr?:string}; if(error.code!==1||error.stdout?.trim()||error.stderr?.trim()) return 'Cannot reliably check open files'; }
+    }
     return sessionIds.length||openFiles.length?{sessionIds,openFiles:[...new Set(openFiles)]}:null;
   } catch {return 'Cannot reliably check client activity';}
 };

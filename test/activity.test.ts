@@ -67,6 +67,16 @@ test('external candidates are checked in bounded batches without recursively sca
   assert.deepEqual(scans.flatMap(c => c.args.slice(c.args.indexOf('--') + 1)), files);
 });
 
+test('macOS lsof exit 1 may contain matched candidates alongside closed files', async () => {
+  const check=createActivityCheck(async file=>{
+    if(file.endsWith('ps'))return {stdout:'/bin/zsh\n'};
+    throw Object.assign(new Error('Some selected files are closed'),{code:1,stderr:'',stdout:'p99\nf20\nn/inert/open.jsonl\n'});
+  },'darwin');
+  const result=await check('codex','/inert',['/inert/open.jsonl','/inert/closed.jsonl']);
+  assert.equal(activityReason(result,'/inert',['/inert/closed.jsonl']),null);
+  assert.match(activityReason(result,'/inert',['/inert/open.jsonl'])!,/open files/);
+});
+
 test('open-file inspection excludes its own transaction but retains external writers', async () => {
   let externalWriter = false;
   const check = createActivityCheck(async (file, args) => {
