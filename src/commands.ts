@@ -73,7 +73,7 @@ Options:
   --version                     Version; supports --json
 
 Interactive cleanup:
-  Scan and deep scan, then summarize operations and estimated savings. View files for full paths.
+  Scan and deep scan, then summarize category counts and estimated savings; View files for details.
   Press Enter to confirm cleanup; Q / Esc cancels. --yes does not skip this step.
 
 Duplicate Codex histories:
