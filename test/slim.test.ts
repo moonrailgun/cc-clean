@@ -423,7 +423,7 @@ const skillListing = {
 };
 
 
-test('Claude tool-definition slimming preserves raw prompts, skills, chat, cost and graph', () => {
+test('Claude tool and skill slimming preserve raw prompts, chat, cost and graph while resetting skill discovery', () => {
   const user = JSON.stringify(claude('user', [{type: 'text', text: 'Keep 用户 text'}], {uuid: 'user-id', parentUuid: null}));
   const assistant = JSON.stringify(claude('assistant', [{type: 'thinking', thinking: 'keep', signature: 'keep-signature'}],
     {uuid: 'assistant-id', parentUuid: 'skills-id', usage: {input_tokens: 123, output_tokens: 45}}));
@@ -438,13 +438,13 @@ test('Claude tool-definition slimming preserves raw prompts, skills, chat, cost 
   for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
     const rows = [user, rawSnapshot, listing, assistant, cost];
     const input = Buffer.from(rows.join(newline) + finalNewline);
-    for (const [compactToolDefinitions, compactSkillListings] of [[true, false]]) {
-      const options = {removeImages: false, compactTools: false, compactToolDefinitions};
+    for (const [compactToolDefinitions, compactSkillListings] of [[true, false], [false, true], [true, true]]) {
+      const options = {removeImages: false, compactTools: false, compactToolDefinitions, compactSkillListings};
       const result = slimHistory(input, 'claude', options);
       assert.equal(result.output?.toString(), [user, compactToolDefinitions ? clearedSnapshot : rawSnapshot,
         compactSkillListings ? clearedListing : listing, assistant, cost].join(newline) + finalNewline);
       assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
-        ...(compactToolDefinitions ? {toolDefinitions: 1} : {})});
+        ...(compactToolDefinitions ? {toolDefinitions: 1} : {}), ...(compactSkillListings ? {skillListings: 1} : {})});
       assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
       assert.equal(slimHistory(result.output!, 'claude', options).output, null);
     }
@@ -452,7 +452,7 @@ test('Claude tool-definition slimming preserves raw prompts, skills, chat, cost 
 });
 
 
-test('Claude tool-definition slimming clears every recognized snapshot and preserves skill inventories', () => {
+test('Claude slimming clears every recognized snapshot and resets initial and subsequent skill inventories', () => {
   const tool = toolSnapshot.attachment.tools[0];
   const nextSnapshot = {...toolSnapshot, uuid: 'snapshot-2', parentUuid: skillListing.uuid,
     attachment: {...toolSnapshot.attachment, systemPrompt: ['Keep updated instructions'],
@@ -460,22 +460,23 @@ test('Claude tool-definition slimming clears every recognized snapshot and prese
   const nextListing = {...skillListing, uuid: 'skills-2', parentUuid: nextSnapshot.uuid, rendered: undefined,
     attachment: {...skillListing.attachment, content: '', isInitial: false,
       names: Array.from({length: 12}, (_, i) => `skill-${i}`), skillCount: 12}};
-  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true};
+  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true, compactSkillListings: true};
   const input = jsonl(toolSnapshot, skillListing, nextSnapshot, nextListing);
   const result = slimHistory(input, 'claude', options);
   assert.deepEqual(result.output, jsonl(
     {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: []}},
-    skillListing,
+    {...skillListing, attachment: {...skillListing.attachment, content: '', names: [], skillCount: 0}, rendered: []},
     {...nextSnapshot, attachment: {...nextSnapshot.attachment, tools: []}},
-    nextListing,
+    {...nextListing, attachment: {...nextListing.attachment, content: '', names: [], skillCount: 0}},
   ));
+  assert.deepEqual(result.counts, {images: 0, toolOutputs: 0, toolDefinitions: 3, skillListings: 2});
   assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
   assert.equal(slimHistory(result.output!, 'claude', options).output, null);
 });
 
 
-test('tool-definition slimming retains unknown shapes, other attachments and disabled or Codex content', () => {
-  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true};
+test('tool and skill slimming retains unknown shapes, other attachments and disabled or Codex content', () => {
+  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true, compactSkillListings: true};
   const tool = toolSnapshot.attachment.tools[0];
   for (const row of [
     {...toolSnapshot, uuid: undefined}, {...toolSnapshot, parentUuid: undefined},
@@ -498,5 +499,28 @@ test('tool-definition slimming retains unknown shapes, other attachments and dis
   assert.equal(slimHistory(jsonl(toolSnapshot, skillListing), 'claude', {removeImages: false, compactTools: false}).output, null);
   assert.equal(slimHistory(jsonl(meta, toolSnapshot, skillListing), 'codex', options).output, null);
   const result = slimHistory(jsonl({...skillListing, rendered: undefined}, {...toolSnapshot, version: 'future-version'}), 'claude', options);
+  assert.equal(result.counts.skillListings, 1);
   assert.equal(result.counts.toolDefinitions, 1);
+  assert.equal(JSON.parse(result.output!.toString().split('\n')[0]).attachment.skillCount, 0);
+});
+
+test('Claude Quick clean combines all history operations without double counting', () => {
+  const input = jsonl(
+    claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}]),
+    claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: matches}]),
+    ...archives, successfulHook, toolSnapshot, skillListing,
+  );
+  const options = {...both, removeRequestArchives: true, compactHooks: true, compactToolDefinitions: true, compactSkillListings: true};
+  const result = slimHistory(input, 'claude', options);
+  assert.ok(result.output);
+  assert.deepEqual(result.counts, {images: 1, toolOutputs: 1, requestRecords: 3, hooks: 1, toolDefinitions: 1, skillListings: 1});
+  let savings = 0;
+  for (const option of ['removeImages', 'compactTools', 'removeRequestArchives', 'compactHooks', 'compactToolDefinitions', 'compactSkillListings'] as const) {
+    const separate = slimHistory(input, 'claude', {removeImages: false, compactTools: false, [option]: true});
+    assert.ok(separate.output);
+    savings += input.length - separate.output.length;
+  }
+  assert.equal(savings, input.length - result.output.length);
+  assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), savings);
+  assert.equal(slimHistory(result.output, 'claude', options).output, null);
 });

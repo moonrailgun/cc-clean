@@ -203,7 +203,7 @@ test('temporary scopes run before evidence-changing history plans without mutati
 
 
 test('Claude archive, hook, tool-definition and skill-listing slimming share age and activity protection', async () => {
-  for (const option of ['removeRequestArchives', 'compactHooks', 'compactToolDefinitions'] as const) {
+  for (const option of ['removeRequestArchives', 'compactHooks', 'compactToolDefinitions', 'compactSkillListings'] as const) {
     const actions = [cutoff - 1, cutoff, now, now + 1, NaN].map((mtime, i) => ({
       ...action('slim-history', mtime, `/inert/${i}.jsonl`),
       slimOptions: {removeImages: false, compactTools: false, [option]: true},

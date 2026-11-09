@@ -2,9 +2,9 @@ import type { Provider } from './types.ts';
 import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
-export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean }
-export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number }
-export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number }
+export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean }
+export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
@@ -62,6 +62,16 @@ function knownToolSnapshot(row: Row): boolean {
       Object.keys(tool.schema).every(key => ['name', 'description', 'input_schema', 'eager_input_streaming'].includes(key)));
 }
 
+function knownSkillListing(row: Row): boolean {
+  if (!knownContextAttachment(row)) return false;
+  const listing = row.attachment;
+  return listing.type === 'skill_listing' &&
+    Object.keys(listing).every(key => ['type', 'content', 'names', 'skillCount', 'isInitial'].includes(key)) &&
+    typeof listing.content === 'string' && typeof listing.isInitial === 'boolean' &&
+    Array.isArray(listing.names) && listing.names.every((name: unknown) => typeof name === 'string') &&
+    Number.isSafeInteger(listing.skillCount) && listing.skillCount === listing.names.length;
+}
+
 // Record value spans so untouched fields (including signatures and large numeric
 // literals) stay byte-for-byte identical even in a modified JSONL record.
 function parseLine(text: string) {
@@ -111,12 +121,12 @@ function parseLine(text: string) {
   const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   return {
     row, savingsBytes,
-    replace(parent: object, key: string | number, value: unknown, category: keyof SlimSavingsBytes): boolean {
+    replace(parent: object, key: string | number, value: unknown, category: keyof SlimSavingsBytes, allowEqual = false): boolean {
       const span = spans.get(parent)?.get(key);
       if (!span) throw new Error('Unrecognized history field location');
       const serialized = JSON.stringify(value);
       const saved = Buffer.byteLength(text.slice(...span)) - Buffer.byteLength(serialized);
-      if (saved <= 0) return false;
+      if (saved < 0 || saved === 0 && (!allowEqual || text.slice(...span) === serialized)) return false;
       savingsBytes[category] = (savingsBytes[category] ?? 0) + saved;
       edits.push({start: span[0], end: span[1], value: serialized}); return true;
     },
@@ -230,6 +240,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   if (options.removeRequestArchives) { counts.requestRecords = 0; savingsBytes.requestRecords = 0; }
   if (options.compactHooks) { counts.hooks = 0; savingsBytes.hooks = 0; }
   if (options.compactToolDefinitions) { counts.toolDefinitions = 0; savingsBytes.toolDefinitions = 0; }
+  if (options.compactSkillListings) { counts.skillListings = 0; savingsBytes.skillListings = 0; }
   const requestLines = new Set<number>();
   let requestsKnown = true, conversationRecords = 0;
   const calls = new Map<string, RtkFilter | undefined>();
@@ -276,6 +287,14 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
       }
       if (options.compactToolDefinitions && knownToolSnapshot(row) && parsed.replace(row.attachment, 'tools', [], 'toolDefinitions'))
         counts.toolDefinitions! += row.attachment.tools.length;
+      if (options.compactSkillListings && knownSkillListing(row)) {
+        let changed = parsed.replace(row.attachment, 'content', '', 'skillListings');
+        if (parsed.replace(row.attachment, 'names', [], 'skillListings')) changed = true;
+        // The recorded inventory suppresses fresh discovery even after descriptions are cleared.
+        if (parsed.replace(row.attachment, 'skillCount', 0, 'skillListings', true)) changed = true;
+        if (row.rendered !== undefined && parsed.replace(row, 'rendered', [], 'skillListings')) changed = true;
+        if (changed) counts.skillListings!++;
+      }
       if (['user', 'assistant'].includes(row.type) && object(row.message) && Array.isArray(row.message.content)) {
         const content = row.message.content;
         replaceImages(content, false);
@@ -349,6 +368,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
     if (options.compactHooks) savingsBytes.hooks! += parsed.savingsBytes.hooks ?? 0;
     if (options.compactToolDefinitions) savingsBytes.toolDefinitions! += parsed.savingsBytes.toolDefinitions ?? 0;
+    if (options.compactSkillListings) savingsBytes.skillListings! += parsed.savingsBytes.skillListings ?? 0;
   }
   if (!records || !session) throw new Error('History format or session identity could not be established');
   // Remove the entire known archive family together; unknown siblings may still reference it.
