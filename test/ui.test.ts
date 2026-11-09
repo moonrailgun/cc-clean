@@ -636,6 +636,30 @@ function inertPlan(): Plan {
   };
 }
 
+test('cleanup summary shows all session bytes beside savings in both views, excluding temporary roots', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const first = { ...inertPlan(), totalSessionBytes: 8192 };
+  const second = { ...inertPlan(), provider: 'claude' as const, totalSessionBytes: 16384 };
+  const temporary = { ...inertPlan(), systemTemp: { uid: 501, excludedRoots: [] }, totalSessionBytes: 65536 };
+  for (const details of [false, true]) {
+    lines.length = 0;
+    printPlans([first, second, temporary], details);
+    const text = lines.join('\n');
+    assert.match(text, /24\.00 KiB\s+Total session size/);
+    assert.match(text, /3\.00 KiB\s+Total estimated savings/);
+    assert.equal(text.match(/Total session size/g)?.length, 1);
+  }
+  for (const totalSessionBytes of [undefined, null]) {
+    lines.length = 0;
+    printPlans([first, { ...second, totalSessionBytes }], false);
+    assert.match(lines.join('\n'), /unknown\s+Total session size/);
+  }
+  lines.length = 0;
+  printPlans([temporary], false);
+  assert.doesNotMatch(lines.join('\n'), /Total session size/);
+});
+
 test('cleanup file rows group and rank savings, hide inactive effects and retain full details', () => {
   const p = { ...inertPlan(), provider: 'claude' as const, root: '/inert/claude' };
   const history = (id: string, project: string, savings: number): Plan['actions'][number] => ({

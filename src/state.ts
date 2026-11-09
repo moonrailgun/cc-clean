@@ -130,6 +130,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
     (uuid.test(data.explicitTarget) || absolute(data.explicitTarget) && within(data.root, data.explicitTarget))));
   requireReceipt(data.rootIdentity === undefined || (object(data.rootIdentity) && bytes(data.rootIdentity.dev) && bytes(data.rootIdentity.ino)));
   requireReceipt(data.codexIndexFingerprint === undefined || (text(data.codexIndexFingerprint) && /^[0-9a-f]{64}$/.test(data.codexIndexFingerprint)));
+  requireReceipt(data.totalSessionBytes === undefined || data.totalSessionBytes === null || bytes(data.totalSessionBytes));
   if (data.systemTemp !== undefined) {
     requireReceipt(object(data.systemTemp) && bytes(data.systemTemp.uid) && Array.isArray(data.systemTemp.excludedRoots) && data.systemTemp.excludedRoots.every(absolute));
     requireReceipt(data.systemTemp.session === undefined || validSessionTempEvidence(data.systemTemp.session, data.root, data.provider));

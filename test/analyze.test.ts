@@ -7,8 +7,22 @@ import { DatabaseSync } from 'node:sqlite';
 import { directoryEntries, scanRoot } from '../src/scan.ts';
 import { analyze } from '../src/analyze.ts';
 import { readCodexIndex } from '../src/providers/codex.ts';
-import { report } from '../src/app.ts';
-import type { ScanProgress } from '../src/types.ts';
+import { report, sessionStorageBytes } from '../src/app.ts';
+import type { Inventory, ScanProgress } from '../src/types.ts';
+
+test('session storage includes protected histories and compressed copies, counting hard links once', () => {
+  const file = { path: '/inert/a.jsonl', relative: 'a.jsonl', size: 4096, allocatedBytes: 4096,
+    mtimeMs: Date.now(), ctimeMs: 0, dev: 1, ino: 1, nlink: 2, mode: 0, category: 'sessions' };
+  const inventory: Inventory = { provider: 'codex', root: '/inert', exists: true, complete: true,
+    totalBytes: 0, allocatedBytes: 0, links: [], errors: [], files: [
+      file, { ...file, path: '/inert/alias.jsonl' },
+      { ...file, path: '/inert/a.jsonl.zst', ino: 2, size: 1024 },
+      { ...file, path: '/inert/task.output', ino: 3, category: 'task-output' },
+    ] };
+  assert.equal(sessionStorageBytes(inventory), 5120);
+  assert.equal(sessionStorageBytes({ ...inventory, files: [] }), 0);
+  assert.equal(sessionStorageBytes({ ...inventory, complete: false }), null);
+});
 
 async function fixture(t: test.TestContext) {
   const base = await mkdtemp(join(tmpdir(), 'cc-clean-analysis-'));

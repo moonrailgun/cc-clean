@@ -1,5 +1,5 @@
 import type { Config } from './config.ts';
-import type { Provider, ScanProgress } from './types.ts';
+import type { Inventory, Provider, ScanProgress } from './types.ts';
 import { physicalKey, scanRoot } from './scan.ts';
 import { analyze } from './analyze.ts';
 import { createPlan, estimateSavings, executePlan, type Plan } from './clean.ts';
@@ -18,6 +18,11 @@ export const includesSystemTemp = (options: CleanupOptions) => !options.manual &
 export async function report(config: Config, provider: Provider, deep: boolean, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   return analyze(await scanRoot(config.roots[provider], provider, signal, onProgress), { deep, signal, onProgress, stateDir: config.stateDir });
 }
+export function sessionStorageBytes(inventory: Inventory): number | null {
+  if (!inventory.complete) return null;
+  const files = new Map(inventory.files.filter(f => f.category === 'sessions').map(f => [physicalKey(f), f.size]));
+  return [...files.values()].reduce((sum, bytes) => sum + bytes, 0);
+}
 export async function plan(config: Config, provider: Provider, options: CleanupOptions = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   const inventory = await scanRoot(config.roots[provider], provider, signal, onProgress);
   if (options.tempOnly) return createPlan(inventory, {tempOnly: true, otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']]});
@@ -32,6 +37,7 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
     slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools, removeReasoning: !!options.removeReasoning, removeRequestArchives: !!options.removeRequestArchives, compactHooks: !!options.compactHooks, compactToolDefinitions: !!options.compactToolDefinitions, compactSkillListings: !!options.compactSkillListings, removeOldSnapshots: !!options.removeOldSnapshots }, includeFileCleanup: options.includeFileCleanup,
     otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']],
   });
+  result.totalSessionBytes = sessionStorageBytes(inventory);
   result.warnings = [...new Set([...result.warnings, ...analysis.warnings])];
   if (!analysis.scanComplete) result.warnings.push('Deep scan is incomplete; only independently validated files are eligible');
   if (provider === 'claude' && !options.sessions?.length && !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives && !options.compactHooks && !options.compactToolDefinitions && !options.compactSkillListings && !options.removeOldSnapshots) result.warnings.push(CLAUDE_FILE_CLEANUP_NOTICE);

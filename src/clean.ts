@@ -35,6 +35,7 @@ export interface Plan {
   source:'clean'|'analyze';startedAt:string;actions:Action[];warnings:string[];scanComplete:boolean;
   rootIdentity?:{dev:number;ino:number};codexIndexFingerprint?:string;
   explicitTarget?:string;
+  totalSessionBytes?:number|null;
   systemTemp?:SystemTempScope;
 }
 export interface Receipt extends Plan {

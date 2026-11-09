@@ -135,6 +135,11 @@ export function printPlans(plans: Plan[], details = true) {
     }
     line();
   }
+  const sessionPlans = plans.filter(p => !p.systemTemp);
+  if (sessionPlans.length) rows([{
+    label: 'Total session size',
+    value: size(sessionPlans.some(p => p.totalSessionBytes == null) ? null : sessionPlans.reduce((sum, p) => sum + p.totalSessionBytes!, 0)),
+  }]);
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
   if (!details) {
     if (actions.some(a => a.kind !== 'compress-png')) note('Irreversible: removed content cannot be recovered. No undo.');
