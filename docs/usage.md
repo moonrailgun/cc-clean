@@ -52,6 +52,8 @@ npm pack
 npm exec --package=/absolute/path/cc-clean-1.0.0.tgz -- cc-clean --help
 ```
 
+See [Publishing to npm](publishing.md) for release checks, authentication and publishing.
+
 `npm test` includes cleanup and native deletion tests against disposable fixtures. Agents must not run that suite or cleanup commands, including previews, without an explicit user request; see [AGENTS.md](../AGENTS.md). `test:read-only` excludes cleanup planning/execution, file compression and native deletion. It includes synthetic in-memory history and SQLite transforms, inert plan rendering, and temporary layout/receipt fixtures; it does not rewrite user history or invoke native clients.
 
 ## Agent and script usage
