@@ -1135,3 +1135,23 @@ test('duplicate cleanup shows plaintext savings once and identifies the retained
   assert.ok(leaf.detail!.includes(`Remove: ${f.path}\nKeep: ${f.path}.zst`));
   assert.deepEqual(p, original, 'rendering must not mutate the plan');
 });
+
+test('cleanup notes and menu descriptions use readable terminal foreground in color mode', t => {
+  const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+  const noColor = process.env.NO_COLOR, term = process.env.TERM;
+  Object.defineProperty(process.stdout, 'isTTY', {configurable: true, value: true});
+  delete process.env.NO_COLOR; process.env.TERM = 'xterm-256color';
+  t.after(() => {
+    if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete (process.stdout as any).isTTY;
+    if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor;
+    if (term === undefined) delete process.env.TERM; else process.env.TERM = term;
+  });
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  printPlan({...inertPlan(), actions: [], warnings: ['Kept unchanged: unrecognized image format']});
+  assert.doesNotMatch(lines.join('\n'), /\x1b\[(?:90|2)m/);
+  assert.match(lines.join('\n'), /\x1b\[1m.*Scan notes/);
+  const description = menuRow({name: 'View scan notes', description: 'Full paths and reasons', value: 'notes'}, 0, false, 100, {total: 0, max: 0, labelWidth: 20, color: true});
+  assert.match(description, /Full paths and reasons/);
+  assert.doesNotMatch(description, /\x1b\[(?:90|2)m/);
+});

@@ -15,7 +15,7 @@ export function size(bytes: number | null): string {
 }
 export const columns = () => Math.max(1, (process.stdout.columns || 80) - 1);
 export const hasColor = () => !!process.stdout.isTTY && !('NO_COLOR' in process.env) && process.env.TERM !== 'dumb';
-const colors = { cyan: '36', purple: '1;35', gray: '90', green: '32', yellow: '33', bold: '1' };
+const colors = { cyan: '36', purple: '1;35', plain: '39', green: '32', yellow: '33', bold: '1' };
 export function paint(color: keyof typeof colors, value: unknown, enabled = hasColor()): string {
   const text = safe(value);
   return enabled ? `\x1b[${colors[color]}m${text}\x1b[0m` : text;
@@ -53,7 +53,7 @@ export function table(headers: string[], records: string[][], width = columns())
     if (lines.length) lines.push('');
     for (const [index, row] of cells.entries()) {
       const text = `  ${pad(row[0], nameWidth)}${row.slice(start, end).map((cell, i) => `  ${cell.padStart(widths[start + i])}`).join('')}`;
-      lines.push(index === 0 ? paint('gray', text) : text);
+      lines.push(index === 0 ? paint('plain', text) : text);
     }
     start = end;
   }
@@ -93,7 +93,7 @@ export function storageRow(item: { name: string; bytes: number }, options: {
   if (nameWidth < 4) return paint(selected ? 'cyan' : 'bold', fit(`${prefix}${item.name}  ${amount}`, width), color);
   const label = `${pad(item.name, nameWidth)}  ${amount}`;
   if (selected) return paint('cyan', prefix + graph + label, color);
-  return prefix + (barWidth ? `${paint(total > 0 && item.bytes / total > 0.6 ? 'yellow' : 'green', bar, color)} ${paint('gray', percent + '  |  ', color)}` : '') + safe(label);
+  return prefix + (barWidth ? `${paint(total > 0 && item.bytes / total > 0.6 ? 'yellow' : 'green', bar, color)} ${paint('plain', percent + '  |  ', color)}` : '') + safe(label);
 }
 
 export function menuRow(item: Choice<unknown>, index: number, selected: boolean, width: number, options: {
@@ -106,7 +106,7 @@ export function menuRow(item: Choice<unknown>, index: number, selected: boolean,
   const name = fit(item.name, available);
   const description = item.description && available - options.labelWidth > 12 ? fit(item.description, available - options.labelWidth - 2) : '';
   const text = description ? `${pad(name, options.labelWidth)}  ${description}` : name;
-  return selected ? paint('cyan', prefix + text, color) : prefix + (description ? `${pad(name, options.labelWidth)}  ${paint('gray', description, color)}` : name);
+  return selected ? paint('cyan', prefix + text, color) : prefix + (description ? `${pad(name, options.labelWidth)}  ${paint('plain', description, color)}` : name);
 }
 
 function helpLines(hints: string[], width: number): string[] {
@@ -116,7 +116,7 @@ function helpLines(hints: string[], width: number): string[] {
     if (previous && measure(`${previous}  |  ${hint}`).width <= width - 2) lines[lines.length - 1] += `  |  ${hint}`;
     else lines.push(fit(hint, width - 2));
   }
-  return lines.map(text => paint('gray', `  ${text}`));
+  return lines.map(text => paint('plain', `  ${text}`));
 }
 
 // Let Inquirer own raw mode, input and cursor restoration, including on abort.
@@ -184,17 +184,17 @@ const prompt = createPrompt<number[] | null, Menu<unknown>>((config, done) => {
     '  ▀▄▄ ▀▄▄   ▀▄▄ █▄▄ ██▄ █▀█ █ ▀█',
   ].map(text => paint('cyan', text)), '');
   lines.push(paint('purple', fit(`  ${config.message}`, width)));
-  if (config.subtitle) lines.push(paint('gray', fit(`  ${config.subtitle}`, width)));
+  if (config.subtitle) lines.push(paint('plain', fit(`  ${config.subtitle}`, width)));
   lines.push(...summary.map(text => fit(text, width)));
   lines.push('');
-  if (!visible.length) lines.push(paint('gray', `  ${!query && config.emptyMessage ? config.emptyMessage : 'No matching items.'}`));
+  if (!visible.length) lines.push(paint('plain', `  ${!query && config.emptyMessage ? config.emptyMessage : 'No matching items.'}`));
   for (const [offset, entry] of visible.slice(start, start + pageSize).entries()) {
     lines.push(menuRow(entry.item, start + offset, start + offset === active, width, { ...metrics, multiple: config.multiple, checked: checked.includes(entry.index) }));
   }
   lines.push('');
   const item = visible[active]?.item;
-  if (hasDetails) lines.push(paint('gray', fit(`  ${item?.detail ?? ''}`, width)));
-  if (config.searchable) lines.push(paint('gray', fit(`  ${filtering || query ? `Filter: ${query}${filtering ? '▌' : ''}  ·  ` : ''}${visible.length} items${visible.length > pageSize ? `  ·  ${start + 1}–${Math.min(start + pageSize, visible.length)}` : ''}${config.multiple ? `  ·  ${checked.length} selected` : ''}`, width)));
+  if (hasDetails) lines.push(paint('plain', fit(`  ${item?.detail ?? ''}`, width)));
+  if (config.searchable) lines.push(paint('plain', fit(`  ${filtering || query ? `Filter: ${query}${filtering ? '▌' : ''}  ·  ` : ''}${visible.length} items${visible.length > pageSize ? `  ·  ${start + 1}–${Math.min(start + pageSize, visible.length)}` : ''}${config.multiple ? `  ·  ${checked.length} selected` : ''}`, width)));
   lines.push(...footer);
   return '\x1b[?25l' + lines.join('\n');
 });
@@ -325,7 +325,7 @@ const treePrompt = createPrompt<void, { message: string; subtitle?: string; node
   });
   const start = Math.floor(active / pageSize) * pageSize;
   const lines = ['', paint('purple', fit(`  ${config.message}`, width))];
-  if (config.subtitle) lines.push(paint('gray', fit(`  ${config.subtitle}`, width)));
+  if (config.subtitle) lines.push(paint('plain', fit(`  ${config.subtitle}`, width)));
   lines.push('');
   if (inspecting) lines.push(...detail.slice(detailStart, detailStart + pageSize).map(text => `  ${text}`));
   else if (!visible.length) lines.push(fit('  No items found.', width));
@@ -337,7 +337,7 @@ const treePrompt = createPrompt<void, { message: string; subtitle?: string; node
     const text = prefix + pad(fit(node.name, labelWidth, node.truncateStart), labelWidth) + amount;
     lines.push(paint(selected ? 'cyan' : 'bold', fit(text, width)));
   }
-  lines.push('', paint('gray', fit(`  ${inspecting ? `${detailStart + 1}–${Math.min(detailStart + pageSize, detail.length)} / ${detail.length} lines`
+  lines.push('', paint('plain', fit(`  ${inspecting ? `${detailStart + 1}–${Math.min(detailStart + pageSize, detail.length)} / ${detail.length} lines`
     : `${visible.length ? start + 1 : 0}–${Math.min(start + pageSize, visible.length)} / ${visible.length} items · ${current?.node.detail ?? ''}`}`, width)), ...footer);
   return '\x1b[?25l' + lines.join('\n');
 });
@@ -367,7 +367,7 @@ const pagerPrompt = createPrompt<void, Pager>((config, done) => {
   const tabs = config.pages.map((page, i) => i === active ? `[${safe(page.name)}]` : safe(page.name)).join('  ');
   const tabLine = measure(tabs).width <= width - 2 ? tabs : `← [${config.pages[active]?.name ?? ''}] →`;
   const header = ['', paint('purple', fit(`  ${config.message}`, width))];
-  if (config.subtitle) header.push(paint('gray', fit(`  ${config.subtitle}`, width)));
+  if (config.subtitle) header.push(paint('plain', fit(`  ${config.subtitle}`, width)));
   header.push('', paint('cyan', fit(`  ${tabLine}`, width)), '');
   const footer = helpLines(['←/→ Tabs', '↑↓/jk Scroll', 'PgUp/PgDn Page', 'Home/End', 'Q/Esc Back'], width);
   // Keep a content row even when the terminal is too short for the full chrome.
@@ -393,7 +393,7 @@ const pagerPrompt = createPrompt<void, Pager>((config, done) => {
   const body = content.slice(start, start + pageSize);
   while (body.length < pageSize) body.push('');
   return '\x1b[?25l' + [...header, ...body, '',
-    paint('gray', fit(`  ${content.length ? start + 1 : 0}–${Math.min(start + pageSize, content.length)} / ${content.length} lines`, width)),
+    paint('plain', fit(`  ${content.length ? start + 1 : 0}–${Math.min(start + pageSize, content.length)} / ${content.length} lines`, width)),
     ...footer].join('\n');
 });
 
@@ -426,7 +426,7 @@ const progressPrompt = createPrompt<void, {
   });
   const labels = { discovering: 'Discovering files…', sessions: 'Scanning sessions…', index: 'Reading session index…', finalizing: 'Building report…', estimating: 'Estimating cleanup savings…' };
   const lines = ['', paint('purple', fit(`  ${config.message}`, width))];
-  if (config.subtitle) lines.push(paint('gray', fit(`  ${config.subtitle}`, width)));
+  if (config.subtitle) lines.push(paint('plain', fit(`  ${config.subtitle}`, width)));
   lines.push('', paint('cyan', fit(`  ${stopping ? 'Stopping…' : labels[progress.phase]}`, width)));
   lines.push(fit(`  ${progress.total === null ? `${progress.completed} files found · total pending` : `${progress.completed} / ${progress.total} ${progress.phase === 'estimating' ? 'cleanup items estimated' : 'session files scanned'}`}`, width));
   if (progress.totalBytes !== undefined && progress.processedBytes !== undefined) {
@@ -436,7 +436,7 @@ const progressPrompt = createPrompt<void, {
     lines.push(paint('green', fit(`  ${'█'.repeat(filled)}${'░'.repeat(barWidth - filled)}  ${(ratio * 100).toFixed(1)}%`, width)));
     lines.push(fit(`  ${size(progress.processedBytes)} / ${size(progress.totalBytes)}`, width));
   }
-  if (progress.currentFile) lines.push(paint('gray', fit(`  ${progress.currentFile}`, width)));
+  if (progress.currentFile) lines.push(paint('plain', fit(`  ${progress.currentFile}`, width)));
   lines.push('', ...helpLines(['Q / Esc / Ctrl+C Cancel'], width));
   return '\x1b[?25l' + lines.join('\n');
 });

@@ -14,11 +14,11 @@ const providerName = (provider: Provider) => provider === 'claude' ? 'Claude Cod
 function line(value = '') { for (const part of value.split('\n')) console.log(safe(part)); }
 function title(value: string, subtitle?: string) {
   console.log('\n' + paint('purple', `  ${value}`));
-  if (subtitle) console.log(paint('gray', `  ${subtitle}`));
+  if (subtitle) console.log(paint('plain', `  ${subtitle}`));
   line();
 }
 function section(value: string) { console.log('\n' + paint('bold', `  ➤ ${value}`)); }
-function note(value: string) { console.log(paint('gray', `  ◎ ${value}`)); }
+function note(value: string) { console.log(paint('plain', `  ◎ ${value}`)); }
 function rows(items: { label: string; value: string }[]) {
   for (const row of items) console.log(`  ${paint('cyan', row.value.padStart(14))}  ${safe(row.label)}`);
 }
