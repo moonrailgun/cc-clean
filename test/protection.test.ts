@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ageProtectionReason, protectRecentContent, protectActiveContent, singleSelectedTarget, type Action, type Plan } from '../src/clean.ts';
-
 import { cleanupExecutionOrder, includesSystemTemp } from '../src/app.ts';
 import type { SessionTempEvidence } from '../src/session-temp.ts';
 
@@ -18,6 +17,38 @@ function plan(actions: Action[], explicitTarget?: string): Plan {
   return {schemaVersion: 1, operationId: 'inert', provider: 'codex', root: '/inert', version: 'unknown',
     source: 'clean', startedAt: new Date(now).toISOString(), scanComplete: true, warnings: [], actions, explicitTarget};
 }
+const sessionTemp: SessionTempEvidence = {path: '/inert', kind: 'directory', callId: 'exec-1', startedAt: 1, completedAt: 1,
+  roots: {claude: '/claude', codex: '/codex'}, source: '/codex/sessions/s1.jsonl', sessionId: 's1', fingerprint: 'a'.repeat(64), dev: 1, ino: 1, birthtimeMs: 1};
+
+test('session temporary files require strict age and both providers closed', async () => {
+  for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
+    const p = plan([action('delete-files', mtime)], '/inert/file');
+    p.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
+    protectRecentContent(p, now);
+    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+  }
+  for (const active of ['claude', 'codex', null]) {
+    const p = plan([action('delete-files', cutoff - 1)]), seen: string[] = [];
+    p.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
+    await protectActiveContent(p, async (provider, root, paths) => {
+      seen.push(provider); assert.equal(root, sessionTemp.roots[provider]); assert.deepEqual(paths, ['/inert/file']);
+      return provider === active ? 'Idle client remains open' : null;
+    });
+    assert.equal(p.actions.length, active ? 0 : 1);
+    assert.deepEqual(seen, active === 'claude' ? ['claude'] : ['claude', 'codex']);
+  }
+});
+
+test('temporary scopes run before evidence-changing history plans without mutating the list', () => {
+  const history = plan([action('slim-history')]), temp = plan([action()]), fixed = plan([action()]);
+  temp.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
+  fixed.systemTemp = {uid: 501, excludedRoots: []};
+  const plans = [history, temp, fixed];
+  assert.deepEqual(cleanupExecutionOrder(plans), [temp, history, fixed]);
+  assert.deepEqual(plans, [history, temp, fixed]);
+  assert.equal(includesSystemTemp({tempOnly: true}), true);
+  assert.equal(includesSystemTemp({includeFileCleanup: true, removeImages: true}), true);
+});
 
 test('every destructive kind uses a strict 72-hour modification cutoff', () => {
   for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'deduplicate-history'] as const) {
@@ -28,6 +59,22 @@ test('every destructive kind uses a strict 72-hour modification cutoff', () => {
       assert.ok(ageProtectionReason(action(kind, cutoff - 1), undefined, clock));
   }
   assert.equal(ageProtectionReason(action('compress-png'), undefined, now), null);
+});
+
+test('old snapshot removal inherits strict age and active-client protection', async () => {
+  for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
+    const a = action('slim-history', mtime);
+    a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+    a.slimCounts = {images: 0, toolOutputs: 0, oldSnapshots: 1};
+    const p = protectRecentContent(plan([a]), now);
+    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+  }
+  const a = action('slim-history', cutoff - 1);
+  a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+  const p = plan([a], a.files[0].path);
+  await protectActiveContent(p, async () => 'Idle client remains open');
+  assert.deepEqual(p.actions, []);
+  assert.match(p.warnings.join('\n'), /Activity protection/);
 });
 
 test('an age exception comes only from one unique explicit selection', () => {
@@ -76,6 +123,25 @@ test('bulk selection never gains an exception when only one action remains', () 
   assert.equal(protectRecentContent(plan([action()], '/inert/file'), now).actions.length, 1);
 });
 
+test('duplicate pairs require both files older than 72 hours even with an explicit original', async () => {
+  for (const member of [0, 1]) for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
+    const a = action('deduplicate-history', cutoff - 1, '/inert/sessions/one.jsonl');
+    a.files.push({...a.files[0], path: a.files[0].path + '.zst', ino: 2});
+    a.files[member].mtimeMs = mtime;
+    const p = plan([a], a.files[0].path);
+    protectRecentContent(p, now);
+    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+  }
+  for (const activity of [async () => 'Idle client is still open', async () => { throw new Error('Unknown activity'); }]) {
+    const a = action('deduplicate-history', cutoff - 1);
+    a.files.push({...a.files[0], path: a.files[0].path + '.zst', ino: 2});
+    const p = plan([a], a.files[0].path);
+    await protectActiveContent(p, activity);
+    assert.deepEqual(p.actions, []);
+    assert.match(p.warnings.join('\n'), /Activity protection/);
+  }
+});
+
 test('protected actions are excluded from savings while old and lossless actions remain', () => {
   const old = action('delete-files', cutoff - 1, '/inert/old');
   const png = action('compress-png', now, '/inert/image.png');
@@ -108,101 +174,6 @@ test('reasoning removal shares bulk age protection and excludes protected saving
   assert.equal(p.warnings.length, 4);
 });
 
-test('external system temps retain strict bulk age protection even for one or an explicit target', () => {
-  for (const modified of [cutoff, now, now + 1, NaN]) {
-    const p = plan([action('delete-files', modified)], '/inert/file');
-    p.systemTemp = {uid: 501, excludedRoots: []};
-    protectRecentContent(p, now);
-    assert.equal(p.actions.length, 0);
-    assert.match(p.warnings.join('\n'), /72-hour protection/);
-  }
-  const p = plan([action('delete-files', cutoff - 1)]);
-  p.systemTemp = {uid: 501, excludedRoots: []};
-  assert.equal(protectRecentContent(p, now).actions.length, 1);
-});
-
-
-test('activity protection excludes all estimates and cannot be bypassed by a single target or lossless operation', async () => {
-  for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'compress-png', 'deduplicate-history'] as const) {
-    const p = plan([action(kind, cutoff - 1)], '/inert/file');
-    p.warnings.push('Existing warning');
-    await protectActiveContent(p, async () => 'Client still owns an idle session');
-    assert.deepEqual(p.actions, []);
-    assert.deepEqual(p.warnings, ['Existing warning', 'Activity protection: Client still owns an idle session']);
-  }
-});
-
-
-test('activity inspection failure retains content while a closed client preserves eligible operations', async () => {
-  const p = plan([action('slim-history', cutoff - 1)]), original = [...p.actions];
-  await protectActiveContent(p, async () => null);
-  assert.deepEqual(p.actions, original);
-  await protectActiveContent(p, async () => { throw new Error('Inspection unavailable'); });
-  assert.deepEqual(p.actions, []);
-  assert.match(p.warnings.join('\n'), /Cannot reliably check client activity/);
-});
-
-
-test('activity filtering supplies only candidate paths for external temporary files', async () => {
-  const p = plan([action('delete-files', cutoff - 1)]);
-  p.systemTemp = {uid: 501, excludedRoots: []};
-  await protectActiveContent(p, async (provider, root, files) => {
-    assert.equal(provider, 'codex'); assert.equal(root, '/inert');
-    assert.deepEqual(files, ['/inert/file']);
-    return null;
-  });
-  assert.equal(p.actions.length, 1);
-});
-
-
-test('Codex checks candidate files and protects only their open session identities', async () => {
-  const active = action('slim-history', cutoff - 1), closed = action('slim-history', cutoff - 1, '/inert/sessions/closed.jsonl');
-  const p = plan([active,closed]);
-  await protectActiveContent(p, async (provider, root, files) => {
-    assert.equal(provider, 'codex'); assert.equal(root, p.root);
-    assert.deepEqual(files, [active.files[0].path,closed.files[0].path]);
-    return {sessionIds:[session],openFiles:[],codexOwners:{[active.files[0].path]:[session],[closed.files[0].path]:['closed']}};
-  });
-  assert.deepEqual(p.actions, [closed]);
-  assert.match(p.warnings.join('\n'), /Codex active session/);
-});
-
-const sessionTemp: SessionTempEvidence = {path: '/inert', kind: 'directory', callId: 'exec-1', startedAt: 1, completedAt: 1,
-  roots: {claude: '/claude', codex: '/codex'}, source: '/codex/sessions/s1.jsonl', sessionId: 's1', fingerprint: 'a'.repeat(64), dev: 1, ino: 1, birthtimeMs: 1};
-
-
-test('session temporary files require strict age and both providers closed', async () => {
-  for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
-    const p = plan([action('delete-files', mtime)], '/inert/file');
-    p.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
-    protectRecentContent(p, now);
-    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
-  }
-  for (const active of ['claude', 'codex', null]) {
-    const p = plan([action('delete-files', cutoff - 1)]), seen: string[] = [];
-    p.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
-    await protectActiveContent(p, async (provider, root, paths) => {
-      seen.push(provider); assert.equal(root, sessionTemp.roots[provider]); assert.deepEqual(paths, ['/inert/file']);
-      return provider === active ? 'Idle client remains open' : null;
-    });
-    assert.equal(p.actions.length, active ? 0 : 1);
-    assert.deepEqual(seen, active === 'claude' ? ['claude'] : ['claude', 'codex']);
-  }
-});
-
-
-test('temporary scopes run before evidence-changing history plans without mutating the list', () => {
-  const history = plan([action('slim-history')]), temp = plan([action()]), fixed = plan([action()]);
-  temp.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
-  fixed.systemTemp = {uid: 501, excludedRoots: []};
-  const plans = [history, temp, fixed];
-  assert.deepEqual(cleanupExecutionOrder(plans), [temp, history, fixed]);
-  assert.deepEqual(plans, [history, temp, fixed]);
-  assert.equal(includesSystemTemp({tempOnly: true}), true);
-  assert.equal(includesSystemTemp({includeFileCleanup: true, removeImages: true}), true);
-});
-
-
 test('Claude archive, hook, tool-definition and skill-listing slimming share age and activity protection', async () => {
   for (const option of ['removeRequestArchives', 'compactHooks', 'compactToolDefinitions', 'compactSkillListings'] as const) {
     const actions = [cutoff - 1, cutoff, now, now + 1, NaN].map((mtime, i) => ({
@@ -219,40 +190,47 @@ test('Claude archive, hook, tool-definition and skill-listing slimming share age
   }
 });
 
-
-test('duplicate pairs require both files older than 72 hours even with an explicit original', async () => {
-  for (const member of [0, 1]) for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
-    const a = action('deduplicate-history', cutoff - 1, '/inert/sessions/one.jsonl');
-    a.files.push({...a.files[0], path: a.files[0].path + '.zst', ino: 2});
-    a.files[member].mtimeMs = mtime;
-    const p = plan([a], a.files[0].path);
+test('external system temps retain strict bulk age protection even for one or an explicit target', () => {
+  for (const modified of [cutoff, now, now + 1, NaN]) {
+    const p = plan([action('delete-files', modified)], '/inert/file');
+    p.systemTemp = {uid: 501, excludedRoots: []};
     protectRecentContent(p, now);
-    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+    assert.equal(p.actions.length, 0);
+    assert.match(p.warnings.join('\n'), /72-hour protection/);
   }
-  for (const activity of [async () => 'Idle client is still open', async () => { throw new Error('Unknown activity'); }]) {
-    const a = action('deduplicate-history', cutoff - 1);
-    a.files.push({...a.files[0], path: a.files[0].path + '.zst', ino: 2});
-    const p = plan([a], a.files[0].path);
-    await protectActiveContent(p, activity);
+  const p = plan([action('delete-files', cutoff - 1)]);
+  p.systemTemp = {uid: 501, excludedRoots: []};
+  assert.equal(protectRecentContent(p, now).actions.length, 1);
+});
+
+test('activity protection excludes all estimates and cannot be bypassed by a single target or lossless operation', async () => {
+  for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'compress-png', 'deduplicate-history'] as const) {
+    const p = plan([action(kind, cutoff - 1)], '/inert/file');
+    p.warnings.push('Existing warning');
+    await protectActiveContent(p, async () => 'Client still owns an idle session');
     assert.deepEqual(p.actions, []);
-    assert.match(p.warnings.join('\n'), /Activity protection/);
+    assert.deepEqual(p.warnings, ['Existing warning', 'Activity protection: Client still owns an idle session']);
   }
 });
 
-test('old snapshot removal inherits strict age and active-client protection', async () => {
-  for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
-    const a = action('slim-history', mtime);
-    a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
-    a.slimCounts = {images: 0, toolOutputs: 0, oldSnapshots: 1};
-    const p = protectRecentContent(plan([a]), now);
-    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
-  }
-  const a = action('slim-history', cutoff - 1);
-  a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
-  const p = plan([a], a.files[0].path);
-  await protectActiveContent(p, async () => 'Idle client remains open');
+test('activity inspection failure retains content while a closed client preserves eligible operations', async () => {
+  const p = plan([action('slim-history', cutoff - 1)]), original = [...p.actions];
+  await protectActiveContent(p, async () => null);
+  assert.deepEqual(p.actions, original);
+  await protectActiveContent(p, async () => { throw new Error('Inspection unavailable'); });
   assert.deepEqual(p.actions, []);
-  assert.match(p.warnings.join('\n'), /Activity protection/);
+  assert.match(p.warnings.join('\n'), /Cannot reliably check client activity/);
+});
+
+test('activity filtering supplies only candidate paths for external temporary files', async () => {
+  const p = plan([action('delete-files', cutoff - 1)]);
+  p.systemTemp = {uid: 501, excludedRoots: []};
+  await protectActiveContent(p, async (provider, root, files) => {
+    assert.equal(provider, 'codex'); assert.equal(root, '/inert');
+    assert.deepEqual(files, ['/inert/file']);
+    return null;
+  });
+  assert.equal(p.actions.length, 1);
 });
 
 test('Claude activity retains only the active session, its descendants and unknown ownership', async () => {
@@ -287,4 +265,16 @@ test('session temp evidence uses provider roots and keeps unknown cross-provider
   assert.equal(p.actions.length, 1);
   await protectActiveContent(p, async provider => provider === 'claude' ? {sessionIds: [session], openFiles: []} : null);
   assert.equal(p.actions.length, 0);
+});
+
+test('Codex checks candidate files and protects only their open session identities', async () => {
+  const active = action('slim-history', cutoff - 1), closed = action('slim-history', cutoff - 1, '/inert/sessions/closed.jsonl');
+  const p = plan([active,closed]);
+  await protectActiveContent(p, async (provider, root, files) => {
+    assert.equal(provider, 'codex'); assert.equal(root, p.root);
+    assert.deepEqual(files, [active.files[0].path,closed.files[0].path]);
+    return {sessionIds:[session],openFiles:[],codexOwners:{[active.files[0].path]:[session],[closed.files[0].path]:['closed']}};
+  });
+  assert.deepEqual(p.actions, [closed]);
+  assert.match(p.warnings.join('\n'), /Codex active session/);
 });

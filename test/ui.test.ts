@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
-import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, cleanOptions, confirmPlans, emptyPlansMenu, usageMenu } from '../src/ui.ts';
+import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, confirmPlans, emptyPlansMenu, cleanOptions, usageMenu } from '../src/ui.ts';
 import { CLAUDE_FILE_CLEANUP_NOTICE } from '../src/app.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';

@@ -11,7 +11,7 @@
     "build": "tsc && chmod +x dist/cli.js",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
-    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/activity.test.ts test/system-temp.test.ts test/session-temp.test.ts test/commands.test.ts test/agent.test.ts test/analyze.test.ts test/state.test.ts test/ui.test.ts test/slim.test.ts test/protection.test.ts test/codex-history.test.ts",
+    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/commands.test.ts test/agent.test.ts test/analyze.test.ts test/state.test.ts test/ui.test.ts test/slim.test.ts test/protection.test.ts test/activity.test.ts test/codex-history.test.ts test/system-temp.test.ts test/session-temp.test.ts",
     "prepack": "npm run build"
   },
   "dependencies": { "@inquirer/core": "^12.0.6", "fast-string-truncated-width": "^3.0.3", "smol-toml": "^1.9.1" },

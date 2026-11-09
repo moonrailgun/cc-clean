@@ -251,6 +251,74 @@ async function layout(t: TestContext) {
   return {root, put};
 }
 
+test('duplicate layout allows only the same-basename pair and retains additional identity copies', async t => {
+  const {root, put} = await layout(t);
+  for (const meta of [{id: 'one'}, {id: 'one', session_id: 'stable'}, {id: 'one', session_id: 'one'}]) {
+    const plain = await put('sessions/one.jsonl', meta), zipped = await put('sessions/one.jsonl.zst', meta);
+    const inventory = await scanRoot(root, 'codex');
+    const allowed = await verifyCodexRewriteLayout(inventory, undefined, true);
+    assert.equal(allowed.has(plain), false); assert.equal(allowed.has(zipped), false);
+    const rewrite = await verifyCodexRewriteLayout(inventory);
+    assert.equal(rewrite.has(plain), true); assert.equal(rewrite.has(zipped), true);
+    for (const thirdMeta of [{id: 'one'}, {id: 'third', session_id: meta.session_id ?? meta.id}]) {
+      const third = await put('archived_sessions/third.jsonl.zst', thirdMeta);
+      const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+      for (const path of [plain, zipped, third]) assert.match(blocked.get(path)!, /copies|referenced/);
+      await rm(third);
+    }
+  }
+});
+
+test('duplicate layout retains shared, hardlinked and unknown-format pairs', async t => {
+  const {root, put} = await layout(t);
+  const plain = await put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
+  const zipped = await put('sessions/one.jsonl.zst', {id: 'one', session_id: 'stable'});
+  for (const id of ['one', 'stable']) {
+    const dependent = await put('archived_sessions/dependent.jsonl.zst', {id: 'dependent', history_base: {thread_id: id, end_byte_offset: 100}});
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+    for (const path of [plain, zipped]) assert.match(blocked.get(path)!, /referenced/);
+    await rm(dependent);
+  }
+  for (const path of [plain, zipped]) {
+    const alias = join(root, 'linked-copy'); await link(path, alias);
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+    assert.match(blocked.get(path)!, /hard links/);
+    await rm(alias);
+  }
+  for (const meta of [{id: 'one', history_mode: 'unknown'}, {id: 'one', imported: true}, {id: 'one', attached_thread: 'other'}]) {
+    await put('sessions/one.jsonl', meta); await put('sessions/one.jsonl.zst', meta);
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+    assert.equal(blocked.has(plain), true); assert.equal(blocked.has(zipped), true);
+  }
+});
+
+test('header inspection supports plain and compressed layouts and rejects stale snapshots', async t => {
+  const {root, put} = await layout(t);
+  const plain = await put('sessions/one.jsonl', {id: 'one', history_mode: 'paginated'});
+  await put('archived_sessions/two.jsonl.zst', {id: 'two'});
+  const inv = await scanRoot(root, 'codex');
+  for (const file of inv.files) {
+    const original = await readFile(file.path);
+    assert.ok((await readCodexHeader(file)).payload.id);
+    assert.deepEqual(await readFile(file.path), original);
+  }
+  await writeFile(plain, lines(header));
+  await assert.rejects(readCodexHeader(inv.files.find(f => f.path === plain)!), /changed/);
+});
+
+test('unrelated compressed and hardlinked histories do not block an independent paginated target', async t => {
+  const {root, put} = await layout(t);
+  const independent = await put('sessions/independent.jsonl', {id: 'independent', history_mode: 'paginated'});
+  const zipped = await put('archived_sessions/zipped.jsonl.zst', {id: 'zipped'});
+  const linked = await put('sessions/linked.jsonl', {id: 'linked'});
+  await link(linked, join(root, 'linked-copy'));
+  await writeFile(join(root, 'thread_history_1.sqlite'), 'layout-only sentinel');
+  const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
+  assert.equal(blocked.has(independent), false);
+  assert.match(blocked.get(zipped)!, /Compressed/);
+  assert.match(blocked.get(linked)!, /hard links/);
+});
+
 test('a growing unrelated rollout retains its inbound references without blocking independent history', async t => {
   const {root, put} = await layout(t);
   const source = await put('sessions/source.jsonl', {id: 'source', session_id: 'stable'});
@@ -344,74 +412,6 @@ test('reference inspection still rejects replaced, truncated, incomplete and cha
   inv = await scanRoot(root, 'codex');
   await appendFile(zipped, zstdCompressSync('extra'));
   await assert.rejects(verifyCodexRewriteLayout(inv), /changed/);
-});
-
-test('duplicate layout allows only the same-basename pair and retains additional identity copies', async t => {
-  const {root, put} = await layout(t);
-  for (const meta of [{id: 'one'}, {id: 'one', session_id: 'stable'}, {id: 'one', session_id: 'one'}]) {
-    const plain = await put('sessions/one.jsonl', meta), zipped = await put('sessions/one.jsonl.zst', meta);
-    const inventory = await scanRoot(root, 'codex');
-    const allowed = await verifyCodexRewriteLayout(inventory, undefined, true);
-    assert.equal(allowed.has(plain), false); assert.equal(allowed.has(zipped), false);
-    const rewrite = await verifyCodexRewriteLayout(inventory);
-    assert.equal(rewrite.has(plain), true); assert.equal(rewrite.has(zipped), true);
-    for (const thirdMeta of [{id: 'one'}, {id: 'third', session_id: meta.session_id ?? meta.id}]) {
-      const third = await put('archived_sessions/third.jsonl.zst', thirdMeta);
-      const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
-      for (const path of [plain, zipped, third]) assert.match(blocked.get(path)!, /copies|referenced/);
-      await rm(third);
-    }
-  }
-});
-
-test('duplicate layout retains shared, hardlinked and unknown-format pairs', async t => {
-  const {root, put} = await layout(t);
-  const plain = await put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
-  const zipped = await put('sessions/one.jsonl.zst', {id: 'one', session_id: 'stable'});
-  for (const id of ['one', 'stable']) {
-    const dependent = await put('archived_sessions/dependent.jsonl.zst', {id: 'dependent', history_base: {thread_id: id, end_byte_offset: 100}});
-    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
-    for (const path of [plain, zipped]) assert.match(blocked.get(path)!, /referenced/);
-    await rm(dependent);
-  }
-  for (const path of [plain, zipped]) {
-    const alias = join(root, 'linked-copy'); await link(path, alias);
-    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
-    assert.match(blocked.get(path)!, /hard links/);
-    await rm(alias);
-  }
-  for (const meta of [{id: 'one', history_mode: 'unknown'}, {id: 'one', imported: true}, {id: 'one', attached_thread: 'other'}]) {
-    await put('sessions/one.jsonl', meta); await put('sessions/one.jsonl.zst', meta);
-    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
-    assert.equal(blocked.has(plain), true); assert.equal(blocked.has(zipped), true);
-  }
-});
-
-test('header inspection supports plain and compressed layouts and rejects stale snapshots', async t => {
-  const {root, put} = await layout(t);
-  const plain = await put('sessions/one.jsonl', {id: 'one', history_mode: 'paginated'});
-  await put('archived_sessions/two.jsonl.zst', {id: 'two'});
-  const inv = await scanRoot(root, 'codex');
-  for (const file of inv.files) {
-    const original = await readFile(file.path);
-    assert.ok((await readCodexHeader(file)).payload.id);
-    assert.deepEqual(await readFile(file.path), original);
-  }
-  await writeFile(plain, lines(header));
-  await assert.rejects(readCodexHeader(inv.files.find(f => f.path === plain)!), /changed/);
-});
-
-test('unrelated compressed and hardlinked histories do not block an independent paginated target', async t => {
-  const {root, put} = await layout(t);
-  const independent = await put('sessions/independent.jsonl', {id: 'independent', history_mode: 'paginated'});
-  const zipped = await put('archived_sessions/zipped.jsonl.zst', {id: 'zipped'});
-  const linked = await put('sessions/linked.jsonl', {id: 'linked'});
-  await link(linked, join(root, 'linked-copy'));
-  await writeFile(join(root, 'thread_history_1.sqlite'), 'layout-only sentinel');
-  const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
-  assert.equal(blocked.has(independent), false);
-  assert.match(blocked.get(zipped)!, /Compressed/);
-  assert.match(blocked.get(linked)!, /hard links/);
 });
 
 test('inbound references through rollout and session identities retain only dependent histories', async t => {
