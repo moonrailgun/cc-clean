@@ -200,3 +200,20 @@ test('temporary scopes run before evidence-changing history plans without mutati
   assert.equal(includesSystemTemp({tempOnly: true}), true);
   assert.equal(includesSystemTemp({includeFileCleanup: true, removeImages: true}), true);
 });
+
+
+test('Claude archive, hook, tool-definition and skill-listing slimming share age and activity protection', async () => {
+  for (const option of ['removeRequestArchives'] as const) {
+    const actions = [cutoff - 1, cutoff, now, now + 1, NaN].map((mtime, i) => ({
+      ...action('slim-history', mtime, `/inert/${i}.jsonl`),
+      slimOptions: {removeImages: false, compactTools: false, [option]: true},
+    }));
+    const p = plan(actions); p.provider = 'claude';
+    protectRecentContent(p, now);
+    assert.deepEqual(p.actions, [actions[0]]);
+    assert.equal(p.warnings.length, 4);
+    await protectActiveContent(p, async () => 'Idle client is still open');
+    assert.deepEqual(p.actions, []);
+    assert.match(p.warnings.at(-1)!, /Activity protection/);
+  }
+});

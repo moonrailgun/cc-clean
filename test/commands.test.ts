@@ -29,12 +29,20 @@ test('history flags are independent clean-only opt-ins and keep confirmation req
   assert.equal(quick.values['remove-images'], undefined);
   assert.equal(quick.values['compact-tools'], undefined);
   assert.equal(quick.values['remove-reasoning'], undefined);
+  assert.equal(quick.values['remove-request-archives'], undefined);
   assert.throws(() => parseCommand(['clean', '--provider', 'claude', '--remove-reasoning', '--yes'], false), /Codex/);
-  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-images', '--compact-tools', '--remove-reasoning']]) {
+  for (const flag of ['--remove-request-archives']) {
+    assert.throws(() => parseCommand(['clean', '--provider', 'codex', flag, '--yes'], false), /Claude/);
+    assert.throws(() => parseCommand(['clean', '--temp-only', flag, '--yes'], false), /--temp-only/);
+    assert.equal(parseCommand(['clean', '--provider', 'claude', flag, '--yes'], false).provider, 'claude');
+    assert.ok(commandSchema.commands[0].options.includes(flag.slice(2)));
+    assert.ok(help.includes(flag));
+  }
+  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-request-archives'], ['--remove-images', '--compact-tools', '--remove-reasoning', '--remove-request-archives']]) {
     assert.throws(() => parseCommand(['clean', ...flags, '--json'], true), /--yes/);
     const parsed = parseCommand(['clean', ...flags, '--yes', '--json'], true);
     assert.equal(parsed.interactive, false);
-    for (const flag of flags) assert.equal(parsed.values[flag.slice(2) as 'remove-images' | 'compact-tools' | 'remove-reasoning'], true);
+    for (const flag of flags) assert.equal(parsed.values[flag.slice(2) as keyof typeof parsed.values], true);
     assert.equal(parseCommand(['clean', ...flags, '--yes'], true).interactive, true);
     assert.equal(parseCommand(['clean', ...flags, '--dry-run'], false).values['dry-run'], true);
     for (const command of [['analyze'], ['stats'], ['analyze', 'delete', '--provider', 'claude', '--session', id, '--yes']])

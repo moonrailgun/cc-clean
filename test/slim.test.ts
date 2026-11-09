@@ -332,3 +332,59 @@ test('Claude slimming follows record shape across old, new and mixed versions', 
     }
   }
 });
+
+const archives = [
+  {type: 'api-request-blob', sessionId: 'synthetic', hash: 'blob', message: {role: 'user', content: 'archived prompt'}},
+  {type: 'api-request-shape', sessionId: 'synthetic', shapeHash: 'shape', shape: {model: 'example'}},
+  {type: 'api-request', sessionId: 'synthetic', id: 'request', shapeHash: 'shape', params: {}, base: 'previous', keep: 0, tail: ['blob'], cacheControl: [], requestDigest: 'digest'},
+];
+
+const successfulHook = {
+  type: 'attachment', sessionId: 'synthetic', uuid: 'hook-id', parentUuid: 'user-id', timestamp: '2026-11-01T00:00:00Z',
+  attachment: {type: 'hook_success', hookName: 'SessionStart:resume', hookEvent: 'SessionStart', toolUseID: 'tool-id',
+    command: 'echo saved-command', content: 'saved context', stdout: 'saved output', stderr: 'saved diagnostic', exitCode: 0, durationMs: 12},
+  rendered: [{content: 'model-facing context'}],
+};
+
+
+test('Claude archive and hook slimming preserve raw conversation, cost and graph bytes independently and together', () => {
+  const user = JSON.stringify(claude('user', [{type: 'text', text: 'Keep 用户 text'}], {uuid: 'user-id', parentUuid: null}));
+  const assistant = JSON.stringify(claude('assistant', [{type: 'thinking', thinking: 'keep', signature: 'keep-signature'}],
+    {uuid: 'assistant-id', parentUuid: 'hook-id', usage: {input_tokens: 123, output_tokens: 45}}));
+  const cost = '{ "type":"cost-state", "sessionId":"synthetic", "cost":1.230000, "large":9007199254740993 }';
+  const hook = JSON.stringify(successfulHook).replace('"durationMs":12', '"durationMs":12.000');
+  const cleared = JSON.stringify({...successfulHook, attachment: {...successfulHook.attachment,
+    command: '', content: '', stdout: '', stderr: ''}, rendered: []}).replace('"durationMs":12', '"durationMs":12.000');
+  for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
+    const rows = [user, hook, ...archives.map(row => JSON.stringify(row)), assistant, cost];
+    const input = Buffer.from(rows.join(newline) + finalNewline);
+    for (const [removeRequestArchives, compactHooks] of [[true, false]]) {
+      const options = {removeImages: false, compactTools: false, removeRequestArchives};
+      const result = slimHistory(input, 'claude', options);
+      const expected = [user, compactHooks ? cleared : hook, ...(removeRequestArchives ? [] : rows.slice(2, 5)), assistant, cost];
+      assert.equal(result.output?.toString(), expected.join(newline) + finalNewline);
+      assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
+        ...(removeRequestArchives ? {requestRecords: 3} : {})});
+      assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
+      assert.equal(slimHistory(result.output!, 'claude', options).output, null);
+    }
+  }
+});
+
+
+test('Claude archives handle a final row without newline and retain unknown archive families or archive-only files', () => {
+  const options = {removeImages: false, compactTools: false, removeRequestArchives: true};
+  const conversation = jsonl(claude('user', []));
+  const input = Buffer.concat([conversation, Buffer.from(JSON.stringify(archives[0]))]);
+  const result = slimHistory(input, 'claude', options);
+  assert.deepEqual(result.output, conversation);
+  assert.equal(result.savingsBytes.requestRecords, input.length - conversation.length);
+  assert.equal(slimHistory(jsonl(...archives), 'claude', options).output, null);
+  for (const unknown of [
+    {...archives[0], usage: {input_tokens: 123}}, {...archives[0], message: 'unexpected'},
+    {...archives[1], shape: null}, {...archives[2], tail: [12]}, {...archives[2], keep: -1},
+    {type: 'api-request-new', sessionId: 'synthetic'},
+  ]) assert.equal(slimHistory(jsonl(claude('user', []), ...archives, unknown), 'claude', options).output, null);
+  assert.throws(() => slimHistory(jsonl(claude('user', []), {...archives[0], sessionId: 'other'}), 'claude', options), /Mixed/);
+  assert.throws(() => slimHistory(Buffer.concat([input, Buffer.from('\nnot-json')]), 'claude', options), /Malformed/);
+});

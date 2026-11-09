@@ -9,9 +9,9 @@ import { within } from './state.ts';
 import { dirname } from 'node:path';
 import { discoverSessionTemps } from './session-temp.ts';
 
-type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; tempOnly?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean };
+type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; tempOnly?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean };
 export const includesSystemTemp = (options: CleanupOptions) => !options.manual && !options.files?.length && !options.sessions?.length &&
-  (!!options.includeFileCleanup || !options.removeImages && !options.compactTools && !options.removeReasoning);
+  (!!options.includeFileCleanup || !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives);
 
 export async function report(config: Config, provider: Provider, deep: boolean, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   return analyze(await scanRoot(config.roots[provider], provider, signal, onProgress), { deep, signal, onProgress, stateDir: config.stateDir });
@@ -27,13 +27,12 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
   const result = await createPlan(inventory, {
     version, source: options.manual ? 'analyze' : 'clean', sessions: analysis.sessions,
     sessionIds: options.sessions, filePaths: options.files, deleteImages: options.deleteImages,
-    includeFileCleanup: options.includeFileCleanup,
-    slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools, removeReasoning: !!options.removeReasoning },
+    slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools, removeReasoning: !!options.removeReasoning, removeRequestArchives: !!options.removeRequestArchives}, includeFileCleanup: options.includeFileCleanup,
     otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']],
   });
   result.warnings = [...new Set([...result.warnings, ...analysis.warnings])];
   if (!analysis.scanComplete) result.warnings.push('Deep scan is incomplete; only independently validated files are eligible');
-  if (provider === 'claude' && !options.sessions?.length && !options.removeImages && !options.compactTools) result.warnings.push('Claude has no verified automatic temporary-file or standalone PNG rules; use Slim history for opt-in field removal');
+  if (provider === 'claude' && !options.sessions?.length && !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives) result.warnings.push('Claude has no verified automatic temporary-file or standalone PNG rules; use Slim history for opt-in field removal');
   if (provider === 'claude' && options.sessions?.length) {
     const retained = new Map(inventory.files.filter(f => f.category === 'config' || f.relative === 'history.jsonl' || f.relative.startsWith('file-history/')).map(f => [physicalKey(f), f.size]));
     result.warnings.push(`Retaining project memory, configuration, file-history and history.jsonl (provider total: ${[...retained.values()].reduce((sum, bytes) => sum + bytes, 0)} B). Other sessions and resources with unknown ownership are also retained. This does not erase all history.`);
@@ -43,7 +42,7 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
   return result;
 }
 export async function cleanupPlans(config: Config, provider: Provider, options: CleanupOptions = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void): Promise<Plan[]> {
-  if (options.tempOnly && (options.manual || options.files?.length || options.sessions?.length || options.deleteImages || options.removeImages || options.compactTools || options.removeReasoning))
+  if (options.tempOnly && (options.manual || options.files?.length || options.sessions?.length || options.deleteImages || options.removeImages || options.compactTools || options.removeReasoning || options.removeRequestArchives))
     throw new Error('Temporary-file cleanup cannot be combined with explicit targets or history slimming');
   const plans = [await plan(config, provider, options, signal, onProgress)];
   if (!includesSystemTemp(options)) return plans;

@@ -524,3 +524,28 @@ test('session temporary receipts bind the creation scope and direct-file identit
     assert.throws(() => validateReceipt(invalid), /receipt/);
   }
 });
+
+
+test('Claude slimming receipts validate enabled operations, provider and exact category savings', () => {
+  for (const [option, count] of [['removeRequestArchives', 'requestRecords']] as const) {
+    const r = receipt('/inert'), a = r.actions[0]; r.provider = 'claude';
+    a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
+    a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64);
+    a.recoveryState = 'applied'; r.confirmedReductionBytes = 9;
+    a.slimOptions = {removeImages: false, compactTools: false, [option]: true};
+    a.slimCounts = {images: 0, toolOutputs: 0, [count]: 1};
+    a.estimatedSavingsBytes = 9; a.slimSavingsBytes = {images: 0, toolOutputs: 0, [count]: 9};
+    assert.equal(validateReceipt(r), r);
+    const invalidChanges = [
+      ...[false, null, 'true', 1].map(value => ({slimOptions: {...a.slimOptions, [option]: value}})),
+      ...[undefined, 0, -1, 0.5, '1', null].map(value => ({slimCounts: {...a.slimCounts, [count]: value}})),
+      ...[undefined, 0, 8, 10, -1, 0.5, '9', null].map(value => ({slimSavingsBytes: {...a.slimSavingsBytes, [count]: value}})),
+    ];
+    for (const changes of invalidChanges) {
+      const invalid = structuredClone(r); Object.assign(invalid.actions[0], changes);
+      assert.throws(() => validateReceipt(invalid), /receipt/);
+    }
+    const invalid = structuredClone(r); invalid.provider = 'codex'; invalid.actions[0].codexProjection = [];
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+});

@@ -103,6 +103,7 @@ export function printPlans(plans: Plan[]) {
       ['images', 'removeImages', 'Remove inline images', 'images'],
       ['toolOutputs', 'compactTools', 'Compact shell output', 'outputs'],
       ['reasoning', 'removeReasoning', 'Remove encrypted reasoning (Codex)', 'blocks'],
+      ['requestRecords', 'removeRequestArchives', 'Remove API request archives (Claude)', 'records'],
     ] as const) {
       if (slim.some(a => a.slimOptions?.[option])) rows([{
         label: `${label} · ${slim.reduce((sum, a) => sum + (a.slimCounts?.[key] ?? 0), 0)} ${unit}`,
@@ -125,6 +126,7 @@ export function printPlans(plans: Plan[]) {
   }
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
   if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
+  if (actions.some(a => a.slimOptions?.removeRequestArchives)) note('API request archives will be deleted; exact historical requests cannot be reconstructed.');
   if (temporary.length) note('Irreversible: session-created outputs, full temporary task/hook outputs, cwd records and listed installers will be deleted. No undo.');
   if (actions.length) note('Full file paths and per-file estimates: View files in the review menu, or use --json.');
   const groups = new Map<string, number>();
@@ -338,6 +340,7 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
             ['images', 'removeImages', 'images', 'Remove inline images'],
             ['toolOutputs', 'compactTools', 'outputs', 'Compact shell output'],
             ['reasoning', 'removeReasoning', 'reasoning blocks', 'Remove encrypted reasoning'],
+            ['requestRecords', 'removeRequestArchives', 'request records', 'Remove API request archives'],
           ] as const).filter(([key, option]) => a.slimOptions?.[option] && a.slimCounts?.[key] !== 0)
             .map(([key, , unit, label]) => ({
               short: `${a.slimCounts?.[key] ?? '?'} ${unit}`,
@@ -387,14 +390,17 @@ export async function confirmPlans(plans: Plan[], signal?: AbortSignal) {
     screen();
   }
 }
-export async function cleanOptions(slim: boolean, signal?: AbortSignal, codex = true) {
-  if (!slim) return { includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: codex };
+export async function cleanOptions(slim: boolean, signal?: AbortSignal, codex = true, claude = true) {
+  if (!slim) return { includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: codex, removeRequestArchives: claude};
   const fields = await checkbox({ message: 'Slim history (irreversible; no undo)', subtitle: 'Only history files last modified more than 72 hours ago.', choices: [
     { name: 'Remove inline images', description: 'Replace Base64 image blocks with text', value: 'images' },
     { name: 'Compact shell output', description: 'Use RTK filters on recognized successful commands', value: 'tools' },
     ...(codex ? [{ name: 'Remove encrypted reasoning (Codex)', description: 'Remove reusable reasoning state; keep visible summaries', value: 'reasoning' }] : []),
+    ...(claude ? [
+      { name: 'Remove API request archives (Claude)', description: 'Lose exact request reconstruction; keep conversation and usage', value: 'requests' },
+    ] : []),
   ] }, context(signal));
-  return fields.length ? { removeImages: fields.includes('images'), compactTools: fields.includes('tools'), removeReasoning: fields.includes('reasoning') } : null;
+  return fields.length ? { removeImages: fields.includes('images'), compactTools: fields.includes('tools'), removeReasoning: fields.includes('reasoning'), removeRequestArchives: fields.includes('requests')} : null;
 }
 const providers = [{ name: 'All providers', description: 'Claude Code and Codex', value: 'all' }, { name: 'Claude Code', value: 'claude' }, { name: 'Codex', value: 'codex' }] as const;
 async function chooseProvider(signal?: AbortSignal): Promise<Provider | 'all' | null> {
@@ -410,7 +416,7 @@ async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal)
   if (await confirmPlans(plans, signal)) { printReceipts((await execute(config, plans, false, signal, line)).receipts); await pause(signal); }
 }
 async function cleanProviders(config: Config, selected: Provider[], mode: 'quick' | 'slim' | 'temp', signal?: AbortSignal) {
-  const options = mode === 'temp' ? {tempOnly: true} : await cleanOptions(mode === 'slim', signal, selected.includes('codex'));
+  const options = mode === 'temp' ? {tempOnly: true} : await cleanOptions(mode === 'slim', signal, selected.includes('codex'), selected.includes('claude'));
   if (!options) return;
   screen(); title(mode === 'temp' ? 'Clean Temporary Files' : mode === 'slim' ? 'Slim History' : 'Quick Clean');
   const plans: Plan[] = [];

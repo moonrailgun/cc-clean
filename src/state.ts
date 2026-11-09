@@ -180,24 +180,30 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       if (action.status === 'completed') requireReceipt(action.beforeHash && action.afterHash);
     }
     if (action.kind === 'slim-history') {
+      const options = action.slimOptions;
+      requireReceipt(object(options));
       requireReceipt(action.sessionIds === undefined && object(action.slimOptions) &&
         typeof action.slimOptions.removeImages === 'boolean' && typeof action.slimOptions.compactTools === 'boolean' &&
-        (action.slimOptions.removeReasoning === undefined || typeof action.slimOptions.removeReasoning === 'boolean') &&
-        (action.slimOptions.removeImages || action.slimOptions.compactTools || action.slimOptions.removeReasoning));
+        ['removeReasoning', 'removeRequestArchives'].every(key => options[key] === undefined || typeof options[key] === 'boolean') &&
+        (action.slimOptions.removeImages || action.slimOptions.compactTools || action.slimOptions.removeReasoning || action.slimOptions.removeRequestArchives));
       requireReceipt(object(action.slimCounts) && bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
         (action.slimOptions.removeImages || action.slimCounts.images === 0) && (action.slimOptions.compactTools || action.slimCounts.toolOutputs === 0) &&
         (action.slimCounts.reasoning === undefined || bytes(action.slimCounts.reasoning)) &&
         (action.slimOptions.removeReasoning || (action.slimCounts.reasoning ?? 0) === 0));
+      for (const [key, option] of [['requestRecords', 'removeRequestArchives']])
+        requireReceipt((action.slimCounts[key] === undefined || bytes(action.slimCounts[key])) &&
+          (action.slimOptions[option] && data.provider === 'claude' || (action.slimCounts[key] ?? 0) === 0));
       requireReceipt(action.files.every(file => file.category === 'sessions'));
     }
     if (action.slimSavingsBytes !== undefined) {
-      const savings = action.slimSavingsBytes;
+      const savings = action.slimSavingsBytes, counts = action.slimCounts;
+      requireReceipt(object(counts));
       requireReceipt(action.kind === 'slim-history' && object(action.slimCounts) &&
         bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
         object(savings) && bytes(savings.images) && bytes(savings.toolOutputs) &&
-        (savings.reasoning === undefined || bytes(savings.reasoning)) &&
-        savings.images + savings.toolOutputs + ((savings.reasoning as number | undefined) ?? 0) === action.estimatedSavingsBytes &&
-        (((action.slimCounts.reasoning as number | undefined) ?? 0) > 0 || (savings.reasoning ?? 0) === 0) &&
+        ['reasoning', 'requestRecords'].every(key => (savings[key] === undefined || bytes(savings[key])) &&
+          (((counts[key] as number | undefined) ?? 0) > 0 || (savings[key] ?? 0) === 0)) &&
+        savings.images + savings.toolOutputs + ['reasoning', 'requestRecords'].reduce((sum, key) => sum + ((savings[key] as number | undefined) ?? 0), 0) === action.estimatedSavingsBytes &&
         (action.slimCounts.images > 0 || savings.images === 0) && (action.slimCounts.toolOutputs > 0 || savings.toolOutputs === 0));
     }
     if (data.provider === 'codex' && action.recoveryState !== 'finalized' && !tempScope) {
@@ -206,7 +212,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       if (action.kind === 'slim-history') requireReceipt(Array.isArray(action.codexProjection));
     }
     if (action.codexProjection !== undefined) {
-      requireReceipt(data.provider === 'codex' && action.kind === 'slim-history' && Array.isArray(action.codexProjection));
+      requireReceipt(data.provider === 'codex' && (action.kind === 'slim-history') && Array.isArray(action.codexProjection));
       const names = new Set<string>(), threads = new Set<string>();
       for (const entry of action.codexProjection) {
         requireReceipt(object(entry) && text(entry.name) && /^thread_history_\d+\.sqlite$/.test(entry.name) && !names.has(entry.name));

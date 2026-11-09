@@ -2,13 +2,29 @@ import type { Provider } from './types.ts';
 import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
-export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean }
-export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number }
-export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number }
+export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean }
+export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
 const inlineImage = (value: unknown): value is string => typeof value === 'string' && /^data:image\/[^;,]+;base64,[A-Za-z0-9+/=\s]+$/.test(value);
+
+function knownRequestArchive(row: Row): boolean {
+  const fields: Record<string, string[]> = {
+    'api-request-blob': ['hash', 'message'],
+    'api-request-shape': ['shapeHash', 'shape'],
+    'api-request': ['id', 'querySource', 'shapeHash', 'params', 'base', 'keep', 'tail', 'cacheControl', 'requestDigest'],
+  };
+  const allowed = fields[row.type];
+  if (!allowed || typeof row.sessionId !== 'string' || !row.sessionId ||
+      Object.keys(row).some(key => !['type', 'sessionId', 'agentId', 'timestamp', 'version', ...allowed].includes(key))) return false;
+  if (row.type === 'api-request-blob') return typeof row.hash === 'string' && object(row.message);
+  if (row.type === 'api-request-shape') return typeof row.shapeHash === 'string' && object(row.shape);
+  return ['id', 'shapeHash', 'requestDigest'].every(key => typeof row[key] === 'string') &&
+    (row.base === undefined || typeof row.base === 'string') && object(row.params) &&
+    Number.isSafeInteger(row.keep) && row.keep >= 0 && Array.isArray(row.tail) && row.tail.every((hash: unknown) => typeof hash === 'string') && Array.isArray(row.cacheControl);
+}
 
 // Record value spans so untouched fields (including signatures and large numeric
 // literals) stay byte-for-byte identical even in a modified JSONL record.
@@ -175,6 +191,9 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   const lines = text.split('\n'), counts: SlimCounts = {images: 0, toolOutputs: 0};
   const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   if (options.removeReasoning) { counts.reasoning = 0; savingsBytes.reasoning = 0; }
+  if (options.removeRequestArchives) { counts.requestRecords = 0; savingsBytes.requestRecords = 0; }
+  const requestLines = new Set<number>();
+  let requestsKnown = true, conversationRecords = 0;
   const calls = new Map<string, RtkFilter | undefined>();
   let session: string | undefined, records = 0, ordinal = -1;
   function remember(id: unknown, command: unknown) {
@@ -205,6 +224,11 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
         if (session && session !== row.sessionId) throw new Error('Mixed history session identities');
         session = row.sessionId;
       }
+      if (options.removeRequestArchives && typeof row.type === 'string' && row.type.startsWith('api-request')) {
+        if (knownRequestArchive(row)) requestLines.add(n);
+        else requestsKnown = false;
+      }
+      if (['user', 'assistant'].includes(row.type) && object(row.message)) conversationRecords++;
       if (['user', 'assistant'].includes(row.type) && object(row.message) && Array.isArray(row.message.content)) {
         const content = row.message.content;
         replaceImages(content, false);
@@ -252,7 +276,6 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           counts.images += count;
         }
       }
-      // shortcut: compacted replacement histories stay intact until their replay format is supported.
       if (row.type === 'response_item' && object(payload)) {
         if (options.removeReasoning && payload.type === 'reasoning' && typeof payload.encrypted_content === 'string' && payload.encrypted_content.length) {
           parsed.remove(payload, 'encrypted_content', 'reasoning');
@@ -279,5 +302,10 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
   }
   if (!records || !session) throw new Error('History format or session identity could not be established');
-  return {output: counts.images || counts.toolOutputs || counts.reasoning ? Buffer.from(lines.join('\n')) : null, counts, savingsBytes};
+  // Remove the entire known archive family together; unknown siblings may still reference it.
+  if (requestsKnown && conversationRecords) {
+    if (options.removeRequestArchives) counts.requestRecords = requestLines.size;
+    for (const n of requestLines) savingsBytes.requestRecords! += Buffer.byteLength(lines[n]) + (n < lines.length - 1 ? 1 : 0);
+  } else requestLines.clear();
+  return {output: Object.values(counts).some(Boolean) ? Buffer.from(lines.map((line, n) => requestLines.has(n) ? '' : line + (n < lines.length - 1 ? '\n' : '')).join('')) : null, counts, savingsBytes};
 }

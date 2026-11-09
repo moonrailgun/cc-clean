@@ -846,10 +846,13 @@ test('NO_COLOR suppresses colors even in a terminal', () => {
 test('Quick clean selects all supported history operations alongside file cleanup without prompting', async t => {
   const term = await terminal(t);
   assert.deepEqual(await cleanOptions(false, term.context.signal), {
-    includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: true,
+    includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: true, removeRequestArchives: true,
+
   });
   assert.equal(term.text(), '');
   assert.equal((await cleanOptions(false, term.context.signal, false))?.removeReasoning, false);
+  const codexOnly = await cleanOptions(false, term.context.signal, true, false);
+  assert.equal(codexOnly?.removeRequestArchives, false);
 });
 
 test('standalone Slim history starts unchecked and only includes the selected operations', async t => {
@@ -861,12 +864,18 @@ test('standalone Slim history starts unchecked and only includes the selected op
   }
   let answer = cleanOptions(true, term.context.signal);
   await term.key('\r'); assert.equal(await answer, null);
-  for (const [keys, removeImages, compactTools, removeReasoning] of [['1', true, false, false], ['2', false, true, false], ['12', true, true, false], ['3', false, false, true], ['123', true, true, true]] as const) {
+  for (const keys of ["1", "2", "3", "4", "12", "1234"]) {
     answer = cleanOptions(true, term.context.signal);
     for (const key of keys) await term.key(key);
     await term.key('\r');
-    assert.deepEqual(await answer, { removeImages, compactTools, removeReasoning });
+    assert.deepEqual(await answer, { removeImages: keys.includes('1'), compactTools: keys.includes('2'),
+      removeReasoning: keys.includes('3'), removeRequestArchives: keys.includes('4'),
+      });
   }
+  answer = cleanOptions(true, term.context.signal, false, true);
+  await term.key('3'); await term.key('\r');
+  answer = cleanOptions(true, term.context.signal, true, false);
+  await term.key('3'); await term.key('\r');
   answer = cleanOptions(true, term.context.signal);
   await term.key('q'); assert.equal(await answer, null);
   assert.match(stripVTControlCharacters(term.text()), /irreversible; no undo/);
@@ -956,4 +965,52 @@ test('temporary cleanup menu can be opened and cancelled before any scan', async
   assert.match(stripVTControlCharacters(term.text()), /Claude Code/);
   await term.key('q'); await term.key('q'); await running;
   assert.doesNotMatch(stripVTControlCharacters(term.text()), /Scanning|Deep Scan|Confirm cleanup|Incomplete:/);
+});
+
+
+test('cleanup categories combine providers and temporary roots without double-counting history savings', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const first = inertPlan(), second = {...inertPlan(), provider: 'claude' as const, root: '/inert/claude'};
+  first.actions.push({...first.actions[0], estimatedSavingsBytes: null});
+  const history = {...second.actions[0], kind: 'slim-history' as const,
+    estimatedSavingsBytes: 1792,
+    slimOptions: {removeImages: true, compactTools: true, removeRequestArchives: true},
+    slimCounts: {images: 2, toolOutputs: 4, requestRecords: 3},
+    slimSavingsBytes: {images: 768, toolOutputs: 256, requestRecords: 768}};
+  second.actions = [history];
+  first.actions.push({...history, estimatedSavingsBytes: 1024, slimOptions: {removeImages: true, compactTools: true, removeReasoning: true},
+    slimCounts: {images: 3, toolOutputs: 2, reasoning: 2}, slimSavingsBytes: {images: 512, toolOutputs: 256, reasoning: 256}});
+  const temporary = ['/inert/tmp', '/inert/user-temp'].map(root => ({...inertPlan(), root,
+    systemTemp: {uid: 501, excludedRoots: []}, actions: [{...first.actions[0], kind: 'delete-files' as const,
+      files: [{...history.files[0], path: `${root}/task.output`, category: 'task-output'}]}],
+    warnings: [`${root}/recent.jsonl: Kept unchanged`],
+  }));
+  temporary[1].actions.push({...temporary[1].actions[0], files: [{...history.files[0], category: 'hook-output'}]});
+  for (const p of temporary) p.actions.push({...p.actions[0], files: [{...history.files[0], category: 'session-output'}]});
+  const plans = [first, second, ...temporary], original = structuredClone(plans);
+  printPlans(plans);
+  const text = lines.join('\n');
+  assert.match(text, /Claude Code/); assert.match(text, /Codex/);
+  assert.match(text, /1\.25 KiB\s+Remove inline images · 5 images/);
+  assert.match(text, /512 B\s+Compact shell output · 6 outputs/);
+  assert.match(text, /256 B\s+Remove encrypted reasoning \(Codex\) · 2 blocks/);
+  assert.match(text, /768 B\s+Remove API request archives \(Claude\) · 3 records/);
+  assert.match(text, /exact historical requests cannot be reconstructed/);
+  assert.match(text, /1\.00 KiB \+ unknown \(1 item\)\s+Compress PNGs \(lossless\) · 2 files/);
+  assert.match(text, /2\.00 KiB\s+Remove temporary task outputs · 2 files/);
+  assert.match(text, /1\.00 KiB\s+Remove temporary hook outputs · 1 files/);
+  assert.match(text, /2\.00 KiB\s+Remove session-created temporary outputs · 2 files/);
+  assert.match(text, /8\.75 KiB \+ unknown \(1 item\)\s+Total estimated savings/);
+  for (const label of ['Estimated savings by operation', 'Remove inline images', 'Compact shell output', 'Remove encrypted reasoning', 'Remove API request archives', 'Remove temporary task outputs', 'Remove session-created temporary outputs', 'Total estimated savings', 'Scan notes ·']) {
+    assert.equal(text.split(label).length - 1, 1, `${label} appears once across all roots`);
+  }
+  assert.match(text, /2 × Kept unchanged/);
+  assert.doesNotMatch(text, /\/inert\/|Delete files|source size/);
+  assert.ok(lines.length < 37);
+  assert.deepEqual(plans, original, 'summarizing preserves the individual plans and JSON details');
+  lines.length = 0;
+  printReceipts(plans.map(p => ({...p, status: 'dry-run', rootBeforeBytes: null, rootAfterBytes: null,
+    confirmedReductionBytes: 0, attributionComplete: false})));
+  assert.ok(lines.join('\n').startsWith(text), 'text-only previews use the same combined summary');
 });
