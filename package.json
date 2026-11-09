@@ -16,12 +16,18 @@
   "scripts": {
     "dev": "node --disable-warning=ExperimentalWarning src/cli.ts",
     "build": "tsc && chmod +x dist/cli.js",
+    "release": "release-it",
+    "release:patch": "release-it patch",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
     "test:read-only": "node --disable-warning=ExperimentalWarning --test test/commands.test.ts test/agent.test.ts test/analyze.test.ts test/state.test.ts test/ui.test.ts test/slim.test.ts test/protection.test.ts test/activity.test.ts test/codex-history.test.ts test/codex-shared.test.ts test/system-temp.test.ts test/session-temp.test.ts",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm run test:read-only"
   },
+  "release-it": {
+    "git": false,
+    "npm": { "publishArgs": ["--registry=https://registry.npmjs.org/"] }
+  },
   "dependencies": { "@inquirer/core": "^12.0.6", "fast-string-truncated-width": "^3.0.3", "smol-toml": "^1.9.1" },
-  "devDependencies": { "@types/node": "^24.0.0", "typescript": "^5.9.0" }
+  "devDependencies": { "@types/node": "^24.0.0", "release-it": "^21.1.2", "typescript": "^5.9.0" }
 }
