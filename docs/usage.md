@@ -215,7 +215,7 @@ Precedence: configuration file → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` → defaul
 
 | Feature | Supported scope |
 | --- | --- |
-| Temporary files | Codex root files named `..codex-global-state.json.tmp-*`, with a valid final state file; subject to 72-hour protection and its explicit single-target exception |
+| Temporary files | Codex root files named `..codex-global-state.json.tmp-*`, with a valid final state file; known Claude/Codex system layouts, as described below. Independent of CLI version; system temporary files always require more than 72 hours |
 | PNG compression | Eligible static PNGs in Codex `generated_images/`; recompress IDAT losslessly, preserving inflated scanlines and supported metadata; replace only when smaller |
 | Claude session deletion | Structurally complete transcripts and verifiably owned subagent/tool-result files, independent of version; retain memory, configuration, file-history and history.jsonl |
 | Codex session deletion | Official `codex delete` with capability checks instead of a version whitelist; verify full spawn descendant scope, ownership and references. Reject incomplete indexes, attached relationships and unpreviewed target copies; unrelated compressed/hardlinked histories are allowed. Native evidence remains limited to **0.167.0** |
@@ -230,7 +230,7 @@ PNG compression excludes APNG, unknown/unsupported chunks, damaged images, exten
 
 ## Accounting and recovery
 
-Statistics come only from `~/.config/cc-clean/cleanup.jsonl`. An actual cleanup execution records one line per provider, using the source directory's logical size immediately before and after execution. Opening the app, analysis, previews and cancelled confirmations do not create cleanup history. An executed cleanup with no eligible items records zero changes. Without history, savings and cleaned records are both zero. Application caches, receipts and work files are not subtracted from savings.
+Statistics come only from `~/.config/cc-clean/cleanup.jsonl`. An actual cleanup execution records one line per provider/root scope, using its logical size immediately before and after execution. System-temp entries have `scope: "system-temp"` and count only matched eligible-layout files, not the entire shared temp directory; the UI labels these measurements **Matched temp files**. Opening the app, analysis, previews and cancelled confirmations do not create cleanup history. An executed cleanup with no eligible items records zero changes. Without history, savings and cleaned records are both zero. Application caches, receipts and work files are not subtracted from savings.
 
 Each line is a JSON object, for example:
 
@@ -256,7 +256,20 @@ See the distributed [Apache-2.0 license](../third_party/rtk/LICENSE) and [source
 
 ### System temporary files
 
-Quick clean and ordinary CLI `clean` also check known system temporary layouts for Claude task outputs/cwd records and Codex hook outputs/leftover installers. Only matching files owned by the current user and last modified strictly more than 72 hours ago qualify. Configuration roots, application state, source, images, scratchpads, locks and sockets are retained; directories are never deleted wholesale. Review the combined category estimates before confirming.
+Quick clean and ordinary CLI `clean` also inspect `/tmp`, `/var/tmp`, the operating system's user temp directory (`os.tmpdir()`, typically `/var/folders/.../T` on macOS), `$TMPDIR`, `$TMP`, `$TEMP`, and Claude's `$CLAUDE_CODE_TMPDIR` when set. Paths are canonicalized and deduplicated (`/tmp` is commonly `/private/tmp` on macOS). Provider roots and cc-clean state are excluded from these scans. Explicit file/session operations and history-only CLI flags do not add system-temp targets.
+
+Only these relative layouts are eligible, where `<uid>` is the current user ID:
+
+| Provider | File layout | Category |
+| --- | --- | --- |
+| Claude Code | `claude-<uid>/<project>/tasks/<id>.output` and legacy `claude/<project>/tasks/<id>.output` | Temporary task outputs |
+| Claude Code | `claude-<4 lowercase hex>-cwd` and `claude-<uid>/cwd-<lowercase hex>` | Temporary working-directory records |
+| Codex | `hook_outputs/<UUID>/<UUID>.txt` | Temporary full hook outputs |
+| Codex | `codex-app-installer-<suffix>/Codex.dmg` | Leftover desktop installers |
+
+Only regular files owned by the current user, without hard links or group/world write access, qualify. Nested directories must also have safe ownership and permissions. Symlinks are not followed; discovered inbound links retain their targets. Arbitrary scratchpad files, source, images, lock files, sockets, daemon data and other cache contents are retained. Directories are never removed wholesale. References elsewhere on the machine are not exhaustively scanned: old task/hook outputs can still be referenced by a saved conversation, and those full outputs become unavailable after deletion.
+
+Every system-temp candidate must have `mtime` strictly more than 72 hours old, with no single-target exception. Quick clean shows category counts, estimated savings and the irreversible effect before requiring Enter. Execution rechecks ownership, paths, file identity, age, processes and open files, and uses the existing transaction/recovery mechanism. Files on another filesystem from cc-clean's state directory are skipped.
 
 See [native compatibility](native-compatibility.md#system-temporary-files-source-and-metadata-checks-only) for layout sources and verification limits.
 
