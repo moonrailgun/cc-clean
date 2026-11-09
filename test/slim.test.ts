@@ -358,13 +358,13 @@ test('Claude archive and hook slimming preserve raw conversation, cost and graph
   for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
     const rows = [user, hook, ...archives.map(row => JSON.stringify(row)), assistant, cost];
     const input = Buffer.from(rows.join(newline) + finalNewline);
-    for (const [removeRequestArchives, compactHooks] of [[true, false]]) {
-      const options = {removeImages: false, compactTools: false, removeRequestArchives};
+    for (const [removeRequestArchives, compactHooks] of [[true, false], [false, true], [true, true]]) {
+      const options = {removeImages: false, compactTools: false, removeRequestArchives, compactHooks};
       const result = slimHistory(input, 'claude', options);
       const expected = [user, compactHooks ? cleared : hook, ...(removeRequestArchives ? [] : rows.slice(2, 5)), assistant, cost];
       assert.equal(result.output?.toString(), expected.join(newline) + finalNewline);
       assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
-        ...(removeRequestArchives ? {requestRecords: 3} : {})});
+        ...(removeRequestArchives ? {requestRecords: 3} : {}), ...(compactHooks ? {hooks: 1} : {})});
       assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
       assert.equal(slimHistory(result.output!, 'claude', options).output, null);
     }
@@ -387,4 +387,23 @@ test('Claude archives handle a final row without newline and retain unknown arch
   ]) assert.equal(slimHistory(jsonl(claude('user', []), ...archives, unknown), 'claude', options).output, null);
   assert.throws(() => slimHistory(jsonl(claude('user', []), {...archives[0], sessionId: 'other'}), 'claude', options), /Mixed/);
   assert.throws(() => slimHistory(Buffer.concat([input, Buffer.from('\nnot-json')]), 'claude', options), /Malformed/);
+});
+
+
+test('hook compaction retains failures, unknown payloads, prompt snapshots and graph-less records', () => {
+  const options = {removeImages: false, compactTools: false, compactHooks: true};
+  for (const hook of [
+    {...successfulHook, attachment: {...successfulHook.attachment, exitCode: 1}},
+    {...successfulHook, attachment: {...successfulHook.attachment, type: 'hook_error'}},
+    {...successfulHook, attachment: {...successfulHook.attachment, type: 'prompt_snapshot'}},
+    {...successfulHook, attachment: {...successfulHook.attachment, content: null}},
+    {...successfulHook, attachment: {...successfulHook.attachment, newContext: 'retain'}},
+    {...successfulHook, uuid: undefined}, {...successfulHook, parentUuid: undefined},
+    {...successfulHook, rendered: [{content: 'keep', signature: 'new-field'}]},
+    {...successfulHook, rendered: 'unrecognized'},
+  ]) assert.equal(slimHistory(jsonl(claude('user', []), hook), 'claude', options).output, null);
+  const withoutRendered = {...successfulHook, rendered: undefined};
+  assert.equal(slimHistory(jsonl(withoutRendered), 'claude', options).counts.hooks, 1);
+  const input = jsonl(meta, ...archives, successfulHook);
+  assert.equal(slimHistory(input, 'codex', {...options, removeRequestArchives: true}).output, null);
 });

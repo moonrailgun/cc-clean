@@ -30,15 +30,16 @@ test('history flags are independent clean-only opt-ins and keep confirmation req
   assert.equal(quick.values['compact-tools'], undefined);
   assert.equal(quick.values['remove-reasoning'], undefined);
   assert.equal(quick.values['remove-request-archives'], undefined);
+  assert.equal(quick.values['compact-hooks'], undefined);
   assert.throws(() => parseCommand(['clean', '--provider', 'claude', '--remove-reasoning', '--yes'], false), /Codex/);
-  for (const flag of ['--remove-request-archives']) {
+  for (const flag of ['--remove-request-archives', '--compact-hooks']) {
     assert.throws(() => parseCommand(['clean', '--provider', 'codex', flag, '--yes'], false), /Claude/);
     assert.throws(() => parseCommand(['clean', '--temp-only', flag, '--yes'], false), /--temp-only/);
     assert.equal(parseCommand(['clean', '--provider', 'claude', flag, '--yes'], false).provider, 'claude');
     assert.ok(commandSchema.commands[0].options.includes(flag.slice(2)));
     assert.ok(help.includes(flag));
   }
-  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-request-archives'], ['--remove-images', '--compact-tools', '--remove-reasoning', '--remove-request-archives']]) {
+  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-request-archives'], ['--compact-hooks'], ['--remove-images', '--compact-tools', '--remove-reasoning', '--remove-request-archives', '--compact-hooks']]) {
     assert.throws(() => parseCommand(['clean', ...flags, '--json'], true), /--yes/);
     const parsed = parseCommand(['clean', ...flags, '--yes', '--json'], true);
     assert.equal(parsed.interactive, false);

@@ -2,9 +2,9 @@ import type { Provider } from './types.ts';
 import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
-export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean }
-export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number }
-export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number }
+export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean }
+export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
@@ -24,6 +24,17 @@ function knownRequestArchive(row: Row): boolean {
   return ['id', 'shapeHash', 'requestDigest'].every(key => typeof row[key] === 'string') &&
     (row.base === undefined || typeof row.base === 'string') && object(row.params) &&
     Number.isSafeInteger(row.keep) && row.keep >= 0 && Array.isArray(row.tail) && row.tail.every((hash: unknown) => typeof hash === 'string') && Array.isArray(row.cacheControl);
+}
+
+function knownSuccessfulHook(row: Row): boolean {
+  const hook = row.attachment;
+  return row.type === 'attachment' && object(hook) && hook.type === 'hook_success' && hook.exitCode === 0 &&
+    typeof row.uuid === 'string' && !!row.uuid && typeof row.sessionId === 'string' && !!row.sessionId &&
+    (row.parentUuid === null || typeof row.parentUuid === 'string') &&
+    ['hookName', 'hookEvent', 'toolUseID', 'command', 'content', 'stdout', 'stderr'].every(key => typeof hook[key] === 'string') &&
+    Object.keys(hook).every(key => ['type', 'hookName', 'hookEvent', 'toolUseID', 'command', 'content', 'stdout', 'stderr', 'exitCode', 'durationMs'].includes(key)) &&
+    (row.rendered === undefined || Array.isArray(row.rendered) && row.rendered.every((item: unknown) =>
+      object(item) && Object.keys(item).every(key => key === 'content') && typeof item.content === 'string'));
 }
 
 // Record value spans so untouched fields (including signatures and large numeric
@@ -192,6 +203,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   if (options.removeReasoning) { counts.reasoning = 0; savingsBytes.reasoning = 0; }
   if (options.removeRequestArchives) { counts.requestRecords = 0; savingsBytes.requestRecords = 0; }
+  if (options.compactHooks) { counts.hooks = 0; savingsBytes.hooks = 0; }
   const requestLines = new Set<number>();
   let requestsKnown = true, conversationRecords = 0;
   const calls = new Map<string, RtkFilter | undefined>();
@@ -229,6 +241,13 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
         else requestsKnown = false;
       }
       if (['user', 'assistant'].includes(row.type) && object(row.message)) conversationRecords++;
+      if (options.compactHooks && knownSuccessfulHook(row)) {
+        let changed = false;
+        for (const key of ['command', 'content', 'stdout', 'stderr'])
+          if (parsed.replace(row.attachment, key, '', 'hooks')) changed = true;
+        if (row.rendered !== undefined && parsed.replace(row, 'rendered', [], 'hooks')) changed = true;
+        if (changed) counts.hooks!++;
+      }
       if (['user', 'assistant'].includes(row.type) && object(row.message) && Array.isArray(row.message.content)) {
         const content = row.message.content;
         replaceImages(content, false);
@@ -300,6 +319,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     savingsBytes.images += parsed.savingsBytes.images;
     savingsBytes.toolOutputs += parsed.savingsBytes.toolOutputs;
     if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
+    if (options.compactHooks) savingsBytes.hooks! += parsed.savingsBytes.hooks ?? 0;
   }
   if (!records || !session) throw new Error('History format or session identity could not be established');
   // Remove the entire known archive family together; unknown siblings may still reference it.

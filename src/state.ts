@@ -184,13 +184,13 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       requireReceipt(object(options));
       requireReceipt(action.sessionIds === undefined && object(action.slimOptions) &&
         typeof action.slimOptions.removeImages === 'boolean' && typeof action.slimOptions.compactTools === 'boolean' &&
-        ['removeReasoning', 'removeRequestArchives'].every(key => options[key] === undefined || typeof options[key] === 'boolean') &&
-        (action.slimOptions.removeImages || action.slimOptions.compactTools || action.slimOptions.removeReasoning || action.slimOptions.removeRequestArchives));
+        ['removeReasoning', 'removeRequestArchives', 'compactHooks'].every(key => options[key] === undefined || typeof options[key] === 'boolean') &&
+        (action.slimOptions.removeImages || action.slimOptions.compactTools || action.slimOptions.removeReasoning || action.slimOptions.removeRequestArchives || action.slimOptions.compactHooks));
       requireReceipt(object(action.slimCounts) && bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
         (action.slimOptions.removeImages || action.slimCounts.images === 0) && (action.slimOptions.compactTools || action.slimCounts.toolOutputs === 0) &&
         (action.slimCounts.reasoning === undefined || bytes(action.slimCounts.reasoning)) &&
         (action.slimOptions.removeReasoning || (action.slimCounts.reasoning ?? 0) === 0));
-      for (const [key, option] of [['requestRecords', 'removeRequestArchives']])
+      for (const [key, option] of [['requestRecords', 'removeRequestArchives'], ['hooks', 'compactHooks']])
         requireReceipt((action.slimCounts[key] === undefined || bytes(action.slimCounts[key])) &&
           (action.slimOptions[option] && data.provider === 'claude' || (action.slimCounts[key] ?? 0) === 0));
       requireReceipt(action.files.every(file => file.category === 'sessions'));
@@ -201,9 +201,9 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       requireReceipt(action.kind === 'slim-history' && object(action.slimCounts) &&
         bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
         object(savings) && bytes(savings.images) && bytes(savings.toolOutputs) &&
-        ['reasoning', 'requestRecords'].every(key => (savings[key] === undefined || bytes(savings[key])) &&
+        ['reasoning', 'requestRecords', 'hooks'].every(key => (savings[key] === undefined || bytes(savings[key])) &&
           (((counts[key] as number | undefined) ?? 0) > 0 || (savings[key] ?? 0) === 0)) &&
-        savings.images + savings.toolOutputs + ['reasoning', 'requestRecords'].reduce((sum, key) => sum + ((savings[key] as number | undefined) ?? 0), 0) === action.estimatedSavingsBytes &&
+        savings.images + savings.toolOutputs + ['reasoning', 'requestRecords', 'hooks'].reduce((sum, key) => sum + ((savings[key] as number | undefined) ?? 0), 0) === action.estimatedSavingsBytes &&
         (action.slimCounts.images > 0 || savings.images === 0) && (action.slimCounts.toolOutputs > 0 || savings.toolOutputs === 0));
     }
     if (data.provider === 'codex' && action.recoveryState !== 'finalized' && !tempScope) {
