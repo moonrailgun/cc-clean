@@ -6,6 +6,7 @@ import type { Provider } from './types.ts';
 import type { Receipt } from './clean.ts';
 import { scopedTempKind, tempExcluded, type SystemTempScope } from './system-temp.ts';
 import { validSessionTempEvidence } from './session-temp.ts';
+import { knownCodexHome } from './codex-shared.ts';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_JSON_BYTES = 64 * 1024 * 1024;
@@ -144,7 +145,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
   requireReceipt(['completed', 'partial', 'failed', 'interrupted', 'needs-review', 'dry-run'].includes(data.status as string));
   requireReceipt((data.rootBeforeBytes === null || bytes(data.rootBeforeBytes)) && (data.rootAfterBytes === null || bytes(data.rootAfterBytes)) &&
     Number.isSafeInteger(data.confirmedReductionBytes) && typeof data.attributionComplete === 'boolean');
-  const ids = new Set<string>(), paths = new Set<string>();
+  const ids = new Set<string>(), paths = new Set<string>(), inodes = new Set<string>();
   let total = 0;
   for (const action of data.actions) {
     requireReceipt(object(action) && text(action.id) && uuid.test(action.id) && !ids.has(action.id));
@@ -168,12 +169,15 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       requireReceipt(object(file) && absolute(file.path) && within(data.root, file.path) && !paths.has(file.path));
       paths.add(file.path);
       requireReceipt(file.relative === relative(data.root, file.path) && bytes(file.size) && bytes(file.allocatedBytes) &&
-        Number.isFinite(file.mtimeMs) && Number.isFinite(file.ctimeMs) && bytes(file.dev) && bytes(file.ino) && file.nlink === 1 && bytes(file.mode) && text(file.category));
+        Number.isFinite(file.mtimeMs) && Number.isFinite(file.ctimeMs) && bytes(file.dev) && bytes(file.ino) &&
+        (action.codexShared ? bytes(file.nlink) && file.nlink > 0 : file.nlink === 1) && bytes(file.mode) && text(file.category));
       requireReceipt(file.uid === undefined || bytes(file.uid));
       if (tempScope) requireReceipt(file.uid === tempScope.uid && !(file.mode & 0o022) && (file.mode & 0o170000) === 0o100000 &&
         !tempExcluded(file.path, tempScope) && scopedTempKind(data.root, file.path, data.provider, tempScope) === file.category);
       if (tempScope?.session?.kind === 'file') requireReceipt(file.dev === tempScope.session.dev && file.ino === tempScope.session.ino);
       fileBytes += file.size; requireReceipt(Number.isSafeInteger(fileBytes));
+      const inode = `${file.dev}:${file.ino}`;
+      requireReceipt(!inodes.has(inode)); inodes.add(inode);
     }
     requireReceipt(action.kind === 'codex-delete' || action.beforeBytes === fileBytes);
     if (action.kind === 'compress-png' || action.kind === 'slim-history') {
@@ -226,10 +230,11 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
         requireReceipt(action.kind === 'slim-history' || action.kind === 'codex-delete' || action.kind === 'deduplicate-history');
       if (action.kind === 'slim-history') requireReceipt(Array.isArray(action.codexProjection));
     }
-    if (action.codexProjection !== undefined) {
-      requireReceipt(data.provider === 'codex' && (action.kind === 'slim-history' || action.kind === 'deduplicate-history') && Array.isArray(action.codexProjection));
-      const names = new Set<string>(), threads = new Set<string>();
-      for (const entry of action.codexProjection) {
+    const threads = new Set<string>();
+    const projection = (entries: unknown) => {
+      requireReceipt(data.provider === 'codex' && (action.kind === 'slim-history' || action.kind === 'deduplicate-history') && Array.isArray(entries));
+      const names = new Set<string>();
+      for (const entry of entries) {
         requireReceipt(object(entry) && text(entry.name) && /^thread_history_\d+\.sqlite$/.test(entry.name) && !names.has(entry.name));
         names.add(entry.name);
         requireReceipt(bytes(entry.dev) && bytes(entry.ino) && text(entry.threadId) && entry.threadId.length > 0);
@@ -238,6 +243,59 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
         if (action.kind === 'deduplicate-history') requireReceipt(entry.beforeHash === entry.afterHash);
       }
       requireReceipt(threads.size <= 1);
+    };
+    if (action.codexProjection !== undefined) projection(action.codexProjection);
+    if (action.codexShared !== undefined) {
+      const scope = action.codexShared;
+      requireReceipt(data.provider === 'codex' && !tempScope && ['slim-history', 'deduplicate-history'].includes(action.kind as string) &&
+        object(scope) && Object.keys(scope).every(k => ['homes', 'groups', 'compressedLinks', 'started', 'outputIdentity'].includes(k)) &&
+        Array.isArray(scope.homes) && scope.homes.length >= 2 && Array.isArray(scope.groups) && scope.groups.length === action.files.length &&
+        Array.isArray(scope.compressedLinks) && scope.compressedLinks.every(absolute) &&
+        (scope.started === undefined || typeof scope.started === 'boolean') && action.beforeHash && action.afterHash &&
+        action.files.some(f => f.nlink > 1) && object(data.rootIdentity));
+      const homes = new Set<string>();
+      for (const home of scope.homes) {
+        requireReceipt(object(home) && Object.keys(home).every(k => ['root', 'dev', 'ino', 'codexProjection'].includes(k)) &&
+          absolute(home.root) && knownCodexHome(home.root) && !homes.has(home.root) && bytes(home.dev) && bytes(home.ino));
+        homes.add(home.root); projection(home.codexProjection);
+      }
+      requireReceipt(scope.homes[0].root === data.root && scope.homes[0].dev === data.rootIdentity.dev && scope.homes[0].ino === data.rootIdentity.ino &&
+        JSON.stringify(scope.homes[0].codexProjection) === JSON.stringify(action.codexProjection));
+      const aliases = new Set<string>();
+      for (let i = 0; i < scope.groups.length; i++) {
+        const group = scope.groups[i], canonical = action.files[i];
+        requireReceipt((canonical.uid === undefined || canonical.uid === process.getuid?.()) &&
+          Array.isArray(group) && group.length === canonical.nlink && group.some(f => object(f) && f.path === canonical.path));
+        for (const file of group) {
+          requireReceipt(object(file) && absolute(file.path) && !aliases.has(file.path) &&
+            [...homes].some(root => file.path === join(root, canonical.relative) && within(root, file.path)) &&
+            ['relative', 'dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'nlink', 'mode', 'category'].every(k => file[k] === canonical[k]) &&
+            file.category === 'sessions' && /^(?:sessions|archived_sessions)\/.+\.jsonl(?:\.zst)?$/.test(file.relative as string) &&
+            bytes(file.allocatedBytes) && (file.uid === undefined || file.uid === process.getuid?.()) &&
+            (canonical.mode & 0o170000) === 0o100000 && !(canonical.mode & 0o022) && canonical.dev === action.files[0].dev);
+          aliases.add(file.path);
+          if (file.path !== canonical.path) {requireReceipt(!paths.has(file.path)); paths.add(file.path);}
+        }
+      }
+      const expected = action.kind === 'deduplicate-history' ? scope.groups[0].map((f: {path: string}) => f.path + '.zst').filter((p: string) => !aliases.has(p)) : [];
+      requireReceipt(scope.compressedLinks.length === expected.length && scope.compressedLinks.every(p => expected.includes(p)) &&
+        new Set(scope.compressedLinks).size === expected.length);
+      for (const path of scope.compressedLinks) {requireReceipt(!paths.has(path)); paths.add(path);}
+      if (scope.started) {
+        requireReceipt(bytes(action.estimatedSavingsBytes) && action.afterBytes === action.beforeBytes - action.estimatedSavingsBytes &&
+          action.status !== 'skipped' && (action.recoveryState !== 'finalized' || action.status === 'completed'));
+        if (action.status === 'completed' || action.recoveryState === 'applied')
+          requireReceipt(action.kind !== 'slim-history' || scope.outputIdentity !== undefined);
+      } else requireReceipt(action.afterBytes === action.beforeBytes && action.status !== 'completed' && action.recoveryState !== 'applied');
+      if (scope.outputIdentity !== undefined) {
+        const output = scope.outputIdentity;
+        requireReceipt(scope.started && action.kind === 'slim-history' && object(output) && Object.keys(output).every(k => ['dev', 'ino'].includes(k)) &&
+          output.dev === action.files[0].dev && bytes(output.ino) && output.ino !== action.files[0].ino &&
+          action.afterBytes === action.beforeBytes - (action.estimatedSavingsBytes as number));
+        const inode = `${output.dev}:${output.ino}`;
+        requireReceipt(!inodes.has(inode)); inodes.add(inode);
+      }
+      if (data.status === 'dry-run') requireReceipt(!scope.started && scope.outputIdentity === undefined);
     }
     if (action.kind === 'codex-delete') requireReceipt(data.provider === 'codex' && uuid.test(action.targetId) &&
       Array.isArray(action.sessionIds) && action.sessionIds.includes(action.targetId));

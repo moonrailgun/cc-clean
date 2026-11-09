@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtemp, realpath, mkdir, writeFile, appendFile, readFile, rm, link, rename, open, type FileHandle } from 'node:fs/promises';
+import { mkdtemp, realpath, mkdir, writeFile, appendFile, readFile, rm, link, rename, symlink, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { zstdCompressSync } from 'node:zlib';
@@ -9,6 +9,8 @@ import { slimHistory, slimCodexItem } from '../src/slim.ts';
 import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout, verifyCodexDeletionHistories, decodeDuplicateHistory } from '../src/providers/codex-history.ts';
 import { assertCodexDeleteCapabilities } from '../src/codex-delete.ts';
 import { scanRoot } from '../src/scan.ts';
+import * as shared from '../src/codex-shared.ts';
+import type { Action } from '../src/clean.ts';
 
 const options = {removeImages: true, compactTools: true};
 const url = 'data:image/png;base64,' + 'YQ=='.repeat(300);
@@ -127,6 +129,30 @@ test('projection recovery distinguishes before, after, unchanged and conflicts',
   assert.equal(projectionState('b', {beforeHash: 'a', afterHash: 'b'}), 'after');
   assert.equal(projectionState('a', {beforeHash: 'a', afterHash: 'a'}), 'after');
   assert.throws(() => projectionState('c', {beforeHash: 'a', afterHash: 'b'}), /changed/);
+});
+
+test('independent home indexes converge from mixed commits without altering other threads', () => {
+  const homes = [fixture(), fixture()];
+  try {
+    const output = slimHistory(input, 'codex', options).output!;
+    const snapshots = homes.map(db => projectionSnapshot(db, 'rollout'));
+    const other = homes.map(db => projectionSnapshot(db, 'other'));
+    const rewritten = snapshots.map(before => rewriteProjection(before, byteOffsetMap(input, output), options));
+    const receipts = snapshots.map((before, i) => ({beforeHash: projectionHash(before), afterHash: projectionHash(rewritten[i])}));
+    applyProjection(homes[0], snapshots[0], rewritten[0]);
+    assert.deepEqual(homes.map((db, i) => projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipts[i])), ['after', 'before']);
+    for (let pass = 0; pass < 2; pass++) for (const [i, db] of homes.entries()) {
+      const before = projectionSnapshot(db, 'rollout');
+      if (projectionState(projectionHash(before), receipts[i]) === 'before') {
+        db.exec('BEGIN'); applyProjection(db, before, rewriteProjection(before, byteOffsetMap(input, output), options)); db.exec('COMMIT');
+      }
+      assert.equal(projectionHash(projectionSnapshot(db, 'rollout')), receipts[i].afterHash);
+      assert.deepEqual(projectionSnapshot(db, 'other'), other[i]);
+    }
+    homes[1].exec("UPDATE thread_turns SET rollout_end_byte_offset=7 WHERE thread_id='rollout'");
+    assert.throws(() => projectionState(projectionHash(projectionSnapshot(homes[1], 'rollout')), receipts[1]), /changed/);
+    assert.equal(projectionHash(projectionSnapshot(homes[0], 'rollout')), receipts[0].afterHash);
+  } finally {for (const db of homes) db.close();}
 });
 
 test('old snapshot slimming coordinates line offsets and recovery hashes while preserving caches and ordinals', () => {
@@ -251,6 +277,71 @@ async function layout(t: TestContext) {
   return {root, put};
 }
 
+test('shared layout accepts fully accounted aliases and retains independent copies and inbound references', async t => {
+  const primary = await layout(t), other = await layout(t);
+  const plain = await primary.put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
+  const alias = join(other.root, 'sessions/one.jsonl'); await link(plain, alias);
+  const inspect = async (duplicates = false, coordinated: string[][] = []) => {
+    const inventories = await Promise.all([primary, other].map(home => scanRoot(home.root, 'codex')));
+    return verifyCodexRewriteLayout(inventories[0], undefined, duplicates, inventories.slice(1), coordinated);
+  };
+  assert.equal((await inspect()).size, 0);
+  await assert.rejects(verifyCodexDeletionHistories(await scanRoot(primary.root, 'codex'), new Set(['stable']), new Set([plain])), /linked/);
+  const copy = await other.put('archived_sessions/copy.jsonl', {id: 'one'});
+  for (const path of [plain, alias, copy]) assert.match((await inspect()).get(path)!, /copies/);
+  await rm(copy);
+  const dependent = await other.put('archived_sessions/dependent.jsonl', {id: 'dependent', history_base: {thread_id: 'stable', end_byte_offset: 100}});
+  for (const path of [plain, alias]) assert.match((await inspect()).get(path)!, /referenced/);
+  await rm(dependent);
+  const zipped = await primary.put('sessions/one.jsonl.zst', {id: 'one', session_id: 'stable'});
+  assert.equal((await inspect(true)).size, 0, 'missing compressed alias can be coordinated');
+  for (const path of [plain, alias, zipped]) assert.ok((await inspect()).has(path));
+  await rm(zipped);
+  const linked = join(other.root, 'sessions/unknown.jsonl'); await symlink(plain, linked);
+  await assert.rejects(inspect(), /Linked/); await rm(linked);
+  const invs = await Promise.all([primary, other].map(home => scanRoot(home.root, 'codex')));
+  await assert.rejects(verifyCodexRewriteLayout(invs[0], undefined, false, [{...invs[1], complete: false}]), /complete/);
+  // Model a partially replaced alias with header-only fixtures; no cleanup/recovery executor.
+  await rm(alias); await other.put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
+  assert.match((await inspect()).get(plain)!, /copies/);
+  assert.equal((await inspect(false, [[plain, alias]])).size, 0);
+});
+
+test('per-action dependency inspection catches forks created after the batch scan', async t => {
+  for (const coordinated of [false, true]) for (const duplicate of [false, true]) {
+    const primary = await layout(t), other = await layout(t);
+    const plain = await primary.put('sessions/source.jsonl', {id: 'source', session_id: 'stable'});
+    if (coordinated) await link(plain, join(other.root, 'sessions/source.jsonl'));
+    if (duplicate) await primary.put('sessions/source.jsonl.zst', {id: 'source', session_id: 'stable'});
+    const inventories = await Promise.all([primary, other].map(h => scanRoot(h.root, 'codex')));
+    const files = [inventories[0].files.find(f => f.path === plain)!,
+      ...duplicate ? [inventories[0].files.find(f => f.path === plain + '.zst')!] : []];
+    const a = {kind: duplicate ? 'deduplicate-history' : 'slim-history', files,
+      ...coordinated ? {codexShared: {...shared.sharedHistoryGroups(files, inventories),
+        homes: inventories.map(i => ({root: i.root, dev: 1, ino: 1, codexProjection: []}))}} : {},
+    } as Action;
+    const cached = await verifyCodexRewriteLayout(inventories[0], undefined, duplicate, coordinated ? inventories.slice(1) : []);
+    assert.equal(cached.has(plain), false);
+    await shared.verifyHistoryDependencies(a, primary.root);
+    await (coordinated ? other : primary).put('archived_sessions/late-fork.jsonl',
+      {id: 'fork', history_base: {thread_id: 'stable', end_byte_offset: files[0].size}});
+    assert.equal(cached.has(plain), false, 'a cached batch result cannot see the late fork');
+    await assert.rejects(shared.verifyHistoryDependencies(a, primary.root), /referenced/);
+    const fresh = (await scanRoot(primary.root, 'codex')).files.find(f => f.path === plain)!;
+    assert.deepEqual(fresh, files[0], 'the source itself need not change when another rollout references it');
+  }
+});
+
+test('dedup layout does not confuse paired names with an extra alias of a different basename', async t => {
+  const primary = await layout(t), other = await layout(t);
+  const plain = await primary.put('sessions/one.jsonl', {id: 'one'});
+  const zipped = await primary.put('sessions/one.jsonl.zst', {id: 'one'});
+  const wrong = join(other.root, 'sessions/two.jsonl.zst'); await link(zipped, wrong);
+  const invs = await Promise.all([primary, other].map(home => scanRoot(home.root, 'codex')));
+  const blocked = await verifyCodexRewriteLayout(invs[0], undefined, true, invs.slice(1));
+  for (const path of [plain, plain + '.zst', wrong]) assert.match(blocked.get(path)!, /copies/);
+});
+
 test('duplicate layout allows only the same-basename pair and retains additional identity copies', async t => {
   const {root, put} = await layout(t);
   for (const meta of [{id: 'one'}, {id: 'one', session_id: 'stable'}, {id: 'one', session_id: 'one'}]) {
@@ -358,6 +449,31 @@ test('link-count changes retain affected histories and references without blocki
     }
     await assert.rejects(readCodexHeader(inv.files.find(f => f.path === changing)!), /changed/);
     await assert.rejects(verifyCodexDeletionHistories(inv, new Set(['independent']), new Set([independent])), /changed/);
+  });
+});
+
+test('a link added while inspecting a later alias also retains already inspected aliases', async t => {
+  for (const duplicates of [false, true]) await t.test(duplicates ? 'deduplication' : 'slimming', async t => {
+    const primary = await layout(t), other = await layout(t);
+    const plain = await primary.put('sessions/shared.jsonl', {id: 'shared'});
+    const alias = join(other.root, 'sessions/shared.jsonl'); await link(plain, alias);
+    const independent = await primary.put('sessions/independent.jsonl', {id: 'independent'});
+    const invs = await Promise.all([primary, other].map(h => scanRoot(h.root, 'codex')));
+    const handle = await open(plain, 'r'), prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    const read = prototype.read, headerLine = lines({type: 'session_meta', payload: {id: 'shared'}});
+    let inspected = 0;
+    const mock = t.mock.method(prototype, 'read', async function(this: FileHandle, ...args: any[]) {
+      const result = await Reflect.apply(read, this, args);
+      if (Buffer.isBuffer(args[0]) && args[0].equals(headerLine) && ++inspected === 2)
+        await link(plain, join(primary.root, 'bridge-link'));
+      return result;
+    });
+    const blocked = await verifyCodexRewriteLayout(invs[0], undefined, duplicates, invs.slice(1));
+    mock.mock.restore();
+    assert.equal(inspected, 2);
+    for (const path of [plain, alias]) assert.equal(blocked.has(path), true);
+    assert.equal(blocked.has(independent), false);
   });
 });
 

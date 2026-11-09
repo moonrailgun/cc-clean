@@ -329,6 +329,7 @@ test('mixed cleanup counts include only completed sessions and files, and no-op 
   const add = (suffix: string) => {
     const action = structuredClone(r.actions[0]); action.id = randomUUID();
     action.files[0].path += suffix; action.files[0].relative += suffix;
+    action.files[0].ino = r.actions.length + 1;
     r.actions.push(action); return action;
   };
   const sessions = add('-sessions'); sessions.sessionIds = [randomUUID(), randomUUID()];
@@ -452,6 +453,7 @@ for (const [status, recoveryState] of [['failed', 'prepared'], ['skipped', 'appl
     r.status = 'interrupted';
     const action = structuredClone(r.actions[0]); action.id = randomUUID();
     action.files[0].path += '-other'; action.files[0].relative += '-other';
+    action.files[0].ino++;
     action.status = status; action.recoveryState = recoveryState; action.afterBytes = action.beforeBytes;
     r.actions.push(action); await save(state, r);
     const stats = await readStats(state);

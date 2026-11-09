@@ -1,6 +1,7 @@
 import { basename, dirname, relative } from 'node:path';
 import type { Analysis, Provider, Session, Usage } from './types.ts';
 import type { Config } from './config.ts';
+import { sharedFiles } from './codex-shared.ts';
 import type { Plan, Receipt } from './clean.ts';
 import { report, plan, cleanupPlans, includesSystemTemp, execute, CLAUDE_FILE_CLEANUP_NOTICE } from './app.ts';
 import { systemTempLabels } from './system-temp.ts';
@@ -389,7 +390,9 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
               `Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`,
               `Source size: ${size(a.beforeBytes)}`,
               ...(a.kind === 'deduplicate-history' ? [`Remove: ${safe(a.files[0].path)}`, `Keep: ${safe(a.files[1].path)}`] : []),
-              ...effects.map(e => e.detail), '', 'Full paths:', ...a.files.map(f => safe(f.path)),
+              ...effects.map(e => e.detail), '', 'Full paths:', ...sharedFiles(a).map(f => safe(f.path)),
+              ...(a.codexShared ? ['', 'Coordinated Codex homes:', ...a.codexShared.homes.map(h => safe(h.root)),
+                ...(a.codexShared.compressedLinks.length ? ['', 'Create compressed hard links before removing originals:', ...a.codexShared.compressedLinks.map(safe)] : [])] : []),
               ...(a.sessionIds?.length ? ['', 'Related sessions:', ...a.sessionIds.map(safe)] : []),
             ].join('\n'),
           };

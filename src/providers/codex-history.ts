@@ -91,15 +91,21 @@ export async function readCodexHeader(file: HeaderFile, signal?: AbortSignal, op
 }
 
 // Read all headers to find inbound byte references, but retain only affected targets.
-export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSignal, duplicates = false): Promise<Map<string, string>> {
+export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSignal, duplicates = false, related: Inventory[] = [], coordinated: string[][] = []): Promise<Map<string, string>> {
+  const inventories = [inv, ...related], files = inventories.flatMap(i => i.files);
+  for (const inv of inventories) {
   if (!inv.complete) throw new Error('Codex rewrite requires a complete scan');
   if (inv.links.some(l => /^(?:(?:sessions|archived_sessions)(?:\/|$)|config\.toml$|thread_history_.*\.sqlite)/.test(relative(inv.root, l.path))))
     throw new Error('Linked Codex history or configuration prevents complete reference inspection');
   await verifyCodexSqliteLocation(inv);
+  }
   const physical = new Map<string, FileEntry[]>();
-  for (const f of inv.files) physical.set(physicalKey(f), [...physical.get(physicalKey(f)) ?? [], f]);
+  for (const f of files) physical.set(physicalKey(f), [...physical.get(physicalKey(f)) ?? [], f]);
+  const logical = new Map(coordinated.flatMap((paths, i) => paths.map(path => [path, `coordinated:${i}`] as const)));
+  const identity = new Map(files.map(f => [f.path, logical.get(f.path) ?? physicalKey(f)]));
+  const names = new Map(files.map(f => [f.path, f.relative.replace(/\.zst$/, '')]));
   const blocked = new Map<string, string>(), owners = new Map<string, string[]>(), aliases = new Map<string, string[]>(), references = new Set<string>();
-  for (const file of inv.files.filter(f => historyPath.test(f.relative))) {
+  for (const file of files.filter(f => historyPath.test(f.relative))) {
     signal?.throwIfAborted();
     let row;
     try {
@@ -125,14 +131,21 @@ export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSig
       throw new Error(`${file.relative}: shared history reference has no source identity`);
     try { assertCodexMeta(row); }
     catch (error) { blocked.set(file.path, (error as Error).message); }
-    if (file.nlink !== 1) blocked.set(file.path, 'History has hard links; coordinated copies are required');
+    if (!logical.has(file.path) && (file.nlink !== 1 && !related.length || physical.get(physicalKey(file))!.length !== file.nlink ||
+      physical.get(physicalKey(file))!.some(f => f.relative !== file.relative || snapshotKeys.some(k => f[k] !== file[k]))))
+      blocked.set(file.path, 'History has unaccounted or inconsistent hard links; all copies are required');
     if (!duplicates && file.path.endsWith('.zst')) blocked.set(file.path, 'Compressed history is inspected for references but is not rewritten');
   }
   for (const id of references) for (const path of aliases.get(id) ?? [])
     blocked.set(path, 'History is referenced by another rollout; dependent updates are required');
   for (const paths of (duplicates ? aliases : owners).values()) {
-    if (duplicates && paths.length === 2 && paths.some(path => path.endsWith('.jsonl') && paths.includes(path + '.zst'))) continue;
-    if (paths.length > 1)
+    const distinct = new Set(paths.map(path => identity.get(path)));
+    if (duplicates && distinct.size === 2 && new Set(paths.map(path => names.get(path))).size === 1) {
+      const plain = paths.filter(path => path.endsWith('.jsonl')), compressed = paths.filter(path => path.endsWith('.zst'));
+      if (plain.some(path => compressed.includes(path + '.zst')) &&
+        new Set(plain.map(path => identity.get(path))).size === 1 && new Set(compressed.map(path => identity.get(path))).size === 1) continue;
+    }
+    if (distinct.size > 1)
       for (const path of paths) blocked.set(path, 'History is referenced by another rollout or has multiple copies; dependent updates are required');
   }
   return blocked;
