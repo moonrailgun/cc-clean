@@ -10,7 +10,7 @@ import { verifySessionTempEvidence } from './session-temp.ts';
 import { scanSystemTemp, scopedTempKind, tempExcluded, verifySystemTempParents, type SystemTempScope } from './system-temp.ts';
 import { privateDir, atomicJson, jsonFiles, within, existingDir, readOrdinaryFile } from './state.ts';
 import { recompressPng, MAX_PNG_BYTES } from './png.ts';
-import { checkActivity as defaultActivity, type ActivityCheck } from './activity.ts';
+import { checkActivity as defaultActivity, activityReason, type ActivityCheck } from './activity.ts';
 import { deleteCodexSession, verifyCodexDeleteCapabilities } from './codex-delete.ts';
 import { validateReceipt } from './state.ts';
 import { readCodexIndex, type IndexThread } from './providers/codex.ts';
@@ -341,7 +341,11 @@ async function planActivity(p:Plan,check:ActivityCheck,actions=p.actions,openPat
     let result=await check(provider,root,codexRoot?undefined:paths).catch(()=>'Cannot reliably check client activity');
     // Codex still protects the whole root, including index writers; transaction copies can be outside it.
     if(!result&&codexRoot&&openPaths?.length)result=await check(provider,root,openPaths).catch(()=>'Cannot reliably check client activity');
-    for(const a of actions)if(result&&!reasons.has(a))reasons.set(a,result);
+    for(const a of actions) {
+      const ownedPaths=p.systemTemp?.session?[p.systemTemp.session.source]:a.files.map(f=>f.path);
+      const reason=activityReason(result,root,openPaths??a.files.map(f=>f.path),a.sessionIds,ownedPaths);
+      if(reason&&!reasons.has(a))reasons.set(a,reason);
+    }
     if(reasons.size===actions.length)break;
   }
   return reasons;

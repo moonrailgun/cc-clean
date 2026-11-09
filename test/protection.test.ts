@@ -253,3 +253,37 @@ test('old snapshot removal inherits strict age and active-client protection', as
   assert.deepEqual(p.actions, []);
   assert.match(p.warnings.join('\n'), /Activity protection/);
 });
+
+test('Claude activity retains only the active session, its descendants and unknown ownership', async () => {
+  const closed = 'aaaaaaaa-1234-1234-1234-123456789abc';
+  const paths = [`projects/p/${session}.jsonl`, `projects/p/${session}/subagents/agent-child.jsonl`,
+    `projects/p/${session}/tool-results/result.txt`, `projects/p/${closed}.jsonl`, 'debug/unknown.log'];
+  const p = plan(paths.map(path => action('slim-history', cutoff - 1, `/inert/${path}`)));
+  p.provider = 'claude';
+  let calls = 0;
+  await protectActiveContent(p, async () => { calls++; return {sessionIds: [session], openFiles: []}; });
+  assert.equal(calls, 1);
+  assert.deepEqual(p.actions.map(a => a.files[0].path), [`/inert/projects/p/${closed}.jsonl`]);
+  assert.equal(p.actions.reduce((sum, a) => sum + a.estimatedSavingsBytes!, 0), 50);
+  assert.match(p.warnings.join('\n'), /active session/i);
+});
+
+test('grouped actions and explicit targets cannot hide an active parent or open file', async () => {
+  const child = action('delete-files', cutoff - 1, `/inert/projects/p/${session}/subagents/agent-child.jsonl`);
+  child.sessionIds = ['child'];
+  const other = action('slim-history', cutoff - 1, '/inert/projects/p/aaaaaaaa-1234-1234-1234-123456789abc.jsonl');
+  const group = action('delete-files', cutoff - 1, other.files[0].path);
+  group.files.push(...child.files); group.sessionIds = ['child'];
+  const p = plan([child, other, group], child.files[0].path); p.provider = 'claude';
+  await protectActiveContent(p, async () => ({sessionIds: [session], openFiles: [other.files[0].path]}));
+  assert.deepEqual(p.actions, []);
+});
+
+test('session temp evidence uses provider roots and keeps unknown cross-provider ownership conservative', async () => {
+  const p = plan([action('delete-files', cutoff - 1)]); p.provider = 'claude';
+  p.systemTemp = {uid: 501, excludedRoots: [], session: {...sessionTemp, source: `/claude/projects/p/${session}.jsonl`, sessionId: session}};
+  await protectActiveContent(p, async provider => provider === 'claude' ? {sessionIds: ['aaaaaaaa-1234-1234-1234-123456789abc'], openFiles: []} : null);
+  assert.equal(p.actions.length, 1);
+  await protectActiveContent(p, async provider => provider === 'claude' ? {sessionIds: [session], openFiles: []} : null);
+  assert.equal(p.actions.length, 0);
+});
