@@ -86,7 +86,7 @@ The native CLI was run in a bounded terminal session with `--bare --safe-mode --
 
 This validates listing refresh and reading/resuming the surviving **plain main transcript** after deletion, for 2.1.319. It does not validate a generated continuation, arbitrary signed/tool payload rewriting, unknown attachments, or all subagent layouts. Do not advertise those broader guarantees based on this probe.
 
-The supported cc-clean operation removes only a structurally verified session group: its main JSONL and independently verified uniquely owned subagent/tool-result files. Preserve project memory, configuration, file history, `history.jsonl`, and resources with uncertain ownership. Never substitute `claude purge`: its project/configuration scope is broader than a selected conversation. Unknown versions, malformed or incomplete transcripts, ambiguous references, and unsupported ownership relationships must prevent mutation.
+The supported cc-clean operation removes only a structurally verified session group: its main JSONL and independently verified uniquely owned subagent/tool-result files. Preserve project memory, configuration, file history, `history.jsonl`, and resources with uncertain ownership. Never substitute `claude purge`: its project/configuration scope is broader than a selected conversation. Malformed or incomplete transcripts, ambiguous references, and unsupported ownership relationships must prevent mutation; version numbers alone do not.
 
 ## Open-session protection: verified Claude session ownership
 

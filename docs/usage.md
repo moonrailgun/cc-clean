@@ -171,7 +171,11 @@ node src/cli.ts clean --provider claude --remove-images
 node src/cli.ts clean --provider codex --file /absolute/.codex/sessions/example.jsonl --compact-tools --yes --json
 ```
 
-Supported inputs are Claude Code **2.1.319** transcripts and independent plain legacy or paginated Codex rollouts, up to **64 MiB per file**. Claude version fields must all match. Codex compatibility follows record structure and identity, with version fields preserved. Every current and archived header, including compressed files, is checked for inbound references. Shared, forked, imported, attached, compressed or hardlinked targets are retained; unrelated compressed or hardlinked files do not block independent targets.
+History slimming recognizes **Claude Code transcripts and independent Codex plain legacy and paginated rollouts**, independently of client version numbers. Old, new, custom, missing or mixed version fields do not by themselves block an operation; existing version fields are preserved. Only the recognized records and fields described above are changed; human/assistant text, usage/cost records, message identities and unrelated prompt attachments remain intact. The current in-memory transformer is limited to **64 MiB per file**; larger files need a streaming implementation.
+
+Codex checks **every current and archived session header**, including compressed `.jsonl.zst` files, for ownership and inbound references. Independent plain histories can be rewritten alongside unrelated compressed or hardlinked histories. Compressed targets, shared/forked/imported/attached histories, linked targets and their referenced sources are retained. An incomplete scan or unreadable reference header still prevents history rewriting because dependencies cannot be established.
+
+Codex configuration is parsed as TOML. Quoted or escaped keys, ordinary strings and comments are accepted. A `sqlite_home` or `CODEX_SQLITE_HOME` pointing to the scanned root is accepted; a database outside that root cannot be verified. Configuration takes precedence over the environment. Invalid, changed or linked configuration, a relative environment path with unknown native working directory, and files exceeding the **64 KiB configuration inspection bound** are retained with an explanation.
 
 Codex rewrites remap recognized SQLite byte offsets and cached items within the coordinated replacement and recovery flow. Pending rewrites require `codexProjection` receipts, including an explicit empty array when no databases exist. Unknown offset schemas, unsupported dependencies, external SQLite locations and uncertain configuration prevent rewriting. Generic file deletion/compression cannot bypass history coordination.
 
@@ -209,20 +213,20 @@ Precedence: configuration file → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` → defaul
 
 ## Supported scope
 
-| Feature | First-version support |
+| Feature | Supported scope |
 | --- | --- |
-| Temporary files | Codex **0.167.0** root files named `..codex-global-state.json.tmp-*`, with a valid final state file; subject to 72-hour protection and its explicit single-target exception |
+| Temporary files | Codex root files named `..codex-global-state.json.tmp-*`, with a valid final state file; subject to 72-hour protection and its explicit single-target exception |
 | PNG compression | Eligible static PNGs in Codex `generated_images/`; recompress IDAT losslessly, preserving inflated scanlines and supported metadata; replace only when smaller |
-| Claude session deletion | Complete **2.1.319** transcripts and verifiably owned subagent/tool-result files; retain memory, configuration, file-history and history.jsonl |
-| Codex session deletion | Installed **0.167.0**, through official `codex delete`; verify full spawn descendant scope; reject incomplete indexes, attached relationships and compressed rollouts |
-| History slimming | Recognized inline-image removal and RTK shell-output compaction for Claude **2.1.319** and independent plain legacy/paginated Codex history, plus Codex encrypted-reasoning removal, with mandatory SQLite coordination; irreversible, with [limited native reasoning-resume evidence](native-compatibility.md#history-slimming-synthetic-checks-and-limited-native-resume) |
+| Claude session deletion | Structurally complete transcripts and verifiably owned subagent/tool-result files, independent of version; retain memory, configuration, file-history and history.jsonl |
+| Codex session deletion | Official `codex delete` with capability checks instead of a version whitelist; verify full spawn descendant scope, ownership and references. Reject incomplete indexes, attached relationships and unpreviewed target copies; unrelated compressed/hardlinked histories are allowed. Native evidence remains limited to **0.167.0** |
+| History slimming | Recognized inline-image removal and RTK shell-output compaction for Claude transcripts and independent plain legacy/paginated Codex history, plus Codex encrypted-reasoning removal, with mandatory SQLite coordination; irreversible, with [limited native reasoning-resume evidence](native-compatibility.md#history-slimming-synthetic-checks-and-limited-native-resume) |
 | Platforms | Mutations on macOS after checks; analysis, previews and statistics on other platforms |
 
 Claude Quick clean includes history slimming and known system temporary files; standalone-image deletion is not supported. Zero candidates means no files both pass the age/compatibility checks and contain reducible content. When history slimming is not enabled, the empty-result menu links to **Slim history**. Scan notes explain retained files and unsupported formats. A directory called `.tmp` or `cache` is not automatically disposable: installed plugins may still reference its resources through links.
 
 Open Claude sessions, their subagents/tool results and resume/fork sources are protected when live processes can be matched to native session registrations. Unrelated closed sessions can remain eligible while Claude runs. Missing or uncertain ownership retains the provider's candidates; Codex still requires its clients and services to be closed. Open files, incomplete scans, uncertain references and changed files also block affected operations. A computer restart is not required. Live analysis is a snapshot that may change. Session deletion currently requires complete deep analysis of the provider; an unrelated malformed or oversized transcript can also block deletion.
 
-PNG compression excludes APNG, unknown/unsupported chunks, damaged images, extended attributes, JPEG/WebP and Base64 images. History slimming handles supported Base64 images separately. Direct file transactions require the source and application work directory on the same filesystem. See [native compatibility evidence](native-compatibility.md) for native version checks and limits.
+PNG compression excludes APNG, unknown/unsupported chunks, damaged images, extended attributes, JPEG/WebP and Base64 images. History slimming handles supported Base64 images separately. Direct file transactions require the source and application work directory on the same filesystem. See [native compatibility evidence](native-compatibility.md) for capability checks and validation limits.
 
 ## Accounting and recovery
 
