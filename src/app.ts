@@ -8,7 +8,7 @@ import { getCodexVersion } from './codex-delete.ts';
 export async function report(config: Config, provider: Provider, deep: boolean, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   return analyze(await scanRoot(config.roots[provider], provider, signal, onProgress), { deep, signal, onProgress, stateDir: config.stateDir });
 }
-export async function plan(config: Config, provider: Provider, options: { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; removeImages?: boolean; compactTools?: boolean } = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
+export async function plan(config: Config, provider: Provider, options: { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean; includeFileCleanup?: boolean } = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   const inventory = await scanRoot(config.roots[provider], provider, signal, onProgress);
   const analysis = await analyze(inventory, { deep: true, signal, onProgress, stateDir: config.stateDir });
   if (options.sessions?.length && !analysis.scanComplete) throw new Error('Session analysis is incomplete; deletion scope cannot be verified. Inspect the analysis report');
@@ -18,7 +18,8 @@ export async function plan(config: Config, provider: Provider, options: { sessio
   const result = await createPlan(inventory, {
     version, source: options.manual ? 'analyze' : 'clean', sessions: analysis.sessions,
     sessionIds: options.sessions, filePaths: options.files, deleteImages: options.deleteImages,
-    slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools },
+    includeFileCleanup: options.includeFileCleanup,
+    slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools, removeReasoning: !!options.removeReasoning },
     otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']],
   });
   result.warnings = [...new Set([...result.warnings, ...analysis.warnings])];

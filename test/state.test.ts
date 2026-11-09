@@ -446,3 +446,24 @@ test('history index receipts bind safe database identities, hashes and one rollo
   r.provider = 'claude'; assert.throws(() => validateReceipt(r), /receipt/);
   r.provider = 'codex'; action.kind = 'delete-files'; assert.throws(() => validateReceipt(r), /receipt/);
 });
+
+test('reasoning-only receipts validate enabled operations, counts and exact category savings', () => {
+  const r = receipt('/inert'), a = r.actions[0];
+  a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
+  a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64); a.codexProjection = [];
+  a.recoveryState = 'applied'; r.confirmedReductionBytes = 9;
+  a.slimOptions = {removeImages: false, compactTools: false, removeReasoning: true};
+  a.slimCounts = {images: 0, toolOutputs: 0, reasoning: 1};
+  a.estimatedSavingsBytes = 9; a.slimSavingsBytes = {images: 0, toolOutputs: 0, reasoning: 9};
+  assert.equal(validateReceipt(r), r);
+  const invalidChanges = [
+    ...[false, null, 'true', 1].map(removeReasoning => ({slimOptions: {...a.slimOptions, removeReasoning}})),
+    ...[undefined, 0, -1, 0.5, '1', null].map(reasoning => ({slimCounts: {...a.slimCounts, reasoning}})),
+    ...[undefined, 0, 8, 10, -1, 0.5, '9', null].map(reasoning => ({slimSavingsBytes: {...a.slimSavingsBytes, reasoning}})),
+    {slimCounts: {...a.slimCounts, images: 1}}, {codexProjection: undefined},
+  ];
+  for (const changes of invalidChanges) {
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0], changes);
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+});

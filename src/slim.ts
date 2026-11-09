@@ -2,9 +2,9 @@ import type { Provider } from './types.ts';
 import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
-export interface SlimOptions { removeImages: boolean; compactTools: boolean }
-export interface SlimCounts { images: number; toolOutputs: number }
-export interface SlimSavingsBytes { images: number; toolOutputs: number }
+export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean }
+export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
@@ -17,6 +17,7 @@ function parseLine(text: string) {
   try { row = JSON.parse(text); } catch { throw new Error('Malformed history JSONL; original retained'); }
   if (!object(row)) throw new Error('Unsupported history record');
   const spans = new WeakMap<object, Map<string | number, [number, number]>>();
+  const members = new WeakMap<object, Map<string | number, [number, number]>>();
   let cursor = 0;
   const whitespace = () => { while (/\s/.test(text[cursor] ?? '') && cursor < text.length) cursor++; };
   function stringEnd() {
@@ -31,17 +32,23 @@ function parseLine(text: string) {
     if (value && typeof value === 'object') {
       const array = Array.isArray(value), fields = new Map<string | number, [number, number]>();
       spans.set(value, fields); cursor++; whitespace();
-      let index = 0;
+      const deletions = new Map<string | number, [number, number]>();
+      if (!array) members.set(value, deletions);
+      let index = 0, comma: number | undefined;
       while (text[cursor] !== (array ? ']' : '}')) {
+        const memberStart = cursor;
         let key: string | number = index++;
         if (!array) {
           const start = cursor; stringEnd(); key = JSON.parse(text.slice(start, cursor));
           if (fields.has(key)) throw new Error('Duplicate history JSON key; original retained');
           whitespace(); cursor++; whitespace();
         }
-        const start = cursor; visit(value[key], depth + 1); fields.set(key, [start, cursor]); whitespace();
+        const start = cursor; visit(value[key], depth + 1); fields.set(key, [start, cursor]);
+        const end = cursor; whitespace();
+        if (!array) deletions.set(key, comma === undefined
+          ? [memberStart, text[cursor] === ',' ? cursor + 1 : end] : [comma, end]);
         if (text[cursor] !== ',') break;
-        cursor++; whitespace();
+        comma = cursor; cursor++; whitespace();
       }
       cursor++;
     } else if (text[cursor] === '"') stringEnd();
@@ -58,8 +65,14 @@ function parseLine(text: string) {
       const serialized = JSON.stringify(value);
       const saved = Buffer.byteLength(text.slice(...span)) - Buffer.byteLength(serialized);
       if (saved <= 0) return false;
-      savingsBytes[category] += saved;
+      savingsBytes[category] = (savingsBytes[category] ?? 0) + saved;
       edits.push({start: span[0], end: span[1], value: serialized}); return true;
+    },
+    remove(parent: object, key: string, category: keyof SlimSavingsBytes) {
+      const span = members.get(parent)?.get(key);
+      if (!span) throw new Error('Unrecognized history member location');
+      savingsBytes[category] = (savingsBytes[category] ?? 0) + Buffer.byteLength(text.slice(...span));
+      edits.push({start: span[0], end: span[1], value: ''});
     },
     render() {
       let result = text, boundary = text.length;
@@ -161,6 +174,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   catch { throw new Error('History is not valid UTF-8'); }
   const lines = text.split('\n'), counts: SlimCounts = {images: 0, toolOutputs: 0};
   const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
+  if (options.removeReasoning) { counts.reasoning = 0; savingsBytes.reasoning = 0; }
   const calls = new Map<string, RtkFilter | undefined>();
   let session: string | undefined, versionSeen = false, records = 0, ordinal = -1;
   function remember(id: unknown, command: unknown) {
@@ -244,6 +258,10 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
       }
       // shortcut: compacted replacement histories stay intact until their replay format is supported.
       if (row.type === 'response_item' && object(payload)) {
+        if (options.removeReasoning && payload.type === 'reasoning' && typeof payload.encrypted_content === 'string' && payload.encrypted_content.length) {
+          parsed.remove(payload, 'encrypted_content', 'reasoning');
+          counts.reasoning = (counts.reasoning ?? 0) + 1;
+        }
         if (payload.type === 'message') replaceImages(payload.content, true);
         if (options.compactTools && payload.type === 'function_call') {
           let args: Row = {};
@@ -262,7 +280,8 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     lines[n] = parsed.render(); records++;
     savingsBytes.images += parsed.savingsBytes.images;
     savingsBytes.toolOutputs += parsed.savingsBytes.toolOutputs;
+    if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
   }
   if (!records || !session || provider === 'claude' && !versionSeen) throw new Error('History format or session identity could not be established');
-  return {output: counts.images || counts.toolOutputs ? Buffer.from(lines.join('\n')) : null, counts, savingsBytes};
+  return {output: counts.images || counts.toolOutputs || counts.reasoning ? Buffer.from(lines.join('\n')) : null, counts, savingsBytes};
 }

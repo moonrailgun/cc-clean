@@ -2,7 +2,7 @@
 
 A Node.js CLI for local Claude Code and Codex storage, with menu navigation inspired by [Mole](https://github.com/tw93/mole).
 
-- **Clean:** scan and deep scan, review targets and estimated savings, then press Enter to clean verified temporary files older than 72 hours and losslessly compress eligible PNGs. Select files yourself or opt into **Slim history** to remove inline images and compact shell output.
+- **Clean:** Quick clean scans and deep scans, combines savings by operation, then waits for Enter to clean verified temporary files, losslessly compress eligible PNGs and slim history older than 72 hours. Use **Slim history** to choose individual history operations.
 - **Analyze:** explore Storage, browse Projects and their sessions, or open Insights for usage and images.
 - **Statistics:** read recorded cleanup history, with before/after storage and cleaned record counts, separately for Claude and Codex.
 
@@ -100,7 +100,7 @@ A timeout or killed process may leave no complete JSON response. For mutations, 
 All JSON responses carry `schemaVersion` and `status`. Successful statistics responses use version `2`; other responses use version `1`:
 
 - Analysis: `reports`, each containing directories, categories, projects, sessions, usage, opportunities, warnings and completeness flags.
-- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. `slim-history` actions also include `slimOptions: { removeImages, compactTools }` and `slimCounts: { images, toolOutputs }`, with `slimSavingsBytes` attributing estimated reductions to each operation. Codex rewrites include `codexProjection` for coordinated index updates. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
+- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. `slim-history` actions also include `slimOptions: { removeImages, compactTools, removeReasoning? }`, `slimCounts: { images, toolOutputs, reasoning? }` and optional `slimSavingsBytes: { images, toolOutputs, reasoning? }`. The category byte estimates add up to `estimatedSavingsBytes`; older receipts may lack this breakdown or the reasoning fields. Codex rewrites include `codexProjection` for coordinated index updates. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
 - Statistics: `providers`, `savedBytes` and `cleanedRecords`. Each provider includes these totals, JSONL `operations`, a `pending` review count and `pendingOperations` recovery receipts. `--provider` limits both the returned providers and totals.
 - Errors: `error: { code, message }`, with `USAGE_ERROR`, `OPERATION_FAILED` or `INTERRUPTED`.
 
@@ -138,13 +138,13 @@ node src/cli.ts analyze delete --provider codex --file /absolute/.codex/generate
 
 Repeat `--session` or `--file` to select multiple targets. Explicit selections require one provider; session and file selections cannot be mixed. File selections remain subject to the same eligibility rules as the menu, and an ineligible selection fails before execution. Session deletion previews include verified descendants.
 
-Every cleanup plan starts with a storage scan and deep session analysis. Interactive cleanup, including Quick clean, Slim history, selected files, session deletion and terminal commands with `--yes`, lists the full target paths, operations and estimated savings before asking for confirmation. Press **Enter** to start the listed operations automatically; **Q / Esc** cancels. No source files are changed before confirmation. Cancelling a scan cancels the request. Noninteractive and JSON commands never prompt and still require explicit `--yes` for mutation. Deletion and history slimming are permanent; this tool does not offer undo.
+Every cleanup plan starts with a storage scan and deep session analysis. Interactive cleanup, including Quick clean, Slim history, selected files, session deletion and terminal commands with `--yes`, summarizes operations and estimated savings before asking for confirmation. **View files** provides full target paths and per-file details. Press **Enter** to start the listed operations automatically; **Q / Esc** cancels. No source files are changed before confirmation. Cancelling a scan cancels the request. Noninteractive and JSON commands never prompt and still require explicit `--yes` for mutation. Deletion and history slimming are permanent; this tool does not offer undo.
 
 Deletion estimates use the selected files' logical sizes. PNG estimates recompress verified source data in memory without replacing files. Failed estimates remain unknown instead of counting as zero. Estimates may differ from actual directory changes, especially when safety checks skip changed or active files. Actual savings are measured around execution.
 
 ### 72-hour protection
 
-Quick clean, automatic selection and bulk operations only delete or irreversibly change files whose **last modification time is more than 72 hours ago**. This includes temporary files, generated-image deletion, session deletion, inline-image removal and shell-output compaction. Session creation time does not determine eligibility. Recent files, files exactly 72 hours old, future timestamps and invalid timestamps are retained, with reasons shown and no estimated savings credited. Execution rechecks age and file identity before mutation.
+Quick clean, automatic selection and bulk operations only delete or irreversibly change files whose **last modification time is more than 72 hours ago**. This includes temporary files, generated-image deletion, session deletion, inline-image removal, shell-output compaction and Codex encrypted-reasoning removal. Session creation time does not determine eligibility. Recent files, files exactly 72 hours old, future timestamps and invalid timestamps are retained, with reasons shown and no estimated savings credited. Execution rechecks age and file identity before mutation.
 
 Only explicitly selecting **one file or one session without descendants** can bypass the age limit. Multiple selections, choosing a provider, `--yes`, or a scan finding only one candidate do not bypass it. A session deletion that includes descendants is protected as a group: any recent file retains the whole action. Other checks and confirmation still apply to a single target.
 
@@ -152,20 +152,23 @@ Lossless PNG recompression that preserves image content and supported metadata i
 
 ### Slim history
 
-Open **Clean → Slim history**, choose Claude Code, Codex or both, then enable either or both options. Both start unchecked; Quick clean does not enable them. This bulk flow only changes history files last modified more than 72 hours ago; an explicit single-file CLI operation can use the age exception above.
+**Clean → Quick clean** includes image removal and shell-output compaction for Claude Code and Codex, plus encrypted-reasoning removal for Codex, alongside existing temporary-file cleanup and lossless PNG compression. Its preview combines all selected providers and temporary directories into one summary: inline-image removal, shell-output compaction, Codex encrypted-reasoning removal, lossless PNG compression and each temporary-file operation show their own counts and estimated savings, followed by one total. Each byte is counted once; unknown estimates remain marked as unknown. The preview explains irreversible effects, then waits for Enter. **View files** opens the full file details grouped by provider and directory. Unsupported histories are retained with an explanation; independently eligible histories, temporary files and PNGs can still be listed.
+
+To choose history operations individually, open **Clean → Slim history**, choose Claude Code, Codex or both, then enable the desired operations. All options start unchecked in this standalone flow, which only slims history; encrypted-reasoning removal appears when Codex is selected. Both bulk flows only change history files last modified more than 72 hours ago; an explicit single-file CLI operation can use the age exception above. CLI `clean` continues to require explicit `--remove-images` / `--compact-tools` / `--remove-reasoning` flags for history slimming; these flags select history operations only.
 
 | Option | Effect |
 | --- | --- |
 | **Remove inline images** / `--remove-images` | Replace recognized Base64 image content blocks with a text block containing `[image removed]`. Remove recognized duplicate inline images from Codex UI events while keeping image hints and ordering aligned. |
 | **Compact shell output** / `--compact-tools` | Apply the ported RTK filters to recognized, completed, successful shell output. Keep tool-call IDs and execution metadata, and mark omitted content as unavailable. |
+| **Remove encrypted reasoning (Codex)** / `--remove-reasoning` | Remove nonempty string `encrypted_content` fields only from direct `response_item` reasoning records. Preserve visible summaries, content, IDs, signatures and all other bytes. Compaction ciphertext and nested replacement history remain intact. |
 
-The preview lists full file paths, enabled operations, stored image copies removed, tool outputs compacted, and exact estimated byte reductions. Image counts include duplicate stored copies, not unique pictures. Estimation transforms data in memory; execution repeats the transform and requires matching source/result hashes before atomic replacement. No-saving files are omitted; unsupported files are retained with warnings.
+The preview summarizes enabled operations, stored image copies removed, tool outputs compacted, reasoning blocks removed and exact estimated byte reductions. Full file paths are available in **View files** and JSON. Image counts include duplicate stored copies, not unique pictures. Estimation transforms data in memory; execution repeats the transform and requires matching source/result hashes before atomic replacement. No-saving files are omitted; unsupported files are retained with warnings.
 
 The following are examples to run **only when explicitly requested**:
 
 ```sh
-# Preview both operations for both providers; does not modify history.
-node src/cli.ts clean --provider all --remove-images --compact-tools --dry-run --json
+# Preview all history operations for both providers; does not modify history.
+node src/cli.ts clean --provider all --remove-images --compact-tools --remove-reasoning --dry-run --json
 
 # Interactively review and press Enter to remove inline images.
 node src/cli.ts clean --provider claude --remove-images
@@ -178,11 +181,11 @@ Supported inputs are Claude Code **2.1.319** transcripts and independent plain l
 
 Codex rewrites remap recognized SQLite byte offsets and cached items within the coordinated replacement and recovery flow. Pending rewrites require `codexProjection` receipts, including an explicit empty array when no databases exist. Unknown offset schemas, unsupported dependencies, external SQLite locations and uncertain configuration prevent rewriting. Generic file deletion/compression cannot bypass history coordination.
 
-Image removal handles Claude message and nested tool-result image blocks, Codex top-level response-message `input_image` data URLs, and known Codex user-message UI image arrays. Remote URLs, local image paths, standalone generated image files, arbitrary Base64 text, reasoning/signatures and unknown image shapes stay intact. Codex compacted replacement histories are not rewritten.
+Image removal handles Claude message and nested tool-result image blocks, Codex top-level response-message `input_image` data URLs, and known Codex user-message UI image arrays. Remote URLs, local image paths, standalone generated image files, arbitrary Base64 text, visible reasoning summaries/content, signatures and unknown image shapes stay intact. Codex compacted replacement histories are not rewritten.
 
 The RTK subset covers numbered `rg`/`grep` matches, `rg --files`/`find`/`fd` listings, recognized successful `cargo test` output and all-passed `pytest` output. Search output keeps up to 10 matches per file; listings keep up to 20 directories and 10 files per directory. Test output retains summaries. Claude requires a paired `Bash` result explicitly marked successful; Codex requires a paired `exec_command` or `shell_command` result with a recognized successful completion envelope. Shell pipelines, compound commands, JavaScript `functions.exec` wrappers, failures, warnings, terminal controls and unrecognized output stay intact. Historical commands are never executed.
 
-**Loss is permanent:** removed image content and omitted command output cannot be recovered from cc-clean. Temporary recovery originals are removed after successful finalization. Synthetic checks cover the transformations and guards; native resume/continuation after a rewrite has **not** been verified. See [compatibility limits](docs/native-compatibility.md#history-slimming-synthetic-checks-only).
+**Loss is permanent:** removed image content, omitted command output and removed encrypted reasoning state cannot be recovered from cc-clean. Temporary recovery originals are removed after successful finalization. A prior Codex 0.167.0 experiment successfully resumed and continued one copied real session after removing its reasoning ciphertext, using freshly rebuilt indexes. Existing-index rewrites have synthetic SQLite coverage only; this does not establish compatibility for complex sessions or all models. See [compatibility limits](docs/native-compatibility.md#history-slimming-synthetic-checks-and-limited-native-resume).
 
 ## Configuration and application data
 
@@ -218,10 +221,10 @@ Precedence: configuration file → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` → defaul
 | PNG compression | Eligible static PNGs in Codex `generated_images/`; recompress IDAT losslessly, preserving inflated scanlines and supported metadata; replace only when smaller |
 | Claude session deletion | Complete **2.1.319** transcripts and verifiably owned subagent/tool-result files; retain memory, configuration, file-history and history.jsonl |
 | Codex session deletion | Installed **0.167.0**, through official `codex delete`; verify full spawn descendant scope; reject incomplete indexes, attached relationships and compressed rollouts |
-| History slimming | Opt-in removal of recognized inline images and RTK shell-output compaction for Claude **2.1.319** and independent plain legacy/paginated Codex history with coordinated SQLite updates; irreversible, with native resume unverified |
+| History slimming | Recognized inline-image removal and RTK shell-output compaction for Claude **2.1.319** and independent plain legacy/paginated Codex history, plus Codex encrypted-reasoning removal, with mandatory SQLite coordination; irreversible, with [limited native reasoning-resume evidence](docs/native-compatibility.md#history-slimming-synthetic-checks-and-limited-native-resume) |
 | Platforms | Mutations on macOS after checks; analysis, previews and statistics on other platforms |
 
-Claude has no verified automatic temporary-file or standalone-image rule yet, so its quick clean may report zero candidates. A directory called `.tmp` or `cache` is not automatically disposable: installed plugins may still reference its resources through links.
+Claude has no verified automatic temporary-file or standalone-image rule yet; Quick clean can still reduce eligible history files. A directory called `.tmp` or `cache` is not automatically disposable: installed plugins may still reference its resources through links.
 
 Close the relevant Claude/Codex clients and services before mutation. Active processes, open files, incomplete scans, uncertain references and changed files block affected operations. Live analysis is a snapshot that may change. Session deletion currently requires complete deep analysis of the provider; an unrelated malformed or oversized transcript can also block deletion.
 

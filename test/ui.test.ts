@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
-import { analysisMenu, menu, printReport, detailNodes, printPlan, confirmPlans, usageMenu } from '../src/ui.ts';
+import { analysisMenu, menu, printReport, detailNodes, printPlan, printPlans, cleanOptions, confirmPlans, usageMenu } from '../src/ui.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
@@ -623,7 +623,7 @@ function inertPlan(): Plan {
   };
 }
 
-test('cleanup confirmation lists scope and totals, and only Enter can approve', async t => {
+test('cleanup confirmation summarizes scope, offers file details, and only Enter can approve', async t => {
   const term = await terminal(t);
   for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
     const original = Object.getOwnPropertyDescriptor(process, name)!;
@@ -632,13 +632,24 @@ test('cleanup confirmation lists scope and totals, and only Enter can approve', 
   }
   t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
   const first = inertPlan(), second = { ...inertPlan(), provider: 'claude' as const };
+  second.actions[0] = { ...second.actions[0], kind: 'slim-history', slimOptions: { removeImages: true, compactTools: true }, slimCounts: { images: 3, toolOutputs: 2 }, slimSavingsBytes: { images: 768, toolOutputs: 256 } };
   let settled = false;
   let answer = confirmPlans([first, second], term.context.signal);
   void answer.then(() => { settled = true; }, () => {});
   await setImmediate();
   const text = stripVTControlCharacters(term.text());
-  assert.match(text, /\/inert\/codex\/generated_images\/图片\.png/);
+  assert.doesNotMatch(text, /\/inert\/codex\/generated_images\/图片\.png/);
+  assert.equal(text.match(/Estimated savings by operation/g)?.length, 1);
   assert.match(text, /2\.00 KiB\s+Total estimated savings/);
+  assert.match(text, /768 B\s+Remove inline images · 3 images/);
+  assert.match(text, /256 B\s+Compact shell output · 2 outputs/);
+  assert.match(text, /Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable/);
+  await term.key('2'); await term.key('\r');
+  assert.equal(settled, false, 'file details must not approve cleanup');
+  assert.match(stripVTControlCharacters(term.text()), /\/inert\/codex\/generated_images\/图片\.png/);
+  assert.match(stripVTControlCharacters(term.text()), /source size 4\.00 KiB/);
+  assert.match(stripVTControlCharacters(term.text()), /Estimated savings: 1\.00 KiB/);
+  await term.key('q');
   for (const key of ['1', '2', ' ', 'y', '\x1b[B']) {
     await term.key(key);
     assert.equal(settled, false, 'a non-Enter key must never approve cleanup');
@@ -655,22 +666,21 @@ test('cleanup confirmation lists scope and totals, and only Enter can approve', 
   assert.ok(term.text().includes('\x1b[?25h'));
 });
 
-test('plan estimates distinguish source size, unknown savings and measured results', t => {
+test('plan estimates distinguish unknown savings and measured results', t => {
   const lines: string[] = [];
   t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
   const p = inertPlan();
   p.actions.push({ ...p.actions[0], id: 'unknown', targetId: 'unknown.png', estimatedSavingsBytes: null });
   printPlan(p);
-  assert.match(lines.join('\n'), /source size 4\.00 KiB/);
-  assert.match(lines.join('\n'), /1\.00 KiB \+ unknown \(1 item\)\s+Estimated savings/);
-  assert.match(lines.join('\n'), /Estimated savings: unknown/);
+  assert.match(lines.join('\n'), /1\.00 KiB \+ unknown \(1 item\)\s+Total estimated savings/);
+  assert.match(lines.join('\n'), /1\.00 KiB \+ unknown \(1 item\)\s+Compress PNGs \(lossless\) · 2 files/);
   assert.match(lines.join('\n'), /last modified more than 72 hours ago/);
   assert.equal(p.actions[0].afterBytes, 4096, 'estimates must not overwrite measured sizes');
   lines.length = 0;
   p.actions = [];
   printPlan(p);
   assert.match(lines.join('\n'), /No eligible cleanup items/);
-  assert.match(lines.join('\n'), /0 B\s+Estimated savings/);
+  assert.match(lines.join('\n'), /0 B\s+Total estimated savings/);
   lines.length = 0;
   p.explicitTarget = '/inert/codex/selected.jsonl';
   printPlan(p);
@@ -685,13 +695,15 @@ test('history plan rendering shows irreversible choices, counts and savings usin
   action.kind = 'slim-history'; action.targetId = 'sessions/example.jsonl';
   action.files[0].path = '/inert/codex/sessions/example.jsonl';
   action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 3, toolOutputs: 0};
+  action.slimSavingsBytes = {images: 1024, toolOutputs: 0};
   printPlan(p);
   const text = lines.join('\n');
-  assert.match(text, /\/inert\/codex\/sessions\/example\.jsonl/);
-  assert.match(text, /Remove inline images: yes.*Compact shell output: no/);
-  assert.match(text, /Images removed: 3.*Tool outputs compacted: 0/);
+  assert.doesNotMatch(text, /\/inert\/codex\/sessions\/example\.jsonl/);
+  assert.match(text, /1\.00 KiB\s+Remove inline images · 3 images/);
+  assert.doesNotMatch(text, /Compact shell output/);
   assert.match(text, /Irreversible:.*No undo/);
-  assert.match(text, /Estimated savings: 1\.00 KiB/);
+  assert.match(text, /1\.00 KiB\s+Total estimated savings/);
+  assert.match(text, /View files/);
 });
 
 test('ordinary menus keep their default selection and abort restores the terminal', async t => {
@@ -715,4 +727,75 @@ test('NO_COLOR suppresses colors even in a terminal', () => {
     if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete process.stdout.isTTY;
     if (original === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = original;
   }
+});
+
+test('Quick clean selects all supported history operations alongside file cleanup without prompting', async t => {
+  const term = await terminal(t);
+  assert.deepEqual(await cleanOptions(false, term.context.signal), {
+    includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: true,
+  });
+  assert.equal(term.text(), '');
+  assert.equal((await cleanOptions(false, term.context.signal, false))?.removeReasoning, false);
+});
+
+test('standalone Slim history starts unchecked and only includes the selected operations', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const original = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, get: () => value });
+    t.after(() => Object.defineProperty(process, name, original));
+  }
+  let answer = cleanOptions(true, term.context.signal);
+  await term.key('\r'); assert.equal(await answer, null);
+  for (const [keys, removeImages, compactTools, removeReasoning] of [['1', true, false, false], ['2', false, true, false], ['12', true, true, false], ['3', false, false, true], ['123', true, true, true]] as const) {
+    answer = cleanOptions(true, term.context.signal);
+    for (const key of keys) await term.key(key);
+    await term.key('\r');
+    assert.deepEqual(await answer, { removeImages, compactTools, removeReasoning });
+  }
+  answer = cleanOptions(true, term.context.signal);
+  await term.key('q'); assert.equal(await answer, null);
+  assert.match(stripVTControlCharacters(term.text()), /irreversible; no undo/);
+  assert.match(stripVTControlCharacters(term.text()), /more than 72 hours/);
+});
+
+test('hundreds of history actions render one bounded category summary including zero-saving operations', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = inertPlan(), base = p.actions[0];
+  p.actions = Array.from({length: 200}, (_, i) => ({
+    ...base, id: `history-${i}`, kind: 'slim-history', targetId: `sessions/${i}.jsonl`,
+    files: [{...base.files[0], path: `/inert/codex/sessions/${i}.jsonl`}],
+    slimOptions: {removeImages: true, compactTools: true}, slimCounts: {images: 3, toolOutputs: 0},
+    slimSavingsBytes: {images: 1024, toolOutputs: 0},
+  }));
+  const original = structuredClone(p);
+  printPlan(p);
+  const text = lines.join('\n');
+  assert.match(text, /200\.00 KiB\s+Remove inline images · 600 images/);
+  assert.match(text, /0 B\s+Compact shell output · 0 outputs/);
+  assert.match(text, /200\.00 KiB\s+Total estimated savings/);
+  assert.doesNotMatch(text, /sessions\/|source size/);
+  assert.equal(text.match(/Irreversible:/g)?.length, 1);
+  assert.ok(lines.length < 20);
+  assert.deepEqual(p, original, 'all details remain intact for JSON and file review');
+});
+
+test('mixed plans distinguish session deletion and preserve legacy history estimates without inventing a breakdown', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = inertPlan(), base = p.actions[0];
+  p.actions.push(
+    {...base, kind: 'slim-history', slimOptions: {removeImages: true, compactTools: true}, slimCounts: {images: 1, toolOutputs: 1}},
+    {...base, kind: 'delete-files'},
+    {...base, kind: 'delete-files', sessionIds: ['claude-session']},
+    {...base, kind: 'codex-delete', sessionIds: ['codex-session']},
+  );
+  printPlan(p);
+  const text = lines.join('\n');
+  assert.match(text, /1\.00 KiB\s+History slimming \(breakdown unavailable\) · 1 files/);
+  assert.match(text, /1\.00 KiB\s+Delete files · 1 files/);
+  assert.match(text, /2\.00 KiB\s+Delete sessions · 2 files/);
+  assert.match(text, /5\.00 KiB\s+Total estimated savings/);
+  assert.doesNotMatch(text, /Remove inline images|Compact shell output/);
 });

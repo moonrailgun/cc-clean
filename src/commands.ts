@@ -10,7 +10,7 @@ export const commandSchema = {
   stateDirectory: '~/.config/cc-clean/',
   ageProtection: { hours: 72, basis: 'File modification time; strictly older than 72 hours', scope: 'Bulk deletion and history slimming', exception: 'One explicitly selected file or one session without descendants; --yes and multi-selection do not bypass protection', losslessPng: 'Exempt' },
   commands: [
-    { command: 'clean', description: 'Clean verified temporary files and PNGs, or explicitly slim history', mutates: true, options: [...common, 'file', 'remove-images', 'compact-tools', 'dry-run', 'yes'] },
+    { command: 'clean', description: 'Clean verified temporary files and PNGs, or explicitly slim history', mutates: true, options: [...common, 'file', 'remove-images', 'compact-tools', 'remove-reasoning', 'dry-run', 'yes'] },
     { command: 'analyze', description: 'Report directory, project, session, usage and compression data', mutates: false, options: [...common, 'view', 'project'] },
     { command: 'analyze delete', description: 'Delete explicit sessions or eligible files', mutates: true, options: [...common, 'session', 'file', 'dry-run', 'yes'], requires: 'One provider and either session UUIDs or absolute file paths' },
     { command: 'stats', description: 'Report savings and operation history separately by provider', mutates: false, options: common },
@@ -23,6 +23,7 @@ export const commandSchema = {
     file: { type: 'string', repeatable: true, description: 'Absolute eligible file path; requires one provider' },
     'remove-images': { type: 'boolean', description: 'Permanently replace inline history images with text (clean only)' },
     'compact-tools': { type: 'boolean', description: 'Permanently shorten recognized successful shell output using RTK filters (clean only)' },
+    'remove-reasoning': { type: 'boolean', description: 'Permanently remove Codex encrypted reasoning state; summaries remain (clean only)' },
     'dry-run': { type: 'boolean', description: 'Preview only; do not modify source data or credit savings' },
     yes: { type: 'boolean', description: 'Explicit confirmation for noninteractive mutations; interactive cleanup still requires Enter' },
     json: { type: 'boolean', description: 'Emit exactly one JSON object on stdout and never prompt, including on errors' },
@@ -40,7 +41,7 @@ Usage:
   cc-clean                       Interactive menu in a terminal; help otherwise
   cc-clean clean [--provider claude|codex|all] [--dry-run|--yes]
   cc-clean clean --provider claude|codex --file <absolute-path> [--file <path>] [--dry-run|--yes]
-  cc-clean clean [--provider claude|codex|all] [--remove-images] [--compact-tools] [--dry-run|--yes]
+  cc-clean clean [--provider claude|codex|all] [--remove-images] [--compact-tools] [--remove-reasoning] [--dry-run|--yes]
   cc-clean analyze [--provider claude|codex|all] [--view directories|projects|sessions|usage|opportunities]
   cc-clean analyze delete --provider claude|codex --session <uuid> [--session <uuid>] [--dry-run|--yes]
   cc-clean analyze delete --provider claude|codex --file <absolute-path> [--file <path>] [--dry-run|--yes]
@@ -54,11 +55,12 @@ Options:
   --dry-run                     Preview cleanup without modifying source data
   --remove-images               Slim history: irreversibly replace inline images with text
   --compact-tools               Slim history: irreversibly filter recognized shell output with RTK
+  --remove-reasoning             Slim Codex history: irreversibly remove encrypted reasoning state
   --help, -h                    Help; add --json for machine-readable command discovery
   --version                     Version; supports --json
 
 Interactive cleanup:
-  Scan and deep scan, then list all targets and estimated savings.
+  Scan and deep scan, then summarize operations and estimated savings. View files for full paths.
   Press Enter to confirm cleanup; Q / Esc cancels. --yes does not skip this step.
 
 72-hour protection:
@@ -74,7 +76,7 @@ Agent usage:
   Use process argument arrays (execFile/spawn), not interpolated shell strings.
 
 Exit codes: 0 completed/preview/skipped, 1 failed/partial, 2 usage error, 130 interrupted.
-State: ~/.config/cc-clean/. Sizes are logical bytes. History slimming is opt-in; no undo.
+State: ~/.config/cc-clean/. Sizes are logical bytes. CLI history slimming requires explicit flags; no undo.
 `;
 
 export class UsageError extends Error {}
@@ -86,7 +88,7 @@ export function parseCommand(args: string[], tty: boolean) {
       session: { type: 'string', multiple: true }, file: { type: 'string', multiple: true },
       'dry-run': { type: 'boolean' }, json: { type: 'boolean' }, 'no-interactive': { type: 'boolean' },
       yes: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
-      'remove-images': { type: 'boolean' }, 'compact-tools': { type: 'boolean' },
+      'remove-images': { type: 'boolean' }, 'compact-tools': { type: 'boolean' }, 'remove-reasoning': { type: 'boolean' },
     } });
   } catch (error) { throw new UsageError((error as Error).message); }
   const { values, positionals } = parsed;
@@ -101,7 +103,8 @@ export function parseCommand(args: string[], tty: boolean) {
     if (values.view && (command !== 'analyze' || deleting)) throw new UsageError('--view is only valid for analyze');
     if (values.project !== undefined && (command !== 'analyze' || deleting || view !== 'sessions' || !isAbsolute(values.project))) throw new UsageError('--project requires analyze --view sessions and an absolute project path');
     if (values.session && !deleting) throw new UsageError('--session is only valid for analyze delete');
-    if ((values['remove-images'] !== undefined || values['compact-tools'] !== undefined) && command !== 'clean') throw new UsageError('--remove-images and --compact-tools require clean');
+    if ((values['remove-images'] !== undefined || values['compact-tools'] !== undefined || values['remove-reasoning'] !== undefined) && command !== 'clean') throw new UsageError('--remove-images, --compact-tools and --remove-reasoning require clean');
+    if (values['remove-reasoning'] && provider === 'claude') throw new UsageError('--remove-reasoning applies only to Codex; use --provider codex or all');
     if ((values.yes || values['dry-run'] || values.file) && !mutating) throw new UsageError('--yes, --dry-run and --file require a cleanup or deletion command');
     if (!command && Object.keys(values).some(key => !['json', 'no-interactive'].includes(key))) throw new UsageError('Specify a command');
     if (deleting && (provider === 'all' || !values.session?.length && !values.file?.length)) throw new UsageError('Deletion requires one --provider and at least one --session or --file');

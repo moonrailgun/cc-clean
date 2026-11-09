@@ -28,11 +28,13 @@ test('history flags are independent clean-only opt-ins and keep confirmation req
   const quick = parseCommand(['clean'], true);
   assert.equal(quick.values['remove-images'], undefined);
   assert.equal(quick.values['compact-tools'], undefined);
-  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-images', '--compact-tools']]) {
+  assert.equal(quick.values['remove-reasoning'], undefined);
+  assert.throws(() => parseCommand(['clean', '--provider', 'claude', '--remove-reasoning', '--yes'], false), /Codex/);
+  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-images', '--compact-tools', '--remove-reasoning']]) {
     assert.throws(() => parseCommand(['clean', ...flags, '--json'], true), /--yes/);
     const parsed = parseCommand(['clean', ...flags, '--yes', '--json'], true);
     assert.equal(parsed.interactive, false);
-    for (const flag of flags) assert.equal(parsed.values[flag.slice(2) as 'remove-images' | 'compact-tools'], true);
+    for (const flag of flags) assert.equal(parsed.values[flag.slice(2) as 'remove-images' | 'compact-tools' | 'remove-reasoning'], true);
     assert.equal(parseCommand(['clean', ...flags, '--yes'], true).interactive, true);
     assert.equal(parseCommand(['clean', ...flags, '--dry-run'], false).values['dry-run'], true);
     for (const command of [['analyze'], ['stats'], ['analyze', 'delete', '--provider', 'claude', '--session', id, '--yes']])

@@ -91,3 +91,16 @@ test('the execution guard can recheck eligibility after a clock or metadata chan
   a.files[0].mtimeMs = now;
   assert.ok(ageProtectionReason(a, undefined, now));
 });
+
+test('reasoning removal shares bulk age protection and excludes protected savings', () => {
+  const actions = [cutoff - 1, cutoff, now, now + 1, NaN].map((mtime, i) => ({
+    ...action('slim-history', mtime, `/inert/${i}.jsonl`),
+    slimOptions: {removeImages: false, compactTools: false, removeReasoning: true},
+    slimCounts: {images: 0, toolOutputs: 0, reasoning: 1},
+    slimSavingsBytes: {images: 0, toolOutputs: 0, reasoning: 50},
+  }));
+  const p = protectRecentContent(plan(actions), now);
+  assert.deepEqual(p.actions, [actions[0]]);
+  assert.equal(p.actions.reduce((sum, a) => sum + (a.slimSavingsBytes?.reasoning ?? 0), 0), 50);
+  assert.equal(p.warnings.length, 4);
+});

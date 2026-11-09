@@ -79,23 +79,63 @@ export function printReport(data: Analysis, view = 'directories') {
   if (data.warnings.length > 12) note(`Plus ${data.warnings.length - 12} more notes; use --json to see all`);
 }
 export function printPlan(p: Plan) {
-  title(`${providerName(p.provider)} · ${p.actions.length} items`, p.root);
+  printPlans([p]);
+}
+export function printPlans(plans: Plan[]) {
+  const actions = plans.flatMap(p => p.actions), warnings = plans.flatMap(p => p.warnings);
+  const single = plans.length === 1 ? plans[0] : undefined;
+  title(single ? `${providerName(single.provider)} · ${actions.length} items` : `Cleanup summary · ${actions.length} items`,
+    single ? single.root : [...new Set(plans.map(p => providerName(p.provider)))].join(' + '));
   note('Bulk deletion and history slimming require files last modified more than 72 hours ago.');
-  if (p.explicitTarget) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
-  if (!p.actions.length) note('No eligible cleanup items.');
-  for (const a of p.actions) {
-    section(`${a.kind} · ${a.targetId} · source size ${size(a.beforeBytes)}`);
-    for (const f of a.files) line(`    ${f.path}`);
-    if (a.sessionIds) line(`    Related sessions: ${a.sessionIds.join(', ')}`);
-    if (a.kind === 'slim-history') {
-      line(`    Remove inline images: ${a.slimOptions?.removeImages ? 'yes' : 'no'} · Compact shell output: ${a.slimOptions?.compactTools ? 'yes' : 'no'}`);
-      line(`    Images removed: ${a.slimCounts?.images ?? 0} · Tool outputs compacted: ${a.slimCounts?.toolOutputs ?? 0}`);
-      line('    Irreversible: original images and omitted output will be unavailable. No undo.');
-    }
-    line(`    Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`);
+  for (const p of plans) if (p.explicitTarget) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
+  if (!actions.length) {
+    line('  No eligible cleanup items.');
   }
-  rows([{ label: 'Estimated savings', value: estimatedSavings(p.actions) }]);
-  for (const warning of p.warnings) note(warning);
+  if (actions.length) {
+    section('Estimated savings by operation');
+    const slim = actions.filter(a => a.kind === 'slim-history' && a.slimSavingsBytes);
+    for (const [key, option, label, unit] of [
+      ['images', 'removeImages', 'Remove inline images', 'images'],
+      ['toolOutputs', 'compactTools', 'Compact shell output', 'outputs'],
+      ['reasoning', 'removeReasoning', 'Remove encrypted reasoning (Codex)', 'blocks'],
+    ] as const) {
+      if (slim.some(a => a.slimOptions?.[option])) rows([{
+        label: `${label} · ${slim.reduce((sum, a) => sum + (a.slimCounts?.[key] ?? 0), 0)} ${unit}`,
+        value: size(slim.reduce((sum, a) => sum + (a.slimSavingsBytes![key] ?? 0), 0)),
+      }]);
+    }
+    const groups: [string, Plan['actions']][] = [
+      ['History slimming (breakdown unavailable)', actions.filter(a => a.kind === 'slim-history' && !a.slimSavingsBytes)],
+      ['Compress PNGs (lossless)', actions.filter(a => a.kind === 'compress-png')],
+      ['Delete files', actions.filter(a => a.kind === 'delete-files' && !a.sessionIds?.length)],
+      ['Delete sessions', actions.filter(a => a.kind === 'codex-delete' || a.sessionIds?.length)],
+    ];
+    for (const [label, actions] of groups) {
+      if (actions.length) rows([{
+        label: `${label} · ${actions.reduce((sum, a) => sum + a.files.length, 0)} files`, value: estimatedSavings(actions),
+      }]);
+    }
+    line();
+  }
+  rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
+  if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
+  if (actions.length) note('Full file paths and per-file estimates: View files in the review menu, or use --json.');
+  const groups = new Map<string, number>();
+  for (const warning of warnings) {
+    const reason = warning.startsWith('72-hour protection:') ? '72-hour protection: modified within the last 3 days, or file time is invalid; kept unchanged.'
+      : warning.replace(/^.*?\.jsonl: /, '');
+    groups.set(reason, (groups.get(reason) ?? 0) + 1);
+  }
+  if (groups.size) {
+    section(`Scan notes · ${warnings.length} notices`);
+    line('  Reasons for retained files or scan limits. One file can have several notices.');
+    for (const [reason, count] of [...groups].sort((a, b) => b[1] - a[1]).slice(0, 5)) {
+      console.log(`    ${paint('cyan', `${count} ×`)} ${safe(reason)}`);
+    }
+    if (groups.size > 5) note(`Plus ${groups.size - 5} more note types.`);
+    note('Full paths and reasons: View scan notes in the review menu, or use --json.');
+    line();
+  }
   note('Estimates use logical bytes; safety checks may skip items. Actual directory changes may differ.');
 }
 function estimatedSavings(actions: Plan['actions']): string {
@@ -104,8 +144,9 @@ function estimatedSavings(actions: Plan['actions']): string {
   return unknown ? `${known ? `${size(known)} + ` : ''}unknown (${unknown} item${unknown === 1 ? '' : 's'})` : size(known);
 }
 export function printReceipts(receipts: Receipt[]) {
-  for (const r of receipts) {
-    if (r.status === 'dry-run') { printPlan(r); note('Preview only; no operations executed or savings credited'); continue; }
+  const previews = receipts.filter(r => r.status === 'dry-run');
+  if (previews.length) { printPlans(previews); note('Preview only; no operations executed or savings credited'); }
+  for (const r of receipts.filter(r => r.status !== 'dry-run')) {
     title(`${providerName(r.provider)} · ${r.status}`);
     console.log(paint(r.attributionComplete ? 'green' : 'yellow', `  Confirmed reduction: ${r.attributionComplete ? size(r.confirmedReductionBytes) : 'needs review'}`));
     rows([{ label: 'Directory before', value: size(r.rootBeforeBytes) }, { label: 'Directory after', value: size(r.rootAfterBytes) }, { label: 'Directory change', value: size(r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes) }]);
@@ -253,16 +294,53 @@ async function insightsMenu(load: () => Promise<Analysis | null>, subtitle: stri
 async function pause(signal?: AbortSignal) {
   await select({ message: 'Continue', clear: false, choices: [{ name: 'Back', value: 'back' }] }, context(signal));
 }
+async function planNotes(plans: Plan[], signal?: AbortSignal) {
+  await pager({ message: 'Scan notes', subtitle: 'Read-only details. Q / Esc returns to review.', pages: plans.filter(p => p.warnings.length).map(p => ({
+    name: `${providerName(p.provider)} · ${p.root}`, content: () => [p.root, '', ...p.warnings.flatMap(w => [w, ''])],
+  })) }, context(signal));
+}
+async function planFiles(plans: Plan[], signal?: AbortSignal) {
+  await pager({ message: 'Cleanup files', subtitle: 'Read-only details. Q / Esc returns to review.', pages: plans.filter(p => p.actions.length).map(p => ({
+    name: `${providerName(p.provider)} · ${p.root}`, content: () => [p.root, '', ...p.actions.flatMap(a => [
+      `${a.kind} · ${a.targetId} · source size ${size(a.beforeBytes)}`,
+      ...a.files.map(f => f.path),
+      ...(a.sessionIds ? [`Related sessions: ${a.sessionIds.join(', ')}`] : []),
+      ...(a.kind === 'slim-history' ? [
+        `Remove inline images: ${a.slimOptions?.removeImages ? 'yes' : 'no'} · Compact shell output: ${a.slimOptions?.compactTools ? 'yes' : 'no'} · Remove encrypted reasoning: ${a.slimOptions?.removeReasoning ? 'yes' : 'no'}`,
+        `Images removed: ${a.slimCounts?.images ?? 0} · Tool outputs compacted: ${a.slimCounts?.toolOutputs ?? 0} · Reasoning blocks removed: ${a.slimCounts?.reasoning ?? 0}`,
+      ] : []),
+      `Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`, '',
+    ])],
+  })) }, context(signal));
+}
 export async function confirmPlans(plans: Plan[], signal?: AbortSignal) {
-  plans.forEach(printPlan);
   const actions = plans.flatMap(p => p.actions);
-  if (!actions.length) return false;
-  rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
-  return await select({
-    message: 'Press Enter to clean the items listed above',
-    subtitle: 'This tool cannot undo these changes. Q / Esc cancels.', clear: false, requireEnter: true, cancelLabel: 'Cancel',
-    choices: [{ name: 'Confirm cleanup', description: 'Apply the full scope listed above', value: true }],
-  }, context(signal)) === true;
+  while (true) {
+    printPlans(plans);
+    if (!actions.length) return false;
+    const next = await select({
+      message: 'Press Enter to apply the cleanup summary above',
+      subtitle: 'This tool cannot undo these changes. Q / Esc cancels.', clear: false, requireEnter: true, cancelLabel: 'Cancel',
+      choices: [
+        { name: 'Confirm cleanup', description: 'Apply all summarized operations', value: 'confirm' },
+        { name: 'View files', description: 'Full paths and per-file estimates', value: 'files' },
+        ...(plans.some(p => p.warnings.length) ? [{ name: 'View scan notes', description: 'Full paths and reasons', value: 'notes' }] : []),
+      ],
+    }, context(signal));
+    if (next === 'files') await planFiles(plans, signal);
+    else if (next === 'notes') await planNotes(plans, signal);
+    else return next === 'confirm';
+    screen();
+  }
+}
+export async function cleanOptions(slim: boolean, signal?: AbortSignal, codex = true) {
+  if (!slim) return { includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: codex };
+  const fields = await checkbox({ message: 'Slim history (irreversible; no undo)', subtitle: 'Only history files last modified more than 72 hours ago.', choices: [
+    { name: 'Remove inline images', description: 'Replace Base64 image blocks with text', value: 'images' },
+    { name: 'Compact shell output', description: 'Use RTK filters on recognized successful commands', value: 'tools' },
+    ...(codex ? [{ name: 'Remove encrypted reasoning (Codex)', description: 'Remove reusable reasoning state; keep visible summaries', value: 'reasoning' }] : []),
+  ] }, context(signal));
+  return fields.length ? { removeImages: fields.includes('images'), compactTools: fields.includes('tools'), removeReasoning: fields.includes('reasoning') } : null;
 }
 const providers = [{ name: 'All providers', description: 'Claude Code and Codex', value: 'all' }, { name: 'Claude Code', value: 'claude' }, { name: 'Codex', value: 'codex' }] as const;
 async function chooseProvider(signal?: AbortSignal): Promise<Provider | 'all' | null> {
@@ -274,7 +352,7 @@ async function searchable<T>(message: string, items: Choice<T>[], signal?: Abort
 }
 async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal) {
   screen();
-  if (!plans.some(p => p.actions.length)) { plans.forEach(printPlan); await pause(signal); return; }
+  if (!plans.some(p => p.actions.length)) { printPlans(plans); await pause(signal); return; }
   if (await confirmPlans(plans, signal)) { printReceipts((await execute(config, plans, false, signal, line)).receipts); await pause(signal); }
 }
 function sessionChoice(s: Session): Choice<Session> {
@@ -429,7 +507,7 @@ export async function menu(config: Config, signal?: AbortSignal) {
         const mode = action === 'clean' ? await select({ message: 'Clean', choices: [
           { name: 'Quick clean', description: 'Deep scan, review savings, then confirm cleanup', value: 'quick' },
           { name: 'Select files', description: 'Choose what to clean', value: 'files' },
-          { name: 'Slim history', description: 'Remove inline images or compact shell output (irreversible)', value: 'slim' },
+          { name: 'Slim history', description: 'Remove images, compact output or remove Codex encrypted reasoning (irreversible)', value: 'slim' },
         ] }, context(signal)) : 'analyze';
         if (!mode) continue;
         const selected = await chooseProvider(signal);
@@ -437,15 +515,12 @@ export async function menu(config: Config, signal?: AbortSignal) {
         if (mode === 'analyze') for (const provider of providerList(selected)) await analysisMenu(config, provider, signal);
         else if (mode === 'files') for (const provider of providerList(selected)) await filesMenu(config, provider, signal);
         else {
-          const fields = mode === 'slim' ? await checkbox({ message: 'Slim history (irreversible; no undo)', subtitle: 'Only history files last modified more than 72 hours ago.', choices: [
-            { name: 'Remove inline images', description: 'Replace Base64 image blocks with text', value: 'images' },
-            { name: 'Compact shell output', description: 'Use RTK filters on recognized successful commands', value: 'tools' },
-          ] }, context(signal)) : [];
-          if (mode === 'slim' && !fields.length) continue;
+          const options = await cleanOptions(mode === 'slim', signal, selected !== 'claude');
+          if (!options) continue;
           screen(); title(mode === 'slim' ? 'Slim History' : 'Quick Clean');
           let plans: Plan[] | null = [];
           for (const provider of providerList(selected)) {
-            const p = await scanPlan(config, provider, { removeImages: fields.includes('images'), compactTools: fields.includes('tools') }, signal);
+            const p = await scanPlan(config, provider, options, signal);
             if (!p) { plans = null; break; }
             plans.push(p);
           }

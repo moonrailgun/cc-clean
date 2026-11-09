@@ -38,7 +38,7 @@ export interface Receipt extends Plan {
   rootBeforeBytes:number|null;rootAfterBytes:number|null;confirmedReductionBytes:number;
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
-interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions}
+interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean}
 export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'>):string|undefined {
   const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
   return targets.length===1?targets[0]:undefined;
@@ -149,7 +149,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   }
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
-  if(options.slim?.removeImages||options.slim?.compactTools) {
+  if(options.slim?.removeImages||options.slim?.compactTools||options.slim?.removeReasoning) {
     let layoutValid=true,blocked=new Map<string,string>();
     if(inv.provider==='codex') {
       try {blocked=await verifyCodexRewriteLayout(inv);}catch(error){plan.warnings.push((error as Error).message);layoutValid=false;}
@@ -160,7 +160,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
       if(!eligible(f)||f.size>MAX_HISTORY_BYTES){plan.warnings.push(`${f.relative}: history is linked, referenced or exceeds 64 MiB; retained`);continue;}
       plan.actions.push({...makeAction('slim-history',f.relative,[f]),slimOptions:{...options.slim}});
     }
-    return protectRecentContent(plan,now);
+    if(!options.includeFileCleanup)return protectRecentContent(plan,now);
   }
   const stateValid=inv.provider==='codex'&&version==='0.167.0'&&await validState(inv.root);
   for(const f of inv.files) {

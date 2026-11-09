@@ -168,9 +168,12 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
     if (action.kind === 'slim-history') {
       requireReceipt(action.sessionIds === undefined && object(action.slimOptions) &&
         typeof action.slimOptions.removeImages === 'boolean' && typeof action.slimOptions.compactTools === 'boolean' &&
-        (action.slimOptions.removeImages || action.slimOptions.compactTools));
+        (action.slimOptions.removeReasoning === undefined || typeof action.slimOptions.removeReasoning === 'boolean') &&
+        (action.slimOptions.removeImages || action.slimOptions.compactTools || action.slimOptions.removeReasoning));
       requireReceipt(object(action.slimCounts) && bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
-        (action.slimOptions.removeImages || action.slimCounts.images === 0) && (action.slimOptions.compactTools || action.slimCounts.toolOutputs === 0));
+        (action.slimOptions.removeImages || action.slimCounts.images === 0) && (action.slimOptions.compactTools || action.slimCounts.toolOutputs === 0) &&
+        (action.slimCounts.reasoning === undefined || bytes(action.slimCounts.reasoning)) &&
+        (action.slimOptions.removeReasoning || (action.slimCounts.reasoning ?? 0) === 0));
       requireReceipt(action.files.every(file => file.category === 'sessions'));
     }
     if (action.slimSavingsBytes !== undefined) {
@@ -178,7 +181,9 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       requireReceipt(action.kind === 'slim-history' && object(action.slimCounts) &&
         bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
         object(savings) && bytes(savings.images) && bytes(savings.toolOutputs) &&
-        savings.images + savings.toolOutputs === action.estimatedSavingsBytes &&
+        (savings.reasoning === undefined || bytes(savings.reasoning)) &&
+        savings.images + savings.toolOutputs + ((savings.reasoning as number | undefined) ?? 0) === action.estimatedSavingsBytes &&
+        (((action.slimCounts.reasoning as number | undefined) ?? 0) > 0 || (savings.reasoning ?? 0) === 0) &&
         (action.slimCounts.images > 0 || savings.images === 0) && (action.slimCounts.toolOutputs > 0 || savings.toolOutputs === 0));
     }
     if (data.provider === 'codex' && action.recoveryState !== 'finalized') {

@@ -278,3 +278,35 @@ sqlite_home = \"not a config key\"
   await writeFile(path, 'sqlite_home = "/elsewhere"');
   await assert.rejects(verifyCodexRewriteLayout(stale), /changed|config/);
 });
+
+test('Codex reasoning removal deletes only the encrypted member and preserves surrounding raw bytes', () => {
+  const reasoning = {removeImages: false, compactTools: false, removeReasoning: true};
+  const member = '"encrypted_content" : "密文\\u0061"';
+  for (const [payload, expected] of [
+    [`{ ${member}, "type":"reasoning", "id":9007199254740993123 }`, '{  "type":"reasoning", "id":9007199254740993123 }'],
+    [`{ "type":"reasoning", ${member}, "signature":"keep" }`, '{ "type":"reasoning", "signature":"keep" }'],
+    [`{ "type":"reasoning", "summary":[], ${member} }`, '{ "type":"reasoning", "summary":[] }'],
+    ['{"type":"reasoning","encrypted_\\u0063ontent":"opaque","content":[]}', '{"type":"reasoning","content":[]}'],
+  ]) {
+    const prefix = jsonl(meta).toString(), line = `{"type":"response_item","payload":${payload},"ordinal":1}\r\n`;
+    const input = Buffer.from(prefix + line), before = Buffer.from(input);
+    const result = slimHistory(input, 'codex', reasoning);
+    assert.equal(result.output?.toString(), prefix + line.replace(payload, expected));
+    assert.equal(result.counts.reasoning, 1);
+    assert.equal(result.savingsBytes.reasoning, input.length - result.output!.length);
+    assert.deepEqual(input, before);
+    assert.equal(slimHistory(result.output!, 'codex', reasoning).output, null);
+    assert.equal(slimHistory(input, 'codex', tools).output, null);
+  }
+});
+
+test('reasoning removal preserves compaction, nested history, unknown ciphertext and Claude thinking', () => {
+  const options = {removeImages: false, compactTools: false, removeReasoning: true};
+  const encrypted = {type: 'reasoning', encrypted_content: 'opaque', summary: [{type: 'summary_text', text: 'Keep'}], content: []};
+  const input = jsonl(meta, codex({type: 'compaction', encrypted_content: 'opaque'}),
+    {type: 'compacted', payload: {replacement_history: [encrypted]}},
+    {type: 'event_msg', payload: encrypted}, codex({type: 'unknown', encrypted_content: 'opaque'}),
+    ...[null, '', 123, {data: 'opaque'}].map(encrypted_content => codex({...encrypted, encrypted_content})));
+  assert.equal(slimHistory(input, 'codex', options).output, null);
+  assert.equal(slimHistory(jsonl(claude('assistant', [{type: 'thinking', thinking: 'Keep', encrypted_content: 'opaque', signature: 'signed'}])), 'claude', options).output, null);
+});

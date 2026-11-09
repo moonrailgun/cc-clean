@@ -63,7 +63,7 @@ async function main() {
   const plans = [];
   for (const p of selected) {
     signal.throwIfAborted();
-    const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting, removeImages: v['remove-images'], compactTools: v['compact-tools'] };
+    const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting, removeImages: v['remove-images'], compactTools: v['compact-tools'], removeReasoning: v['remove-reasoning'] };
     const item = interactive ? await ui.scanPlan(config, p, options, signal) : await plan(config, p, options, signal);
     if (!item) { process.exitCode = 130; return; }
     plans.push(item);
@@ -74,7 +74,7 @@ async function main() {
   }
   if (interactive && !v['dry-run']) {
     if (!plans.some(p => p.actions.length)) {
-      plans.forEach(ui.printPlan);
+      ui.printPlans(plans);
       process.exitCode = plans.every(p => p.scanComplete) ? 0 : 1;
       return;
     }

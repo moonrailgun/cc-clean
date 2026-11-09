@@ -186,3 +186,50 @@ test('unknown offset-bearing schemas and update triggers are refused explicitly'
     assert.throws(() => projectionSnapshot(triggered, 'rollout'), /trigger/);
   } finally { triggered.close(); }
 });
+
+test('reasoning-only and combined slimming synchronize offsets and caches in memory', () => {
+  const reasoning = {type: 'response_item', payload: {type: 'reasoning', id: 'r', summary: [{text: '保留'}], encrypted_content: 'cipher'.repeat(300)}};
+  const command = {type: 'CommandExecution', id: 'cmd', status: 'completed', command: ['/bin/zsh', '-lc', 'rg foo'], exit_code: 0,
+    aggregated_output: Array.from({length: 40}, (_, i) => `src/long-directory/file.ts:${i}:matching source line`).join('\n')};
+  const rows = [header, reasoning, {ordinal: 0, type: 'event_msg', payload: {type: 'item_completed', item}},
+    {ordinal: 1, type: 'event_msg', payload: {type: 'item_completed', item: command}}, {ordinal: 2, type: 'future', payload: {text: '保留'}}];
+  const history = lines(...rows), start = lines(...rows.slice(0, 2)).length;
+  const cachedReasoning = '{ "type": "reasoning", "id": "r", "summary": ["保留"], "content": [], "future": 9007199254740993123 }';
+  for (const combined of [false, true]) {
+    const opts = {removeImages: combined, compactTools: combined, removeReasoning: true};
+    const db = fixture();
+    try {
+      db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=?, next_rollout_ordinal=3 WHERE thread_id=?').run(history.length, 'rollout');
+      db.prepare('UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=? WHERE thread_id=?').run(start, history.length, 'rollout');
+      db.prepare('INSERT INTO thread_items VALUES(?,?,?,?)').run('rollout', 'turn', 'r', cachedReasoning);
+      db.prepare('INSERT INTO thread_items VALUES(?,?,?,?)').run('rollout', 'turn', 'cmd', JSON.stringify(command));
+      db.prepare('INSERT INTO thread_realtime_items VALUES(?,?,?)').run('rollout', 'r', cachedReasoning);
+      const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+      const result = slimHistory(history, 'codex', opts), output = result.output!;
+      assert.ok(output);
+      assert.deepEqual(result.counts, {images: combined ? 1 : 0, toolOutputs: combined ? 1 : 0, reasoning: 1});
+      assert.equal(Object.values(result.savingsBytes).reduce((sum, value) => sum + value, 0), history.length - output.length);
+      assert.doesNotMatch(output.toString(), /encrypted_content/);
+      const after = rewriteProjection(before, byteOffsetMap(history, output), opts);
+      assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
+      assert.equal(after.thread_turns[0].rollout_byte_offset, BigInt(start - result.savingsBytes.reasoning!));
+      assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.length));
+      assert.equal(after.thread_turns[0].extra, 9007199254740993123n);
+      assert.equal(after.thread_turns[0].rollout_ordinal, before.thread_turns[0].rollout_ordinal);
+      assert.equal(after.thread_history_projection_state[0].next_rollout_ordinal, 3n);
+      assert.equal(after.thread_items.find(row => row.item_id === 'r')!.item_json, cachedReasoning);
+      assert.equal(after.thread_realtime_items[0].item_json, cachedReasoning);
+      if (combined) {
+        assert.doesNotMatch(String(after.thread_items.find(row => row.item_id === 'u')!.item_json), /base64/);
+        assert.match(String(after.thread_items.find(row => row.item_id === 'cmd')!.item_json), /RTK output compacted/);
+      } else {
+        assert.equal(projectionHash(after.thread_items), projectionHash(before.thread_items));
+      }
+      db.exec('BEGIN'); applyProjection(db, before, after); db.exec('ROLLBACK');
+      assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
+      db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
+      assert.equal(projectionHash(projectionSnapshot(db, 'rollout')), projectionHash(after));
+      assert.deepEqual(projectionSnapshot(db, 'other'), other);
+    } finally { db.close(); }
+  }
+});
