@@ -408,6 +408,18 @@ async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal)
   if (!plans.some(p => p.actions.length)) { printPlans(plans); await pause(signal); return; }
   if (await confirmPlans(plans, signal)) { printReceipts((await execute(config, plans, false, signal, line)).receipts); await pause(signal); }
 }
+async function cleanProviders(config: Config, selected: Provider[], mode: 'quick' | 'slim' | 'temp', signal?: AbortSignal) {
+  const options = mode === 'temp' ? {tempOnly: true} : await cleanOptions(mode === 'slim', signal, selected.includes('codex'));
+  if (!options) return;
+  screen(); title(mode === 'temp' ? 'Clean Temporary Files' : mode === 'slim' ? 'Slim History' : 'Quick Clean');
+  const plans: Plan[] = [];
+  for (const provider of selected) {
+    const p = await scanCleanupPlans(config, provider, options, signal);
+    if (!p) return;
+    plans.push(...p);
+  }
+  await runSelection(config, plans, signal);
+}
 function sessionChoice(s: Session): Choice<Session> {
   return { name: `${s.id} · ${s.project ?? 'Unknown project'}`, bytes: s.bytes, value: s,
     detail: `${s.updatedAt}${s.archived ? ' · archived' : ''}${s.complete ? '' : ' · partial'}` };
@@ -557,28 +569,18 @@ export async function menu(config: Config, signal?: AbortSignal) {
           await pause(signal);
         }
       } else {
-        const mode = action === 'clean' ? await select({ message: 'Clean', choices: [
+        const mode = action === 'clean' ? await select<'quick' | 'files' | 'slim' | 'temp'>({ message: 'Clean', choices: [
           { name: 'Quick clean', description: 'Deep scan, review savings, then confirm cleanup', value: 'quick' },
           { name: 'Select files', description: 'Choose what to clean', value: 'files' },
           { name: 'Slim history', description: 'Remove images, compact output or remove Codex encrypted reasoning (irreversible)', value: 'slim' },
+          { name: 'Clean temporary files', description: 'Verified temporary outputs older than 72 hours (irreversible)', value: 'temp' },
         ] }, context(signal)) : 'analyze';
         if (!mode) continue;
         const selected = await chooseProvider(signal);
         if (!selected) continue;
         if (mode === 'analyze') for (const provider of providerList(selected)) await analysisMenu(config, provider, signal);
         else if (mode === 'files') for (const provider of providerList(selected)) await filesMenu(config, provider, signal);
-        else {
-          const options = await cleanOptions(mode === 'slim', signal, selected !== 'claude');
-          if (!options) continue;
-          screen(); title(mode === 'slim' ? 'Slim History' : 'Quick Clean');
-          let plans: Plan[] | null = [];
-          for (const provider of providerList(selected)) {
-            const p = await scanCleanupPlans(config, provider, options, signal);
-            if (!p) { plans = null; break; }
-            plans.push(...p);
-          }
-          if (plans) await runSelection(config, plans, signal);
-        }
+        else await cleanProviders(config, providerList(selected), mode, signal);
       }
     } catch (error) {
       if (signal?.aborted || (error as Error).name.includes('Prompt')) throw error;

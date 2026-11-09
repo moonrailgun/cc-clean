@@ -63,7 +63,7 @@ async function main() {
   const plans = [];
   for (const p of selected) {
     signal.throwIfAborted();
-    const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting, removeImages: v['remove-images'], compactTools: v['compact-tools'], removeReasoning: v['remove-reasoning'] };
+    const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting, tempOnly: v['temp-only'], removeImages: v['remove-images'], compactTools: v['compact-tools'], removeReasoning: v['remove-reasoning'] };
     const item = interactive ? await ui.scanCleanupPlans(config, p, options, signal) : await cleanupPlans(config, p, options, signal);
     if (!item) { process.exitCode = 130; return; }
     plans.push(...item);

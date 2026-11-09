@@ -933,3 +933,20 @@ test('system temps show category estimates and selective accounting without list
   assert.match(lines.join('\n'), /Matched temp files after/);
   assert.doesNotMatch(lines.join('\n'), /Directory before|Directory after/);
 });
+
+test('temporary cleanup menu can be opened and cancelled before any scan', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, {configurable: true, value});
+    t.after(() => Object.defineProperty(process, name, descriptor));
+  }
+  const running = menu({roots: {claude: '/inert/claude', codex: '/inert/codex'}, stateDir: '/inert/state'}, term.context.signal);
+  void running.catch(() => {});
+  await term.key('1');
+  assert.match(stripVTControlCharacters(term.text()), /4\. Clean temporary files/);
+  await term.key('4');
+  assert.match(stripVTControlCharacters(term.text()), /Claude Code/);
+  await term.key('q'); await term.key('q'); await running;
+  assert.doesNotMatch(stripVTControlCharacters(term.text()), /Scanning|Deep Scan|Confirm cleanup|Incomplete:/);
+});

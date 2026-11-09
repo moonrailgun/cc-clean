@@ -263,3 +263,5 @@ Quick clean and ordinary CLI `clean` also check known system temporary layouts f
 See [native compatibility](docs/native-compatibility.md#system-temporary-files-source-and-metadata-checks-only) for layout sources and verification limits.
 
 Session history also supplies successful creation evidence for temporary output paths, including `$TMPDIR`/`${TMPDIR}`, expanded paths and macOS `/private` aliases. Only allowlisted text outputs with verified creation, file identity and no other-session references qualify, always after strictly more than 72 hours. Unsupported scripts and incomplete evidence are retained; discovery is not comprehensive.
+
+Choose **Clean → Clean temporary files** or run `cc-clean clean --temp-only` for temporary files only. This mode excludes PNG compression and history slimming, keeps the strict 72-hour protection, and uses the same review and confirmation flow. For noninteractive or JSON use, supply `--yes` to execute or `--dry-run` to preview.

@@ -10,7 +10,7 @@ export const commandSchema = {
   stateDirectory: '~/.config/cc-clean/',
   ageProtection: { hours: 72, basis: 'File modification time; strictly older than 72 hours', scope: 'Bulk deletion and history slimming', exception: 'One explicitly selected file or one session without descendants; --yes and multi-selection do not bypass protection', losslessPng: 'Exempt' },
   commands: [
-    { command: 'clean', description: 'Clean verified temporary files and PNGs, or explicitly slim history', mutates: true, options: [...common, 'file', 'remove-images', 'compact-tools', 'remove-reasoning', 'dry-run', 'yes'] },
+    { command: 'clean', description: 'Clean verified temporary files and PNGs, or explicitly slim history', mutates: true, options: [...common, 'file', 'temp-only', 'remove-images', 'compact-tools', 'remove-reasoning', 'dry-run', 'yes'] },
     { command: 'analyze', description: 'Report directory, project, session, usage and compression data', mutates: false, options: [...common, 'view', 'project'] },
     { command: 'analyze delete', description: 'Delete explicit sessions or eligible files', mutates: true, options: [...common, 'session', 'file', 'dry-run', 'yes'], requires: 'One provider and either session UUIDs or absolute file paths' },
     { command: 'stats', description: 'Report savings and operation history separately by provider', mutates: false, options: common },
@@ -21,6 +21,7 @@ export const commandSchema = {
     project: { type: 'string', description: 'Absolute project path; filters sessions with --view sessions' },
     session: { type: 'string', repeatable: true, description: 'Full session UUID to delete' },
     file: { type: 'string', repeatable: true, description: 'Absolute eligible file path; requires one provider' },
+    'temp-only': { type: 'boolean', description: 'Clean only verified temporary files, always strictly older than 72 hours; excludes PNG compression and history slimming' },
     'remove-images': { type: 'boolean', description: 'Permanently replace inline history images with text (clean only)' },
     'compact-tools': { type: 'boolean', description: 'Permanently shorten recognized successful shell output using RTK filters (clean only)' },
     'remove-reasoning': { type: 'boolean', description: 'Permanently remove Codex encrypted reasoning state; summaries remain (clean only)' },
@@ -40,6 +41,7 @@ export const help = `cc-clean · Claude Code / Codex storage manager
 Usage:
   cc-clean                       Interactive menu in a terminal; help otherwise
   cc-clean clean [--provider claude|codex|all] [--dry-run|--yes]
+  cc-clean clean --temp-only [--provider claude|codex|all] [--dry-run|--yes]
   cc-clean clean --provider claude|codex --file <absolute-path> [--file <path>] [--dry-run|--yes]
   cc-clean clean [--provider claude|codex|all] [--remove-images] [--compact-tools] [--remove-reasoning] [--dry-run|--yes]
   cc-clean analyze [--provider claude|codex|all] [--view directories|projects|sessions|usage|opportunities]
@@ -53,6 +55,7 @@ Options:
   --no-interactive              Never prompt, even in a terminal
   --yes                         Confirm noninteractive mutations; interactive cleanup still requires Enter
   --dry-run                     Preview cleanup without modifying source data
+  --temp-only                   Clean only verified temporary files (strictly older than 72 hours)
   --remove-images               Slim history: irreversibly replace inline images with text
   --compact-tools               Slim history: irreversibly filter recognized shell output with RTK
   --remove-reasoning             Slim Codex history: irreversibly remove encrypted reasoning state
@@ -62,6 +65,15 @@ Options:
 Interactive cleanup:
   Scan and deep scan, then summarize operations and estimated savings. View files for full paths.
   Press Enter to confirm cleanup; Q / Esc cancels. --yes does not skip this step.
+
+System temporary files:
+  Quick clean and ordinary clean include known Claude/Codex files in /tmp, /var/tmp,
+  the OS user temp directory, TMPDIR, TMP, TEMP, and Claude's CLAUDE_CODE_TMPDIR.
+  Session creation records also locate temporary text outputs, including custom temp paths.
+  Only verified outputs, cwd records and leftover installers; never whole directories.
+  Use --temp-only or Clean temporary files for this scope without history or PNG changes.
+  Always more than 72 hours old. Explicit targets and history-only flags exclude this scope.
+  Close clients before cleanup; no computer restart is required.
 
 72-hour protection:
   Bulk deletion and history slimming only affect files last modified more than 72 hours ago.
@@ -89,6 +101,7 @@ export function parseCommand(args: string[], tty: boolean) {
       'dry-run': { type: 'boolean' }, json: { type: 'boolean' }, 'no-interactive': { type: 'boolean' },
       yes: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
       'remove-images': { type: 'boolean' }, 'compact-tools': { type: 'boolean' }, 'remove-reasoning': { type: 'boolean' },
+      'temp-only': { type: 'boolean' },
     } });
   } catch (error) { throw new UsageError((error as Error).message); }
   const { values, positionals } = parsed;
@@ -103,6 +116,7 @@ export function parseCommand(args: string[], tty: boolean) {
     if (values.view && (command !== 'analyze' || deleting)) throw new UsageError('--view is only valid for analyze');
     if (values.project !== undefined && (command !== 'analyze' || deleting || view !== 'sessions' || !isAbsolute(values.project))) throw new UsageError('--project requires analyze --view sessions and an absolute project path');
     if (values.session && !deleting) throw new UsageError('--session is only valid for analyze delete');
+    if (values['temp-only'] && (command !== 'clean' || values.file || values.session || values['remove-images'] || values['compact-tools'] || values['remove-reasoning'])) throw new UsageError('--temp-only requires clean without explicit targets or history slimming flags');
     if ((values['remove-images'] !== undefined || values['compact-tools'] !== undefined || values['remove-reasoning'] !== undefined) && command !== 'clean') throw new UsageError('--remove-images, --compact-tools and --remove-reasoning require clean');
     if (values['remove-reasoning'] && provider === 'claude') throw new UsageError('--remove-reasoning applies only to Codex; use --provider codex or all');
     if ((values.yes || values['dry-run'] || values.file) && !mutating) throw new UsageError('--yes, --dry-run and --file require a cleanup or deletion command');

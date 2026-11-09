@@ -9,7 +9,7 @@ import { within } from './state.ts';
 import { dirname } from 'node:path';
 import { discoverSessionTemps } from './session-temp.ts';
 
-type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean };
+type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; tempOnly?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean };
 export const includesSystemTemp = (options: CleanupOptions) => !options.manual && !options.files?.length && !options.sessions?.length &&
   (!!options.includeFileCleanup || !options.removeImages && !options.compactTools && !options.removeReasoning);
 
@@ -18,11 +18,12 @@ export async function report(config: Config, provider: Provider, deep: boolean, 
 }
 export async function plan(config: Config, provider: Provider, options: CleanupOptions = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   const inventory = await scanRoot(config.roots[provider], provider, signal, onProgress);
+  let version = 'unknown';
+  if (provider === 'codex' && inventory.exists) { try { version = await getCodexVersion(); } catch { /* Unknown versions cannot use version-specific rules. */ } }
+  if (options.tempOnly) return createPlan(inventory, {version, tempOnly: true, otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']]});
   const analysis = await analyze(inventory, { deep: true, signal, onProgress, stateDir: config.stateDir });
   if (options.sessions?.length && !analysis.scanComplete) throw new Error('Session analysis is incomplete; deletion scope cannot be verified. Inspect the analysis report');
   signal?.throwIfAborted();
-  let version = 'unknown';
-  if (provider === 'codex' && inventory.exists) { try { version = await getCodexVersion(); } catch { /* Unknown versions cannot use version-specific rules. */ } }
   const result = await createPlan(inventory, {
     version, source: options.manual ? 'analyze' : 'clean', sessions: analysis.sessions,
     sessionIds: options.sessions, filePaths: options.files, deleteImages: options.deleteImages,
@@ -43,6 +44,8 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
   return result;
 }
 export async function cleanupPlans(config: Config, provider: Provider, options: CleanupOptions = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void): Promise<Plan[]> {
+  if (options.tempOnly && (options.manual || options.files?.length || options.sessions?.length || options.deleteImages || options.removeImages || options.compactTools || options.removeReasoning))
+    throw new Error('Temporary-file cleanup cannot be combined with explicit targets or history slimming');
   const plans = [await plan(config, provider, options, signal, onProgress)];
   if (!includesSystemTemp(options)) return plans;
   const uid = process.getuid?.();

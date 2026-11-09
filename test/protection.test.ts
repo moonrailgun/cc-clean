@@ -197,5 +197,6 @@ test('temporary scopes run before evidence-changing history plans without mutati
   const plans = [history, temp, fixed];
   assert.deepEqual(cleanupExecutionOrder(plans), [temp, history, fixed]);
   assert.deepEqual(plans, [history, temp, fixed]);
+  assert.equal(includesSystemTemp({tempOnly: true}), true);
   assert.equal(includesSystemTemp({includeFileCleanup: true, removeImages: true}), true);
 });

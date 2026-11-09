@@ -41,7 +41,7 @@ export interface Receipt extends Plan {
   rootBeforeBytes:number|null;rootAfterBytes:number|null;confirmedReductionBytes:number;
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
-interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
+interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;tempOnly?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
 export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'>):string|undefined {
   const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
   return targets.length===1?targets[0]:undefined;
@@ -182,7 +182,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
     if(selected&&!selected.has(f.path))continue;
     if(!eligible(f))continue;
     if(/^generated_images\/.+\.png$/i.test(f.relative)&&inv.provider==='codex') {
-      if(f.size<=MAX_PNG_BYTES)plan.actions.push(makeAction(options.deleteImages?'delete-files':'compress-png',f.relative,[f]));
+      if(!options.tempOnly&&f.size<=MAX_PNG_BYTES)plan.actions.push(makeAction(options.deleteImages?'delete-files':'compress-png',f.relative,[f]));
     } else if(stateValid&&/^\.\.codex-global-state\.json\.tmp-[^/]+$/.test(f.relative)) {
       plan.actions.push(makeAction('delete-files',f.relative,[f]));
     }
