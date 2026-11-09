@@ -255,3 +255,9 @@ Metadata analysis reads bounded record prefixes; usage and field analysis parse 
 Shell-output compaction contains modified TypeScript ports of selected [RTK CLI](https://github.com/rtk-ai/rtk) filters, copyright **2026 RTK AI Labs**, licensed under **Apache License 2.0**. The pinned upstream revision is [`653efb6ed02bd287d686c50e830dd1009356904f`](https://github.com/rtk-ai/rtk/tree/653efb6ed02bd287d686c50e830dd1009356904f). Only the Apache-2.0 CLI `src/` code is used; RTK's BUSL-1.1 engine/proxy code is not included.
 
 See the distributed [Apache-2.0 license](third_party/rtk/LICENSE) and [source/function mapping and modifications](third_party/rtk/UPSTREAM.md). This port implements the subset described above, not all RTK filters or its runtime.
+
+### System temporary files
+
+Quick clean and ordinary CLI `clean` also check known system temporary layouts for Claude task outputs/cwd records and Codex hook outputs/leftover installers. Only matching files owned by the current user and last modified strictly more than 72 hours ago qualify. Configuration roots, application state, source, images, scratchpads, locks and sockets are retained; directories are never deleted wholesale. Review the combined category estimates before confirming.
+
+See [native compatibility](docs/native-compatibility.md#system-temporary-files-source-and-metadata-checks-only) for layout sources and verification limits.

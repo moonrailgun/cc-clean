@@ -21,7 +21,7 @@ async function main() {
   const config = await loadConfig(), signal = controller.signal;
   signal.throwIfAborted();
   const ui = await import('./ui.ts');
-  const { report, plan, execute } = await import('./app.ts');
+  const { report, cleanupPlans, execute } = await import('./app.ts');
   const selected: Provider[] = provider === 'all' ? ['claude', 'codex'] : [provider as Provider];
   if (!command) { await ui.menu(config, signal); return; }
   if (command === 'stats') {
@@ -64,9 +64,9 @@ async function main() {
   for (const p of selected) {
     signal.throwIfAborted();
     const options = { sessions: v.session, files, deleteImages: deleting && !!files, manual: deleting, removeImages: v['remove-images'], compactTools: v['compact-tools'], removeReasoning: v['remove-reasoning'] };
-    const item = interactive ? await ui.scanPlan(config, p, options, signal) : await plan(config, p, options, signal);
+    const item = interactive ? await ui.scanCleanupPlans(config, p, options, signal) : await cleanupPlans(config, p, options, signal);
     if (!item) { process.exitCode = 130; return; }
-    plans.push(item);
+    plans.push(...item);
   }
   if (files) {
     const eligible = new Set(plans.flatMap(p => p.actions.flatMap(a => a.files.map(f => f.path))));

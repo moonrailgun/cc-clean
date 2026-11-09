@@ -9,6 +9,7 @@ export interface CleanupLog {
   startedAt: string; finishedAt: string; status: Exclude<Receipt['status'], 'dry-run'>;
   beforeBytes: number | null; afterBytes: number | null; savedBytes: number | null;
   cleanedRecords: number; cleanupTypes: {type: CleanupType; cleanedRecords: number}[]; needsReview: boolean;
+  scope?: 'system-temp';
 }
 export function pendingReceipt(r: Receipt): boolean {
   return !r.attributionComplete || r.status === 'needs-review' || r.actions.some(a =>
@@ -23,6 +24,7 @@ function validLog(value: unknown): asserts value is CleanupLog {
   if (!object(value)) throw new Error('Invalid cleanup log');
   require(value.schemaVersion === 1 && typeof value.operationId === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.operationId));
   require(value.provider === 'claude' || value.provider === 'codex');
+  require(value.scope === undefined || value.scope === 'system-temp');
   require(typeof value.root === 'string' && !value.root.includes('\0') && isAbsolute(value.root) && resolve(value.root) === value.root);
   require(['clean', 'analyze'].includes(value.source as string) && time(value.startedAt) && time(value.finishedAt));
   require(['completed', 'partial', 'failed', 'interrupted', 'needs-review'].includes(value.status as string));
@@ -68,6 +70,7 @@ export async function recordCleanup(stateDir: string, r: Receipt): Promise<void>
   }
   const entry: CleanupLog = {
     schemaVersion: 1, operationId: r.operationId, provider: r.provider, root: r.root, source: r.source,
+    ...(r.systemTemp ? {scope: 'system-temp' as const} : {}),
     startedAt: r.executionStartedAt, finishedAt: r.finishedAt, status: r.status,
     beforeBytes: r.rootBeforeBytes, afterBytes: r.rootAfterBytes,
     savedBytes: r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes,

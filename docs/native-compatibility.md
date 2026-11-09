@@ -86,3 +86,16 @@ The native CLI was run in a bounded terminal session with `--bare --safe-mode --
 This validates listing refresh and reading/resuming the surviving **plain main transcript** after deletion, for 2.1.319. It does not validate a generated continuation, arbitrary signed/tool payload rewriting, unknown attachments, or all subagent layouts. Do not advertise those broader guarantees based on this probe.
 
 The supported cc-clean operation removes only a structurally verified session group: its main JSONL and independently verified uniquely owned subagent/tool-result files. Preserve project memory, configuration, file history, `history.jsonl`, and resources with uncertain ownership. Never substitute `claude purge`: its project/configuration scope is broader than a selected conversation. Unknown versions, malformed or incomplete transcripts, ambiguous references, and unsupported ownership relationships must prevent mutation.
+
+## System temporary files: source and metadata checks only
+
+External temporary files use exact layouts rather than CLI-version gates:
+
+- Claude task outputs: `claude-<uid>/<project>/tasks/<id>.output` and legacy `claude/<project>/tasks/<id>.output`, documented in [task-output reports](https://github.com/anthropics/claude-code/issues/26911).
+- Claude cwd records: legacy `claude-<4 lowercase hex>-cwd` and `claude-<uid>/cwd-<hex>`, supported by [cwd-file reports](https://github.com/anthropics/claude-code/issues/31024) and inspected CLI layouts. These contain working-directory state; they are not scratchpad directories.
+- Codex full hook outputs: [`output_spill.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/output_spill.rs) uses the OS temp directory plus `hook_outputs/<thread UUID>/<UUID>.txt`. The model can receive a preview and the full-output path; deleting this file loses the full output even if a saved conversation still names it.
+- Codex desktop installers: [`mac.rs`](https://github.com/openai/codex/blob/main/codex-rs/cli/src/desktop_app/mac.rs) uses a `codex-app-installer-` directory containing `Codex.dmg`.
+
+Claude's documented [scratchpad layout](https://code.claude.com/docs/en/claude-directory) can hold source, images and other session assets. No scratchpad or provider-prefixed directory is deleted wholesale. Codex daemon directories, locks, IPC sockets and remote-control resources are also outside the allowlist.
+
+Synthetic disposable-layout tests cover provider matching, base-path deduplication, exclusions, symlinks, hard links, permissions, ownership checks, byte accounting and cancellation. Pure metadata tests cover the strict 72-hour cutoff; inert receipts cover scope validation and selective accounting. These tests do not invoke cleanup planning, execution, recovery or native clients. The external-temp execution/recovery path has not been integration-tested; it reuses same-filesystem transactions and activity checks. System-wide inbound references and same-metadata races are not exhaustively detectable. Fixed temporary layouts without verified session ownership require the provider's clients/services and other open writers to be closed; no reboot is required.

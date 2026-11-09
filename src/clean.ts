@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { constants } from 'node:fs';
 import type { FileEntry, Inventory, Provider, ScanProgress, Session } from './types.ts';
 import { scanRoot } from './scan.ts';
+import { scanSystemTemp, scopedTempKind, tempExcluded, verifySystemTempParents, type SystemTempScope } from './system-temp.ts';
 import { privateDir, atomicJson, jsonFiles, within, existingDir, readOrdinaryFile } from './state.ts';
 import { recompressPng, MAX_PNG_BYTES } from './png.ts';
 import { checkActivity as defaultActivity, type ActivityCheck } from './activity.ts';
@@ -32,13 +33,14 @@ export interface Plan {
   source:'clean'|'analyze';startedAt:string;actions:Action[];warnings:string[];scanComplete:boolean;
   rootIdentity?:{dev:number;ino:number};codexIndexFingerprint?:string;
   explicitTarget?:string;
+  systemTemp?:SystemTempScope;
 }
 export interface Receipt extends Plan {
   status:'completed'|'partial'|'failed'|'interrupted'|'needs-review'|'dry-run';
   rootBeforeBytes:number|null;rootAfterBytes:number|null;confirmedReductionBytes:number;
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
-interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean}
+interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
 export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'>):string|undefined {
   const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
   return targets.length===1?targets[0]:undefined;
@@ -55,14 +57,21 @@ export function ageProtectionReason(action:Action,explicitTarget?:string,now=Dat
 }
 export function protectRecentContent(plan:Plan,now=Date.now()):Plan {
   plan.actions=plan.actions.filter(action=>{
-    const reason=ageProtectionReason(action,plan.explicitTarget,now);
+    const reason=ageProtectionReason(action,plan.systemTemp?undefined:plan.explicitTarget,now);
     if(reason)plan.warnings.push(reason);
     return !reason;
   });
   return plan;
 }
+export async function protectActiveContent(plan:Plan,check:ActivityCheck=defaultActivity):Promise<Plan> {
+  if(!plan.actions.length)return plan;
+  const reasons=await planActivity(plan,check);
+  plan.actions=plan.actions.filter(a=>!reasons.has(a));
+  for(const reason of new Set(reasons.values()))plan.warnings.push(`Activity protection: ${reason}`);
+  return plan;
+}
 const replacement=(kind:Action['kind'])=>kind==='compress-png'||kind==='slim-history';
-function same(entry:FileEntry,s:Awaited<ReturnType<typeof lstat>>) {return s.isFile()&&!s.isSymbolicLink()&&s.nlink===1&&s.dev===entry.dev&&s.ino===entry.ino&&s.size===entry.size&&s.mtimeMs===entry.mtimeMs&&s.ctimeMs===entry.ctimeMs;}
+function same(entry:FileEntry,s:Awaited<ReturnType<typeof lstat>>) {return s.isFile()&&!s.isSymbolicLink()&&s.nlink===1&&s.dev===entry.dev&&s.ino===entry.ino&&s.size===entry.size&&s.mtimeMs===entry.mtimeMs&&s.ctimeMs===entry.ctimeMs&&(entry.uid===undefined||s.uid===entry.uid&&s.mode===entry.mode);}
 function referenced(inv:Inventory,path:string) {return inv.links.some(l=>{const target=isAbsolute(l.target)?resolve(l.target):resolve(dirname(l.path),l.target);return path===target||within(target,path)||within(path,target);});}
 function makeAction(kind:Action['kind'],id:string,files:FileEntry[],sessionIds?:string[]):Action {
   const bytes=files.reduce((n,f)=>n+f.size,0);
@@ -116,12 +125,17 @@ async function validState(root:string) {
 }
 export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<Plan> {
   const now=options.now??Date.now();const version=options.version??'unknown';
-  const plan:Plan={schemaVersion:1,operationId:randomUUID(),provider:inv.provider,root:inv.root,version,source:options.source??'clean',explicitTarget:singleSelectedTarget(options),startedAt:new Date(now).toISOString(),actions:[],warnings:[...inv.errors],scanComplete:inv.complete};
+  const plan:Plan={schemaVersion:1,operationId:randomUUID(),provider:inv.provider,root:inv.root,version,source:options.source??'clean',systemTemp:options.systemTemp,explicitTarget:options.systemTemp?undefined:singleSelectedTarget(options),startedAt:new Date(now).toISOString(),actions:[],warnings:[...inv.errors],scanComplete:inv.complete};
   if(!inv.exists)return plan;
   const rootStat=await lstat(inv.root);plan.rootIdentity={dev:rootStat.dev,ino:rootStat.ino};
   if((options.otherRoots??[]).some(r=>r===inv.root||within(r,inv.root)||within(inv.root,r)))throw new Error('Source directories overlap; mutations blocked');
   if(!inv.complete){plan.warnings.push('Scan is incomplete; no mutation plan created');return plan;}
   const eligible=(f:FileEntry)=>f.nlink===1&&!referenced(inv,f.path)&&within(inv.root,f.path);
+  if(options.systemTemp) {
+    for(const f of inv.files)if(eligible(f)&&f.uid===options.systemTemp.uid&&!tempExcluded(f.path,options.systemTemp)&&scopedTempKind(inv.root,f.path,inv.provider,options.systemTemp))
+      plan.actions.push(makeAction('delete-files',f.relative,[f]));
+    return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
+  }
   if(options.sessionIds?.length) {
     const sessions=options.sessions??[];
     const selected=new Set(options.sessionIds);
@@ -145,7 +159,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
       for(const action of plan.actions)verifyCodexScope(action,index.threads,inv,groups);
       plan.codexIndexFingerprint=index.fingerprint;
     }
-    return protectRecentContent(plan,now);
+    return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
   }
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
@@ -160,7 +174,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
       if(!eligible(f)||f.size>MAX_HISTORY_BYTES){plan.warnings.push(`${f.relative}: history is linked, referenced or exceeds 64 MiB; retained`);continue;}
       plan.actions.push({...makeAction('slim-history',f.relative,[f]),slimOptions:{...options.slim}});
     }
-    if(!options.includeFileCleanup)return protectRecentContent(plan,now);
+    if(!options.includeFileCleanup)return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
   }
   const stateValid=inv.provider==='codex'&&version==='0.167.0'&&await validState(inv.root);
   for(const f of inv.files) {
@@ -174,9 +188,10 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   }
   protectRecentContent(plan,now);
   if(selected&&plan.actions.length===0)plan.warnings.push('Selected files have no eligible operations');
-  return plan;
+  return protectActiveContent(plan,options.checkActivity);
 }
-async function verifyFile(root:string,f:FileEntry) {
+async function verifyFile(root:string,f:FileEntry,plan?:Plan) {
+  if(plan?.systemTemp)await verifySystemTempParents(root,f.path,plan.provider,plan.systemTemp);
   if(!within(root,f.path)||await realpath(root)!==root)throw new Error('Source path changed');
   let cursor=root;
   for(const part of relative(root,dirname(f.path)).split('/').filter(Boolean)) {cursor=join(cursor,part);const s=await lstat(cursor);if(!s.isDirectory()||s.isSymbolicLink())throw new Error('Parent directory changed or contains a symlink');}
@@ -186,6 +201,8 @@ async function readVerified(root:string,f:FileEntry) {
   await verifyFile(root,f);const data=await readOrdinaryFile(f.path,MAX_PNG_BYTES);await verifyFile(root,f);return data;
 }
 export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:(progress:ScanProgress)=>void) {
+  signal?.throwIfAborted();
+  await protectActiveContent(plan);
   for(const [index,action] of plan.actions.entries()) {
     signal?.throwIfAborted();
     onProgress?.({phase:'estimating',completed:index,total:plan.actions.length,currentFile:action.targetId});
@@ -223,6 +240,7 @@ async function verifyRoot(r:Plan) {
 async function verifyParents(r:Plan,a:Action) {
   await verifyRoot(r);
   for(const f of a.files)if(!within(r.root,f.path)||!await existingDir(dirname(f.path))||await realpath(dirname(f.path))!==dirname(f.path))throw new Error('Source parent directory changed');
+  if(r.systemTemp)for(const f of a.files)await verifySystemTempParents(r.root,f.path,r.provider,r.systemTemp);
 }
 async function exists(path:string) {try {await lstat(path);return true;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}}
 async function acquireLock(stateDir:string):Promise<()=>Promise<void>> {
@@ -249,7 +267,7 @@ function workPath(stateDir:string,r:Plan,a:Action) {return join(stateDir,'provid
 async function verifyBackup(dir:string,a:Action,index:number) {
   if(!await existingDir(dir))throw new Error('Transaction directory is missing');
   const f=a.files[index],s=await lstat(join(dir,`${index}.original`));
-  if(!s.isFile()||s.isSymbolicLink()||s.dev!==f.dev||s.ino!==f.ino||s.size!==f.size||s.mtimeMs!==f.mtimeMs||s.nlink> (replacement(a.kind)?2:1))throw new Error('Original transaction file identity changed; retained for review');
+  if(!s.isFile()||s.isSymbolicLink()||s.dev!==f.dev||s.ino!==f.ino||s.size!==f.size||s.mtimeMs!==f.mtimeMs||f.uid!==undefined&&(s.uid!==f.uid||s.mode!==f.mode)||s.nlink> (replacement(a.kind)?2:1))throw new Error('Original transaction file identity changed; retained for review');
 }
 async function cleanupWork(dir:string,a:Action) {
   if(!await existingDir(dir))return;
@@ -271,6 +289,32 @@ async function currentHash(root:string,path:string):Promise<string> {
   return hash(await readOrdinaryFile(path,MAX_PNG_BYTES));
 }
 function updateTotal(r:Receipt) {r.confirmedReductionBytes=r.actions.reduce((n,a)=>n+(a.status==='completed'?a.beforeBytes-a.afterBytes:0),0);}
+const scanPlanScope=(p:Plan)=>p.systemTemp?scanSystemTemp(p.root,p.provider,p.systemTemp):scanRoot(p.root,p.provider);
+async function planActivity(p:Plan,check:ActivityCheck,actions=p.actions,openPaths?:string[]) {
+  const reasons=new Map<Action,string>();
+  for(const provider of [p.provider]) {
+    const root=p.root;
+    const paths=openPaths??actions.flatMap(a=>a.files.map(f=>f.path));
+    const codexRoot=provider==='codex'&&!p.systemTemp;
+    let result=await check(provider,root,codexRoot?undefined:paths).catch(()=>'Cannot reliably check client activity');
+    // Codex still protects the whole root, including index writers; transaction copies can be outside it.
+    if(!result&&codexRoot&&openPaths?.length)result=await check(provider,root,openPaths).catch(()=>'Cannot reliably check client activity');
+    for(const a of actions)if(result&&!reasons.has(a))reasons.set(a,result);
+    if(reasons.size===actions.length)break;
+  }
+  return reasons;
+}
+async function actionActivity(p:Plan,a:Action,check:ActivityCheck,dir?:string) {
+  try {
+    const paths:string[]=[];
+    for(const [i,f] of a.files.entries())for(const path of [f.path,...dir?[join(dir,`${i}.original`)]:[]])if(await exists(path))paths.push(path);
+    if(dir&&await exists(join(dir,'output')))paths.push(join(dir,'output'));
+    return (await planActivity(p,check,[a],paths)).get(a)??null;
+  }catch{return 'Cannot reliably inspect candidate and transaction files';}
+}
+function stateOverlaps(p:Plan,stateDir:string) {
+  return p.root===stateDir||within(stateDir,p.root)||within(p.root,stateDir)&&(!p.systemTemp||!tempExcluded(stateDir,p.systemTemp));
+}
 interface ExecuteOptions {stateDir:string;dryRun?:boolean;signal?:AbortSignal;checkActivity?:ActivityCheck;onProgress?:(message:string)=>void}
 export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Receipt> {
   const r:Receipt=structuredClone({...plan,status:'completed',rootBeforeBytes:null,rootAfterBytes:null,confirmedReductionBytes:0,attributionComplete:true});
@@ -278,7 +322,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
   if(r.actions.some(a=>a.status!=='planned'||a.recoveryState!=='prepared'))throw new Error('Execution requires a fresh operation plan');
   if(options.dryRun){r.status='dry-run';return r;}
   const {stateDir}=options;const check=options.checkActivity??defaultActivity;
-  if(plan.root===stateDir||within(plan.root,stateDir)||within(stateDir,plan.root))throw new Error('Application and source directories overlap');
+  if(stateOverlaps(plan,stateDir))throw new Error('Application and source directories overlap');
   const unlock=await acquireLock(stateDir);
   const save=()=>atomicJson(receiptPath(stateDir,r),r);
   const finish=async()=>{updateTotal(r);r.finishedAt=new Date().toISOString();await save();await recordCleanup(stateDir,r);return r;};
@@ -288,25 +332,24 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
     const pending=(await jsonFiles(join(stateDir,'providers',r.provider,'operations'))).some(({data})=>(data as Receipt).status==='needs-review');
     if(pending)throw new Error('An operation needs review; new mutations blocked. Inspect stats for details');
     r.executionStartedAt=new Date().toISOString();
-    const before=await scanRoot(r.root,r.provider);r.rootBeforeBytes=before.complete?before.totalBytes:null;
+    const before=await scanPlanScope(r);r.rootBeforeBytes=before.complete?before.totalBytes:null;
     if(!before.complete){r.status='failed';r.warnings.push('Pre-execution scan is incomplete');r.actions.forEach(a=>{a.status='skipped';a.reason='Scan is incomplete';a.recoveryState='finalized';});return await finish();}
     if(!r.actions.length){r.status=plan.scanComplete?'completed':'failed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
-    const busy=await check(r.provider,r.root);
-    if(busy){r.actions.forEach(a=>{a.status='skipped';a.reason=busy;a.recoveryState='finalized';});r.warnings.push(busy);r.status=r.source==='analyze'?'partial':'completed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
     const blocked=r.provider==='codex'&&r.actions.some(a=>a.kind==='slim-history')?await verifyCodexRewriteLayout(before,options.signal):new Map<string,string>();
     r.status='needs-review';await save();
     for(const a of r.actions) {
       if(options.signal?.aborted){r.status='interrupted';break;}
       options.onProgress?.(`${a.kind}: ${a.targetId}`);
       const dir=workPath(stateDir,r,a);
+      const busy=await actionActivity(r,a,check,dir);
+      if(busy){a.status='skipped';a.reason=busy;a.recoveryState='finalized';r.warnings.push(busy);await save();continue;}
       let projection:Awaited<ReturnType<typeof prepareProjection>>|undefined;
       try {
         if(a.kind==='slim-history'&&blocked.has(a.files[0].path))throw new Error(blocked.get(a.files[0].path));
-        const activity=await check(r.provider,r.root,a.files.map(f=>f.path));if(activity)throw new Error(activity);
         await verifyRoot(r);
         if(a.files.some(f=>referenced(before,f.path)))throw new Error('References or scan state changed');
-        for(const f of a.files)await verifyFile(r.root,f);
-        const ageReason=ageProtectionReason(a,r.explicitTarget);if(ageReason)throw new Error(ageReason);
+        for(const f of a.files)await verifyFile(r.root,f,r);
+        const ageReason=ageProtectionReason(a,r.systemTemp?undefined:r.explicitTarget);if(ageReason)throw new Error(ageReason);
         if(a.kind==='codex-delete') {
           const pre=await scanRoot(r.root,r.provider);if(!pre.complete)throw new Error('Scan before native deletion is incomplete');
           const index=await readCodexIndex(pre);if(!index.complete||!expectedIndexFingerprint||index.fingerprint!==expectedIndexFingerprint)throw new Error('Session index or deletion scope changed; preview again');
@@ -342,6 +385,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
             if(!a.codexProjection)throw new Error('History index preview is missing; preview again');
             projection=await prepareProjection(r.root,a.codexProjection,input,output,a.slimOptions!);
           }
+          const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
           // A hardlink preserves the original inode until the atomic replacement is journaled.
           await link(f.path,join(dir,'0.original'));
           await syncDirectory(dir);
@@ -352,35 +396,40 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
           await projection?.commit();projection=undefined;
         } else {
           a.afterBytes=0;await save();
-          for(let i=0;i<a.files.length;i++){await verifyFile(r.root,a.files[i]);await rename(a.files[i].path,join(dir,`${i}.original`));await verifyBackup(dir,a,i);}
+          for(let i=0;i<a.files.length;i++){
+            const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
+            await verifyFile(r.root,a.files[i],r);await rename(a.files[i].path,join(dir,`${i}.original`));await verifyBackup(dir,a,i);
+          }
         }
         a.recoveryState='applied';a.status='completed';updateTotal(r);await save();
+        const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
         await cleanupWork(dir,a);a.recoveryState='finalized';await save();
       } catch(e) {
         projection?.rollback();
         a.reason=(e as Error).message;
         if(a.recoveryState==='applied'){r.attributionComplete=false;r.status='needs-review';await save();break;}
         if(a.kind==='codex-delete'&&a.nativeStarted){r.attributionComplete=false;a.status='failed';r.status='needs-review';await save();break;}
-        const restored=await rollbackPrepared(r,a,dir);
+        const restored=await rollbackPrepared(r,a,dir,check);
         a.status=restored?'skipped':'failed';a.recoveryState=restored?'finalized':'prepared';
         if(!restored){r.attributionComplete=false;r.status='needs-review';await save();break;}
         await save();
       }
     }
-    const after=await scanRoot(r.root,r.provider);r.rootAfterBytes=after.complete?after.totalBytes:null;
+    const after=await scanPlanScope(r);r.rootAfterBytes=after.complete?after.totalBytes:null;
     for(const a of r.actions)if(a.status==='planned'){a.status='skipped';a.reason='Operation stopped';a.recoveryState='finalized';}
     if(r.attributionComplete&&r.status!=='interrupted')r.status=r.actions.some(a=>a.status==='failed')?'partial':r.source==='analyze'&&r.actions.length>0&&!r.actions.some(a=>a.status==='completed')?'partial':'completed';
     return await finish();
   } finally {await unlock();}
 }
-async function rollbackPrepared(r:Plan,a:Action,dir:string):Promise<boolean> {
+async function rollbackPrepared(r:Plan,a:Action,dir:string,check:ActivityCheck):Promise<boolean> {
   try {
     await verifyParents(r,a);
     if(r.provider==='codex'&&a.kind==='slim-history')await verifyProjectionBefore(r.root,a.codexProjection!);
-    if(!await existingDir(dir)){for(const f of a.files)await verifyFile(r.root,f);return true;}
+    if(!await existingDir(dir)){for(const f of a.files)await verifyFile(r.root,f,r);return true;}
+    if(await actionActivity(r,a,check,dir))return false;
     for(let i=0;i<a.files.length;i++) {
       const f=a.files[i],backup=join(dir,`${i}.original`);
-      if(!await exists(backup)){await verifyFile(r.root,f);continue;}
+      if(!await exists(backup)){await verifyFile(r.root,f,r);continue;}
       await verifyBackup(dir,a,i);
       if(!within(r.root,f.path)||await realpath(dirname(f.path))!==dirname(f.path))return false;
       if(await exists(f.path)) {
@@ -397,24 +446,25 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
   for(const provider of ['claude','codex'] as const) {
     for(const {path,data} of await jsonFiles(join(stateDir,'providers',provider,'operations'))) {
       const r=validateReceipt(data,provider);
-      if(path!==receiptPath(stateDir,r)||r.root===stateDir||within(r.root,stateDir)||within(stateDir,r.root))throw new Error('Invalid operation record path');
+      if(path!==receiptPath(stateDir,r)||stateOverlaps(r,stateDir))throw new Error('Invalid operation record path');
       if(r.actions.every(a=>a.recoveryState==='finalized')){
         if(r.executionStartedAt&&!r.finishedAt){r.status='interrupted';r.rootAfterBytes=null;r.finishedAt=new Date().toISOString();await atomicJson(path,r);}
         await recordCleanup(stateDir,r);continue;
       }
-      if(await check(provider,r.root))continue;
       let pending=false;
       for(const a of r.actions) {
         if(!uuid.test(a.id)||a.files.some(f=>!within(r.root,f.path)))throw new Error('Recovery target is outside the source directory');
         if(a.recoveryState==='finalized')continue;
         const dir=workPath(stateDir,r,a);
+        const busy=await actionActivity(r,a,check,dir);
+        if(busy){a.reason=busy;pending=true;continue;}
         if(a.kind==='codex-delete'){if(a.nativeStarted){pending=true;}else{a.status='skipped';a.reason='Previous operation did not start native deletion';a.recoveryState='finalized';}continue;}
         try {
           await verifyParents(r,a);
           if(replacement(a.kind)&&a.recoveryState==='prepared') {
             const f=a.files[0],s=await lstat(f.path).catch(()=>null);
             if(s?.ino===f.ino&&s.dev===f.dev&&s.size===f.size&&s.mtimeMs===f.mtimeMs) {
-              if(await rollbackPrepared(r,a,dir)){a.status='skipped';a.reason='Previous operation was interrupted; original file was not replaced';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';continue;}
+              if(await rollbackPrepared(r,a,dir,check)){a.status='skipped';a.reason='Previous operation was interrupted; original file was not replaced';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';continue;}
             }
             if(a.afterHash&&s&&(await currentHash(r.root,f.path))===a.afterHash){a.status='completed';a.recoveryState='applied';}
           }
@@ -432,8 +482,10 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
               const projection=await prepareProjection(r.root,a.codexProjection!,input,output,a.slimOptions!,true);
               await projection.commit();
             }
-            a.status='completed';updateTotal(r);await atomicJson(path,r);await cleanupWork(dir,a);a.recoveryState='finalized';
-          } else if(await rollbackPrepared(r,a,dir)){a.status='skipped';a.reason='Previous operation was interrupted; original files restored';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';} else pending=true;
+            a.status='completed';updateTotal(r);await atomicJson(path,r);
+            const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
+            await cleanupWork(dir,a);a.recoveryState='finalized';
+          } else if(await rollbackPrepared(r,a,dir,check)){a.status='skipped';a.reason='Previous operation was interrupted; original files restored';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';} else pending=true;
         }catch{pending=true;}
       }
       r.attributionComplete=!pending;r.status=pending?'needs-review':'interrupted';

@@ -4,11 +4,17 @@ import { physicalKey, scanRoot } from './scan.ts';
 import { analyze } from './analyze.ts';
 import { createPlan, estimateSavings, executePlan, type Plan } from './clean.ts';
 import { getCodexVersion } from './codex-delete.ts';
+import { scanSystemTemp, systemTempBases } from './system-temp.ts';
+import { within } from './state.ts';
+
+type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean };
+export const includesSystemTemp = (options: CleanupOptions) => !options.manual && !options.files?.length && !options.sessions?.length &&
+  (!!options.includeFileCleanup || !options.removeImages && !options.compactTools && !options.removeReasoning);
 
 export async function report(config: Config, provider: Provider, deep: boolean, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   return analyze(await scanRoot(config.roots[provider], provider, signal, onProgress), { deep, signal, onProgress, stateDir: config.stateDir });
 }
-export async function plan(config: Config, provider: Provider, options: { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean; includeFileCleanup?: boolean } = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
+export async function plan(config: Config, provider: Provider, options: CleanupOptions = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void) {
   const inventory = await scanRoot(config.roots[provider], provider, signal, onProgress);
   const analysis = await analyze(inventory, { deep: true, signal, onProgress, stateDir: config.stateDir });
   if (options.sessions?.length && !analysis.scanComplete) throw new Error('Session analysis is incomplete; deletion scope cannot be verified. Inspect the analysis report');
@@ -33,6 +39,22 @@ export async function plan(config: Config, provider: Provider, options: { sessio
   await estimateSavings(result, signal, onProgress);
   signal?.throwIfAborted();
   return result;
+}
+export async function cleanupPlans(config: Config, provider: Provider, options: CleanupOptions = {}, signal?: AbortSignal, onProgress?: (progress: ScanProgress) => void): Promise<Plan[]> {
+  const plans = [await plan(config, provider, options, signal, onProgress)];
+  if (!includesSystemTemp(options)) return plans;
+  const uid = process.getuid?.();
+  if (uid === undefined) { plans[0].warnings.push('System temporary-file ownership checks are unavailable on this platform'); return plans; }
+  const bases = await systemTempBases(provider);
+  const excludedRoots = [...Object.values(config.roots), config.stateDir];
+  for (const root of bases) {
+    signal?.throwIfAborted();
+    const scope = {uid, excludedRoots: [...excludedRoots, ...bases.filter(base => within(root, base))]};
+    const inventory = await scanSystemTemp(root, provider, scope, signal, onProgress);
+    if (!inventory.files.length && !inventory.errors.length) continue;
+    plans.push(await createPlan(inventory, {systemTemp: scope}));
+  }
+  return plans;
 }
 export async function execute(config: Config, plans: Plan[], dryRun: boolean, signal?: AbortSignal, onProgress?: (message: string) => void) {
   const receipts = [];

@@ -467,3 +467,29 @@ test('reasoning-only receipts validate enabled operations, counts and exact cate
     assert.throws(() => validateReceipt(invalid), /receipt/);
   }
 });
+
+test('system-temp receipts enforce the allowlist and keep selective accounting in logs', async t => {
+  const {base, state} = await fixture(t), r = receipt(base), a = r.actions[0], f = a.files[0];
+  r.systemTemp = {uid: 501, excludedRoots: [state]}; r.rootIdentity = {dev: 1, ino: 1};
+  f.relative = 'codex-app-installer-test/Codex.dmg'; f.path = join(r.root, f.relative);
+  f.uid = 501; f.category = 'installer'; a.targetId = f.relative;
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    {systemTemp: {uid: -1, excludedRoots: []}}, {systemTemp: {uid: 501, excludedRoots: ['relative']}},
+    {systemTemp: {uid: 501, excludedRoots: [r.root]}}, {systemTemp: {uid: 502, excludedRoots: []}},
+    {explicitTarget: f.path}, {source: 'analyze'}, {rootIdentity: undefined}, {codexIndexFingerprint: 'a'.repeat(64)},
+  ]) assert.throws(() => validateReceipt({...r, ...changes}), /receipt/);
+  for (const changes of [
+    {kind: 'compress-png'}, {sessionIds: [randomUUID()]}, {nativeStarted: false},
+    {slimOptions: {removeImages: true, compactTools: false}}, {beforeHash: 'a'.repeat(64)},
+  ]) assert.throws(() => validateReceipt({...r, actions: [{...a, ...changes}]}), /receipt/);
+  for (const changes of [
+    {uid: undefined}, {uid: 502}, {mode: 0o100666}, {mode: 0o120600}, {nlink: 2}, {category: 'temporary'},
+    {path: join(r.root, 'codex-app-installer-test/source.ts'), relative: 'codex-app-installer-test/source.ts'},
+    {path: join(r.root, '..', 'Codex.dmg'), relative: '../Codex.dmg'},
+  ]) assert.throws(() => validateReceipt({...r, actions: [{...a, files: [{...f, ...changes}]}]}), /receipt/);
+  await recordCleanup(state, r);
+  const [log] = await readCleanupLog(state);
+  assert.equal(log.scope, 'system-temp'); assert.equal(log.savedBytes, 19);
+  assert.equal(log.cleanedRecords, 1); assert.equal(log.cleanupTypes[0].type, 'delete-files');
+});

@@ -2,7 +2,7 @@ export type Provider = 'claude' | 'codex';
 export interface FileEntry {
   path: string; relative: string; size: number; allocatedBytes: number;
   mtimeMs: number; ctimeMs: number; dev: number; ino: number; nlink: number; mode: number;
-  category: string;
+  category: string; uid?: number;
 }
 export interface Inventory {
   provider: Provider; root: string; exists: boolean; complete: boolean;

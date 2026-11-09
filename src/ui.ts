@@ -2,7 +2,8 @@ import { basename, dirname, relative } from 'node:path';
 import type { Analysis, Provider, Session, Usage } from './types.ts';
 import type { Config } from './config.ts';
 import type { Plan, Receipt } from './clean.ts';
-import { report, plan, execute } from './app.ts';
+import { report, plan, cleanupPlans, includesSystemTemp, execute } from './app.ts';
+import { systemTempLabels } from './system-temp.ts';
 import { readStats } from './stats.ts';
 import type { CleanupLog } from './history.ts';
 import { directoryEntries, scanRoot } from './scan.ts';
@@ -84,11 +85,13 @@ export function printPlan(p: Plan) {
 }
 export function printPlans(plans: Plan[]) {
   const actions = plans.flatMap(p => p.actions), warnings = plans.flatMap(p => p.warnings);
+  const regular = plans.filter(p => !p.systemTemp).flatMap(p => p.actions);
+  const temporary = plans.filter(p => p.systemTemp).flatMap(p => p.actions);
   const single = plans.length === 1 ? plans[0] : undefined;
-  title(single ? `${providerName(single.provider)} · ${actions.length} items` : `Cleanup summary · ${actions.length} items`,
-    single ? single.root : [...new Set(plans.map(p => providerName(p.provider)))].join(' + '));
+  title(single ? `${providerName(single.provider)}${single.systemTemp ? ' · System temporary files' : ''} · ${actions.length} items` : `Cleanup summary · ${actions.length} items`,
+    single ? single.root : [...new Set(plans.map(p => providerName(p.provider)))].join(' + ') + (plans.some(p => p.systemTemp) ? ' · Includes system temporary files' : ''));
   note('Bulk deletion and history slimming require files last modified more than 72 hours ago.');
-  for (const p of plans) if (p.explicitTarget) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
+  for (const p of plans) if (p.explicitTarget && !p.systemTemp) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
   if (!actions.length) {
     line('  No eligible cleanup items.');
   }
@@ -108,7 +111,8 @@ export function printPlans(plans: Plan[]) {
     const groups: [string, Plan['actions']][] = [
       ['History slimming (breakdown unavailable)', actions.filter(a => a.kind === 'slim-history' && !a.slimSavingsBytes)],
       ['Compress PNGs (lossless)', actions.filter(a => a.kind === 'compress-png')],
-      ['Delete files', actions.filter(a => a.kind === 'delete-files' && !a.sessionIds?.length)],
+      ['Delete files', regular.filter(a => a.kind === 'delete-files' && !a.sessionIds?.length)],
+      ...Object.entries(systemTempLabels).map(([kind, label]): [string, Plan['actions']] => [label, temporary.filter(a => a.files[0].category === kind)]),
       ['Delete sessions', actions.filter(a => a.kind === 'codex-delete' || a.sessionIds?.length)],
     ];
     for (const [label, actions] of groups) {
@@ -120,6 +124,7 @@ export function printPlans(plans: Plan[]) {
   }
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
   if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
+  if (temporary.length) note('Irreversible: full temporary task/hook outputs, cwd records and listed installers will be deleted. No undo.');
   if (actions.length) note('Full file paths and per-file estimates: View files in the review menu, or use --json.');
   const groups = new Map<string, number>();
   for (const warning of warnings) {
@@ -148,9 +153,10 @@ export function printReceipts(receipts: Receipt[]) {
   const previews = receipts.filter(r => r.status === 'dry-run');
   if (previews.length) { printPlans(previews); note('Preview only; no operations executed or savings credited'); }
   for (const r of receipts.filter(r => r.status !== 'dry-run')) {
-    title(`${providerName(r.provider)} · ${r.status}`);
+    title(`${providerName(r.provider)}${r.systemTemp ? ' · System temporary files' : ''} · ${r.status}`, r.root);
     console.log(paint(r.attributionComplete ? 'green' : 'yellow', `  Confirmed reduction: ${r.attributionComplete ? size(r.confirmedReductionBytes) : 'needs review'}`));
-    rows([{ label: 'Directory before', value: size(r.rootBeforeBytes) }, { label: 'Directory after', value: size(r.rootAfterBytes) }, { label: 'Directory change', value: size(r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes) }]);
+    const scope = r.systemTemp ? 'Matched temp files' : 'Directory';
+    rows([{ label: `${scope} before`, value: size(r.rootBeforeBytes) }, { label: `${scope} after`, value: size(r.rootAfterBytes) }, { label: `${scope} change`, value: size(r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes) }]);
     for (const [state, symbol] of [['completed', '✓'], ['skipped', '◎'], ['failed', '!']] as const) line(`  ${symbol} ${state}: ${r.actions.filter(a => a.status === state).length} items`);
     for (const a of r.actions.filter(a => a.reason)) note(`${a.targetId}: ${a.reason}`);
     for (const warning of r.warnings) note(warning);
@@ -179,8 +185,8 @@ export function printCleanupLog(r: CleanupLog) {
   line(`  Started:  ${r.startedAt}`);
   line(`  Finished: ${r.finishedAt}`);
   rows([
-    {label: 'Directory before', value: size(r.beforeBytes)},
-    {label: 'Directory after', value: size(r.afterBytes)},
+    {label: r.scope === 'system-temp' ? 'Matched temp files before' : 'Directory before', value: size(r.beforeBytes)},
+    {label: r.scope === 'system-temp' ? 'Matched temp files after' : 'Directory after', value: size(r.afterBytes)},
     {label: 'Space saved', value: size(r.savedBytes)},
     {label: 'Records cleaned', value: String(r.cleanedRecords)},
   ]);
@@ -262,6 +268,10 @@ export async function scanPlan(config: Config, provider: Provider, options: Para
   return withProgress({ message: 'Deep Scan Before Cleanup', subtitle: `${providerName(provider)} · ${config.roots[provider]}` },
     (localSignal, onProgress) => plan(config, provider, options, localSignal, onProgress), context(signal));
 }
+export async function scanCleanupPlans(config: Config, provider: Provider, options: Parameters<typeof plan>[2] = {}, signal?: AbortSignal) {
+  return withProgress({ message: 'Deep Scan Before Cleanup', subtitle: `${providerName(provider)} · ${config.roots[provider]}${includesSystemTemp(options) ? ' and known system temporary files' : ''}` },
+    (localSignal, onProgress) => cleanupPlans(config, provider, options, localSignal, onProgress), context(signal));
+}
 async function insightsMenu(load: () => Promise<Analysis | null>, subtitle: string, signal?: AbortSignal) {
   let data = await load();
   if (!data) return;
@@ -316,7 +326,7 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
     const sortedDirectories = [...directories].sort(([, a], [, b]) =>
       knownTotal(b) - knownTotal(a) || (total(b) ?? -1) - (total(a) ?? -1));
     return {
-      name: `${providerName(p.provider)} · ${count(p.actions.length, 'item')}`,
+      name: `${providerName(p.provider)}${p.systemTemp ? ' · System temp' : ''} · ${count(p.actions.length, 'item')}`,
       bytes: total(p.actions), expanded: true,
       detail: `${safe(p.root)} · Estimated savings: ${estimatedSavings(p.actions)}`,
       children: sortedDirectories.map(([directory, actions]): TreeNode => ({
@@ -563,9 +573,9 @@ export async function menu(config: Config, signal?: AbortSignal) {
           screen(); title(mode === 'slim' ? 'Slim History' : 'Quick Clean');
           let plans: Plan[] | null = [];
           for (const provider of providerList(selected)) {
-            const p = await scanPlan(config, provider, options, signal);
+            const p = await scanCleanupPlans(config, provider, options, signal);
             if (!p) { plans = null; break; }
-            plans.push(p);
+            plans.push(...p);
           }
           if (plans) await runSelection(config, plans, signal);
         }

@@ -4,6 +4,7 @@ import { join, dirname, relative, isAbsolute, resolve, parse, sep } from 'node:p
 import { randomUUID } from 'node:crypto';
 import type { Provider } from './types.ts';
 import type { Receipt } from './clean.ts';
+import { scopedTempKind, tempExcluded, type SystemTempScope } from './system-temp.ts';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_JSON_BYTES = 64 * 1024 * 1024;
@@ -128,6 +129,11 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
     (uuid.test(data.explicitTarget) || absolute(data.explicitTarget) && within(data.root, data.explicitTarget))));
   requireReceipt(data.rootIdentity === undefined || (object(data.rootIdentity) && bytes(data.rootIdentity.dev) && bytes(data.rootIdentity.ino)));
   requireReceipt(data.codexIndexFingerprint === undefined || (text(data.codexIndexFingerprint) && /^[0-9a-f]{64}$/.test(data.codexIndexFingerprint)));
+  if (data.systemTemp !== undefined) {
+    requireReceipt(object(data.systemTemp) && bytes(data.systemTemp.uid) && Array.isArray(data.systemTemp.excludedRoots) && data.systemTemp.excludedRoots.every(absolute));
+    requireReceipt(data.explicitTarget === undefined && data.codexIndexFingerprint === undefined && data.source === 'clean');
+  }
+  const tempScope = data.systemTemp as SystemTempScope | undefined;
   requireReceipt(['clean', 'analyze'].includes(data.source as string) && timestamp(data.startedAt) &&
     (data.executionStartedAt === undefined || timestamp(data.executionStartedAt)) &&
     (data.finishedAt === undefined || timestamp(data.finishedAt)) && typeof data.scanComplete === 'boolean');
@@ -152,12 +158,17 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       new Set(action.sessionIds).size === action.sessionIds.length));
     for (const key of ['beforeHash', 'afterHash']) requireReceipt(action[key] === undefined || (text(action[key]) && /^[0-9a-f]{64}$/.test(action[key])));
     requireReceipt(Array.isArray(action.files) && action.files.length > 0);
+    if (tempScope) requireReceipt(data.rootIdentity && action.kind === 'delete-files' && action.files.length === 1 &&
+      ['sessionIds', 'nativeStarted', 'slimOptions', 'slimCounts', 'slimSavingsBytes', 'codexProjection', 'beforeHash', 'afterHash'].every(key => action[key] === undefined));
     let fileBytes = 0;
     for (const file of action.files) {
       requireReceipt(object(file) && absolute(file.path) && within(data.root, file.path) && !paths.has(file.path));
       paths.add(file.path);
       requireReceipt(file.relative === relative(data.root, file.path) && bytes(file.size) && bytes(file.allocatedBytes) &&
         Number.isFinite(file.mtimeMs) && Number.isFinite(file.ctimeMs) && bytes(file.dev) && bytes(file.ino) && file.nlink === 1 && bytes(file.mode) && text(file.category));
+      requireReceipt(file.uid === undefined || bytes(file.uid));
+      if (tempScope) requireReceipt(file.uid === tempScope.uid && !(file.mode & 0o022) && (file.mode & 0o170000) === 0o100000 &&
+        !tempExcluded(file.path, tempScope) && scopedTempKind(data.root, file.path, data.provider, tempScope) === file.category);
       fileBytes += file.size; requireReceipt(Number.isSafeInteger(fileBytes));
     }
     requireReceipt(action.kind === 'codex-delete' || action.beforeBytes === fileBytes);
@@ -186,7 +197,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
         (((action.slimCounts.reasoning as number | undefined) ?? 0) > 0 || (savings.reasoning ?? 0) === 0) &&
         (action.slimCounts.images > 0 || savings.images === 0) && (action.slimCounts.toolOutputs > 0 || savings.toolOutputs === 0));
     }
-    if (data.provider === 'codex' && action.recoveryState !== 'finalized') {
+    if (data.provider === 'codex' && action.recoveryState !== 'finalized' && !tempScope) {
       if (action.files.some(file => file.category === 'sessions' || /^(?:sessions|archived_sessions)\//.test(file.relative)))
         requireReceipt(action.kind === 'slim-history' || action.kind === 'codex-delete');
       if (action.kind === 'slim-history') requireReceipt(Array.isArray(action.codexProjection));

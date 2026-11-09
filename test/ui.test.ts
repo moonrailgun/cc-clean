@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
-import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, cleanOptions, confirmPlans, usageMenu } from '../src/ui.ts';
+import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, cleanOptions, confirmPlans, usageMenu } from '../src/ui.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
@@ -905,4 +905,31 @@ test('mixed plans distinguish session deletion and preserve legacy history estim
   assert.match(text, /2\.00 KiB\s+Delete sessions · 2 files/);
   assert.match(text, /5\.00 KiB\s+Total estimated savings/);
   assert.doesNotMatch(text, /Remove inline images|Compact shell output/);
+});
+
+test('system temps show category estimates and selective accounting without listing each file', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = inertPlan(), base = p.actions[0];
+  p.root = '/inert/temp'; p.systemTemp = {uid: 501, excludedRoots: []};
+  p.actions = ['task-output', 'cwd-record', 'hook-output', 'installer'].flatMap(category => Array.from({length: 50}, (_, i) => ({
+    ...base, kind: 'delete-files' as const, targetId: `${category}-${i}`,
+    files: [{...base.files[0], path: `/inert/temp/${category}-${i}`, category}],
+  })));
+  printPlan(p);
+  const text = lines.join('\n');
+  assert.match(text, /System temporary files/);
+  for (const label of ['Remove temporary task outputs', 'Remove temporary cwd records', 'Remove temporary hook outputs', 'Remove leftover installers'])
+    assert.ok(text.includes(`50.00 KiB  ${label} · 50 files`));
+  assert.match(text, /200\.00 KiB\s+Total estimated savings/);
+  assert.match(text, /Irreversible:.*No undo/);
+  assert.doesNotMatch(text, /\/inert\/temp\/|Delete files/); assert.ok(lines.length < 25);
+  lines.length = 0;
+  printReceipts([{...p, actions: [], status: 'completed', rootBeforeBytes: 204800, rootAfterBytes: 0, confirmedReductionBytes: 204800, attributionComplete: true}]);
+  printCleanupLog({schemaVersion: 1, operationId: 'inert', provider: 'codex', root: p.root, source: 'clean',
+    scope: 'system-temp', startedAt: p.startedAt, finishedAt: p.startedAt, status: 'completed',
+    beforeBytes: 204800, afterBytes: 0, savedBytes: 204800, cleanedRecords: 200, cleanupTypes: [], needsReview: false});
+  assert.match(lines.join('\n'), /Matched temp files before/);
+  assert.match(lines.join('\n'), /Matched temp files after/);
+  assert.doesNotMatch(lines.join('\n'), /Directory before|Directory after/);
 });

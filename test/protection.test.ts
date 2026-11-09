@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ageProtectionReason, protectRecentContent, singleSelectedTarget, type Action, type Plan } from '../src/clean.ts';
+import { ageProtectionReason, protectRecentContent, protectActiveContent, singleSelectedTarget, type Action, type Plan } from '../src/clean.ts';
 
 // In-memory metadata only: never invoke cleanup planning, estimation or execution.
 const now = Date.parse('2026-11-09T12:00:00Z'), cutoff = now - 72 * 3600000;
@@ -103,4 +103,62 @@ test('reasoning removal shares bulk age protection and excludes protected saving
   assert.deepEqual(p.actions, [actions[0]]);
   assert.equal(p.actions.reduce((sum, a) => sum + (a.slimSavingsBytes?.reasoning ?? 0), 0), 50);
   assert.equal(p.warnings.length, 4);
+});
+
+test('external system temps retain strict bulk age protection even for one or an explicit target', () => {
+  for (const modified of [cutoff, now, now + 1, NaN]) {
+    const p = plan([action('delete-files', modified)], '/inert/file');
+    p.systemTemp = {uid: 501, excludedRoots: []};
+    protectRecentContent(p, now);
+    assert.equal(p.actions.length, 0);
+    assert.match(p.warnings.join('\n'), /72-hour protection/);
+  }
+  const p = plan([action('delete-files', cutoff - 1)]);
+  p.systemTemp = {uid: 501, excludedRoots: []};
+  assert.equal(protectRecentContent(p, now).actions.length, 1);
+});
+
+
+test('activity protection excludes all estimates and cannot be bypassed by a single target or lossless operation', async () => {
+  for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'compress-png'] as const) {
+    const p = plan([action(kind, cutoff - 1)], '/inert/file');
+    p.warnings.push('Existing warning');
+    await protectActiveContent(p, async () => 'Client still owns an idle session');
+    assert.deepEqual(p.actions, []);
+    assert.deepEqual(p.warnings, ['Existing warning', 'Activity protection: Client still owns an idle session']);
+  }
+});
+
+
+test('activity inspection failure retains content while a closed client preserves eligible operations', async () => {
+  const p = plan([action('slim-history', cutoff - 1)]), original = [...p.actions];
+  await protectActiveContent(p, async () => null);
+  assert.deepEqual(p.actions, original);
+  await protectActiveContent(p, async () => { throw new Error('Inspection unavailable'); });
+  assert.deepEqual(p.actions, []);
+  assert.match(p.warnings.join('\n'), /Cannot reliably check client activity/);
+});
+
+
+test('activity filtering supplies only candidate paths for external temporary files', async () => {
+  const p = plan([action('delete-files', cutoff - 1)]);
+  p.systemTemp = {uid: 501, excludedRoots: []};
+  await protectActiveContent(p, async (provider, root, files) => {
+    assert.equal(provider, 'codex'); assert.equal(root, '/inert');
+    assert.deepEqual(files, ['/inert/file']);
+    return null;
+  });
+  assert.equal(p.actions.length, 1);
+});
+
+
+test('ordinary Codex activity retains the provider directory inspection', async () => {
+  const p = plan([action('slim-history', cutoff - 1)]);
+  await protectActiveContent(p, async (provider, root, files) => {
+    assert.equal(provider, 'codex'); assert.equal(root, p.root);
+    assert.equal(files, undefined);
+    return 'Index has an open writer';
+  });
+  assert.deepEqual(p.actions, []);
+  assert.match(p.warnings.join('\n'), /Index has an open writer/);
 });
