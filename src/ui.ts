@@ -393,6 +393,21 @@ async function planFiles(plans: Plan[], signal?: AbortSignal) {
   await tree({ message: 'Cleanup files · Estimated savings', subtitle: 'Read-only · Expand a folder, then Enter on a file for full details.',
     nodes: cleanupFileNodes(plans) }, context(signal));
 }
+export async function emptyPlansMenu(plans: Plan[], signal?: AbortSignal): Promise<null> {
+  let details = false;
+  while (!signal?.aborted) {
+    screen(); printPlans(plans, details);
+    const next = await select({ message: 'No cleanup items', clear: false, requireEnter: true, choices: [
+      { name: 'Back', value: 'back' },
+      { name: details ? 'Less' : 'More', description: 'Protection rules and scan notes', value: 'more' },
+      ...(details && plans.some(p => p.warnings.length) ? [{ name: 'View scan notes', description: 'Full paths and reasons', value: 'notes' }] : []),
+    ] }, context(signal));
+    if (next === 'more') { details = !details; continue; }
+    if (next !== 'notes') return null;
+    await planNotes(plans, signal);
+  }
+  return null;
+}
 export async function confirmPlans(plans: Plan[], signal?: AbortSignal) {
   const actions = plans.flatMap(p => p.actions);
   let details = false;
@@ -442,7 +457,7 @@ async function searchable<T>(message: string, items: Choice<T>[], signal?: Abort
 }
 async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal) {
   screen();
-  if (!plans.some(p => p.actions.length)) { printPlans(plans); await pause(signal); return; }
+  if (!plans.some(p => p.actions.length)) { await emptyPlansMenu(plans, signal); return; }
   if (await confirmPlans(plans, signal)) { printReceipts((await execute(config, plans, false, signal, line)).receipts); await pause(signal); }
 }
 async function cleanProviders(config: Config, selected: Provider[], mode: 'quick' | 'slim' | 'temp', signal?: AbortSignal) {
@@ -521,7 +536,7 @@ async function filesMenu(config: Config, provider: Provider, signal?: AbortSigna
   const p = await scanPlan(config, provider, { manual: true }, signal);
   if (!p) return;
   p.actions.sort((a, b) => b.beforeBytes - a.beforeBytes);
-  if (!p.actions.length) { screen(); printPlan(p); await pause(signal); return; }
+  if (!p.actions.length) { await runSelection(config, [p], signal); return; }
   const selected = await checkbox({ message: 'Select Temporary Files / PNGs', subtitle: 'Select items to review before applying changes.', choices: p.actions.map(a => ({ name: a.targetId, bytes: a.beforeBytes, detail: a.kind, value: a.files[0].path })) }, context(signal));
   if (!selected.length) return;
   const mode = await select({ message: 'Choose Operation', choices: [

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
-import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, cleanOptions, confirmPlans, usageMenu } from '../src/ui.ts';
+import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, cleanOptions, confirmPlans, emptyPlansMenu, usageMenu } from '../src/ui.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
@@ -770,6 +770,38 @@ test('More folds scan notes and returning to review still requires Enter to conf
   assert.equal(settled, false);
   await term.key('\r');
   assert.equal(await answer, true);
+});
+
+test('empty plan navigation folds retained reasons under More without approving cleanup', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const original = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, get: () => value });
+    t.after(() => Object.defineProperty(process, name, original));
+  }
+  t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
+  const p = { ...inertPlan(), provider: 'claude' as const, actions: [], warnings: ['sessions/a.jsonl: Retained'] };
+  let answer = emptyPlansMenu([p], term.context.signal);
+  await setImmediate();
+  const initial = stripVTControlCharacters(term.text());
+  assert.match(initial, /No eligible cleanup items/);
+  assert.match(initial, /2\. More/);
+  assert.doesNotMatch(initial, /Retained|View scan notes|last modified more than 72 hours|Confirm cleanup/);
+  await term.key('\r'); assert.equal(await answer, null, 'Back is the default');
+  answer = emptyPlansMenu([p], term.context.signal);
+  await term.key('2'); await term.key('\r');
+  assert.match(stripVTControlCharacters(term.text()), /2\. Less/);
+  assert.match(stripVTControlCharacters(term.text()), /last modified more than 72 hours/);
+  await term.key('3'); await term.key('\r');
+  assert.match(stripVTControlCharacters(term.text()), /sessions\/a\.jsonl: Retained/);
+  await term.key('q');
+  await term.key('2');
+  const from = term.text().length;
+  await term.key('\r');
+  const collapsed = stripVTControlCharacters(term.text().slice(from));
+  assert.match(collapsed, /2\. More/);
+  assert.doesNotMatch(collapsed, /Retained|View scan notes|last modified more than 72 hours/);
+  await term.key('q'); assert.equal(await answer, null);
 });
 
 test('cleanup confirmation summarizes scope, offers file details, and only Enter can approve', async t => {
