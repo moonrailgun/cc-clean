@@ -1,3 +1,4 @@
+import { basename, dirname, relative } from 'node:path';
 import type { Analysis, Provider, Session, Usage } from './types.ts';
 import type { Config } from './config.ts';
 import type { Plan, Receipt } from './clean.ts';
@@ -299,19 +300,61 @@ async function planNotes(plans: Plan[], signal?: AbortSignal) {
     name: `${providerName(p.provider)} · ${p.root}`, content: () => [p.root, '', ...p.warnings.flatMap(w => [w, ''])],
   })) }, context(signal));
 }
+export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
+  const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  const knownTotal = (actions: Plan['actions']) => actions.reduce((sum, a) => sum + (a.estimatedSavingsBytes ?? 0), 0);
+  const total = (actions: Plan['actions']) => actions.some(a => a.estimatedSavingsBytes == null)
+    ? null : knownTotal(actions);
+  const bySavings = (a: TreeNode, b: TreeNode) => (b.bytes ?? -1) - (a.bytes ?? -1);
+  return plans.filter(p => p.actions.length).map(p => {
+    const directories = new Map<string, Plan['actions']>();
+    for (const action of p.actions) {
+      const directory = dirname(action.files[0]?.path ?? p.root);
+      const actions = directories.get(directory) ?? [];
+      actions.push(action); directories.set(directory, actions);
+    }
+    const sortedDirectories = [...directories].sort(([, a], [, b]) =>
+      knownTotal(b) - knownTotal(a) || (total(b) ?? -1) - (total(a) ?? -1));
+    return {
+      name: `${providerName(p.provider)} · ${count(p.actions.length, 'item')}`,
+      bytes: total(p.actions), expanded: true,
+      detail: `${safe(p.root)} · Estimated savings: ${estimatedSavings(p.actions)}`,
+      children: sortedDirectories.map(([directory, actions]): TreeNode => ({
+        name: `${relative(p.root, directory) || '.'} · ${count(actions.length, 'item')}`, truncateStart: true,
+        bytes: total(actions), detail: `${safe(directory)} · Estimated savings: ${estimatedSavings(actions)}`,
+        children: actions.map((a): TreeNode => {
+          const effects = a.kind === 'slim-history' ? ([
+            ['images', 'removeImages', 'images', 'Remove inline images'],
+            ['toolOutputs', 'compactTools', 'outputs', 'Compact shell output'],
+            ['reasoning', 'removeReasoning', 'reasoning blocks', 'Remove encrypted reasoning'],
+          ] as const).filter(([key, option]) => a.slimOptions?.[option] && a.slimCounts?.[key] !== 0)
+            .map(([key, , unit, label]) => ({
+              short: `${a.slimCounts?.[key] ?? '?'} ${unit}`,
+              detail: `${label}: ${a.slimCounts?.[key] ?? 'unknown'} · ${size(a.slimSavingsBytes?.[key] ?? null)}`,
+            })) : [];
+          const operation = a.kind === 'slim-history' ? 'Slim history' : a.kind === 'compress-png' ? 'Compress PNG (lossless)'
+            : a.kind === 'codex-delete' || a.sessionIds?.length ? 'Delete session' : 'Delete files';
+          const file = basename(a.files[0]?.path ?? a.targetId);
+          const shortFile = file.replace(/([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, '$1…');
+          return {
+            name: `${shortFile}${a.files.length > 1 ? ` (+${count(a.files.length - 1, 'file')})` : ''} · ${effects.length ? effects.map(e => e.short).join(' · ') : operation}`,
+            bytes: a.estimatedSavingsBytes ?? null,
+            detail: [
+              `${operation} · ${count(a.files.length, 'file')}`,
+              `Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`,
+              `Source size: ${size(a.beforeBytes)}`,
+              ...effects.map(e => e.detail), '', 'Full paths:', ...a.files.map(f => safe(f.path)),
+              ...(a.sessionIds?.length ? ['', 'Related sessions:', ...a.sessionIds.map(safe)] : []),
+            ].join('\n'),
+          };
+        }).sort(bySavings),
+      })),
+    };
+  });
+}
 async function planFiles(plans: Plan[], signal?: AbortSignal) {
-  await pager({ message: 'Cleanup files', subtitle: 'Read-only details. Q / Esc returns to review.', pages: plans.filter(p => p.actions.length).map(p => ({
-    name: `${providerName(p.provider)} · ${p.root}`, content: () => [p.root, '', ...p.actions.flatMap(a => [
-      `${a.kind} · ${a.targetId} · source size ${size(a.beforeBytes)}`,
-      ...a.files.map(f => f.path),
-      ...(a.sessionIds ? [`Related sessions: ${a.sessionIds.join(', ')}`] : []),
-      ...(a.kind === 'slim-history' ? [
-        `Remove inline images: ${a.slimOptions?.removeImages ? 'yes' : 'no'} · Compact shell output: ${a.slimOptions?.compactTools ? 'yes' : 'no'} · Remove encrypted reasoning: ${a.slimOptions?.removeReasoning ? 'yes' : 'no'}`,
-        `Images removed: ${a.slimCounts?.images ?? 0} · Tool outputs compacted: ${a.slimCounts?.toolOutputs ?? 0} · Reasoning blocks removed: ${a.slimCounts?.reasoning ?? 0}`,
-      ] : []),
-      `Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`, '',
-    ])],
-  })) }, context(signal));
+  await tree({ message: 'Cleanup files · Estimated savings', subtitle: 'Read-only · Expand a folder, then Enter on a file for full details.',
+    nodes: cleanupFileNodes(plans) }, context(signal));
 }
 export async function confirmPlans(plans: Plan[], signal?: AbortSignal) {
   const actions = plans.flatMap(p => p.actions);

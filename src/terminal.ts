@@ -246,7 +246,7 @@ function promptContext(context: Context = {}): Context {
   return { ...context, output, clearPromptOnDone: true };
 }
 
-export interface TreeNode { name: string; bytes?: number; detail?: string; children?: TreeNode[] }
+export interface TreeNode { name: string; bytes?: number | null; detail?: string; children?: TreeNode[]; expanded?: boolean; truncateStart?: boolean }
 function wrap(value: string, width: number): string[] {
   const lines = [''];
   let used = 0;
@@ -260,7 +260,7 @@ function wrap(value: string, width: number): string[] {
 }
 const treePrompt = createPrompt<void, { message: string; subtitle?: string; nodes: TreeNode[] }>((config, done) => {
   const [active, setActive] = useState(0);
-  const [expanded, setExpanded] = useState(new Set<TreeNode>());
+  const [expanded, setExpanded] = useState(new Set(config.nodes.filter(node => node.expanded)));
   const [inspecting, setInspecting] = useState(false);
   const [offset, setOffset] = useState(0);
   const [dimensions, setDimensions] = useState({ width: columns(), height: process.stdout.rows || 24 });
@@ -286,7 +286,8 @@ const treePrompt = createPrompt<void, { message: string; subtitle?: string; node
     '↑↓/jk Move', '←/→ Fold/Expand', 'Enter Open', 'Q/Esc Back', 'PgUp/PgDn Page',
   ], width);
   const pageSize = Math.max(1, dimensions.height - 7 - Number(!!config.subtitle) - footer.length);
-  const detail = wrap(current?.node.detail ?? current?.node.name ?? 'No items found.', Math.max(1, width - 2));
+  const detail = (current?.node.detail ?? current?.node.name ?? 'No items found.').split('\n')
+    .flatMap(line => wrap(line, Math.max(1, width - 2)));
   const detailStart = Math.min(offset, Math.max(0, detail.length - pageSize));
   const toggle = () => {
     if (!current?.node.children?.length) { setInspecting(true); setOffset(0); return; }
@@ -332,7 +333,8 @@ const treePrompt = createPrompt<void, { message: string; subtitle?: string; node
     const selected = start + index === active;
     const prefix = ` ${selected ? '➤' : ' '} ${'  '.repeat(depth)}${node.children?.length ? expanded.has(node) ? '▾' : '▸' : '·'} `;
     const amount = node.bytes === undefined ? '' : `  ${size(node.bytes)}`;
-    const text = pad(prefix + node.name, Math.max(1, width - amount.length)) + amount;
+    const labelWidth = Math.max(1, width - amount.length - measure(prefix).width);
+    const text = prefix + pad(fit(node.name, labelWidth, node.truncateStart), labelWidth) + amount;
     lines.push(paint(selected ? 'cyan' : 'bold', fit(text, width)));
   }
   lines.push('', paint('gray', fit(`  ${inspecting ? `${detailStart + 1}–${Math.min(detailStart + pageSize, detail.length)} / ${detail.length} lines`

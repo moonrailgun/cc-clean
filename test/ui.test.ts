@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
-import { analysisMenu, menu, printReport, detailNodes, printPlan, printPlans, cleanOptions, confirmPlans, usageMenu } from '../src/ui.ts';
+import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, cleanOptions, confirmPlans, usageMenu } from '../src/ui.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
@@ -627,6 +627,105 @@ function inertPlan(): Plan {
   };
 }
 
+test('cleanup file rows group and rank savings, hide inactive effects and retain full details', () => {
+  const p = { ...inertPlan(), provider: 'claude' as const, root: '/inert/claude' };
+  const history = (id: string, project: string, savings: number): Plan['actions'][number] => ({
+    ...p.actions[0], id, kind: 'slim-history', targetId: id, estimatedSavingsBytes: savings,
+    files: [{ ...p.actions[0].files[0], path: `${p.root}/projects/${project}/${id}.jsonl` }],
+    slimOptions: { removeImages: true, compactTools: true }, slimCounts: { images: 3, toolOutputs: 0 },
+    slimSavingsBytes: { images: savings, toolOutputs: 0 },
+  });
+  p.actions = [history('358d0528-6479-412b-87a3-74339e26037c', 'small', 256),
+    history('dc8434c2-7c80-4783-857c-f6ed5a7b550f', 'large', 2048),
+    history('e8dee114-fa7f-43ad-a9ac-228115a3d60d', 'large', 1024)];
+  const original = structuredClone(p);
+  const [provider] = cleanupFileNodes([p, { ...p, actions: [] }]);
+  assert.equal(provider.bytes, 3328);
+  assert.equal(provider.expanded, true);
+  assert.deepEqual(provider.children?.map(n => [n.name, n.bytes]), [['projects/large · 2 items', 3072], ['projects/small · 1 item', 256]]);
+  const files = provider.children![0].children!;
+  assert.equal(files[0].name, 'dc8434c2….jsonl · 3 images');
+  assert.deepEqual(files.map(n => n.bytes), [2048, 1024]);
+  assert.doesNotMatch(files[0].name + files[0].detail, /reasoning|outputs|yes|no/);
+  assert.match(files[0].detail!, /Remove inline images: 3 · 2\.00 KiB/);
+  assert.ok(files[0].detail!.includes(p.actions[1].files[0].path));
+  assert.deepEqual(p, original, 'formatting must not mutate the plan');
+});
+
+test('cleanup folders rank known savings even when some estimates are unknown', () => {
+  const p = inertPlan(), base = p.actions[0];
+  p.actions = ([
+    ['unknown', 'unknown.png', null], ['zero', 'zero.png', 0], ['small', 'small.png', 1],
+    ['large', 'unknown.png', null], ['large', 'first.png', 512], ['large', 'second.png', 512],
+    ['medium', 'medium.png', 768],
+  ] as const).map(([directory, file, estimatedSavingsBytes]) => ({
+    ...base, id: `${directory}/${file}`, estimatedSavingsBytes,
+    files: [{ ...base.files[0], path: `${p.root}/${directory}/${file}` }],
+  }));
+  const original = structuredClone(p);
+  const [provider] = cleanupFileNodes([p]);
+  assert.deepEqual(provider.children?.map(n => [n.name, n.bytes]), [
+    ['large · 3 items', null], ['medium · 1 item', 768], ['small · 1 item', 1],
+    ['zero · 1 item', 0], ['unknown · 1 item', null],
+  ]);
+  assert.match(provider.children![0].detail!, /1\.00 KiB \+ unknown \(1 item\)/);
+  assert.deepEqual(provider.children![0].children?.map(n => n.bytes), [512, 512, null]);
+  assert.equal(provider.bytes, null);
+  assert.deepEqual(p, original, 'sorting must not mutate the plan');
+});
+
+test('cleanup file details preserve unknown estimates, multi-file scope and Codex effects', () => {
+  const p = inertPlan(), a = p.actions[0];
+  p.actions = [{ ...a, estimatedSavingsBytes: null, kind: 'codex-delete', sessionIds: ['parent', 'child'],
+    files: [...a.files, { ...a.files[0], path: '/inert/codex/other/child.jsonl' }] },
+    { ...a, kind: 'slim-history', slimOptions: { removeImages: false, compactTools: false, removeReasoning: true },
+      slimCounts: { images: 0, toolOutputs: 0, reasoning: 7 }, slimSavingsBytes: { images: 0, toolOutputs: 0, reasoning: 1024 } }];
+  const [provider] = cleanupFileNodes([p]), group = provider.children![0];
+  assert.equal(provider.bytes, null); assert.equal(group.bytes, null);
+  assert.match(provider.detail!, /1\.00 KiB \+ unknown \(1 item\)/);
+  const [slim, deletion] = group.children!;
+  assert.match(slim.name, /7 reasoning blocks/);
+  assert.match(slim.detail!, /Remove encrypted reasoning: 7 · 1\.00 KiB/);
+  assert.match(deletion.name, /\(\+1 file\) · Delete session/);
+  assert.equal(deletion.bytes, null);
+  assert.match(deletion.detail!, /Estimated savings: unknown/);
+  assert.match(deletion.detail!, /\/other\/child\.jsonl\n\nRelated sessions:\nparent\nchild$/);
+});
+
+test('cleanup file tree stays compact, shows folder suffixes and opens multiline full paths', async t => {
+  const term = await terminal(t);
+  for (const [key, value] of Object.entries({ columns: 81, rows: 24 })) {
+    const descriptor = Object.getOwnPropertyDescriptor(process.stdout, key);
+    Object.defineProperty(process.stdout, key, { configurable: true, writable: true, value });
+    t.after(() => { if (descriptor) Object.defineProperty(process.stdout, key, descriptor); else Reflect.deleteProperty(process.stdout, key); });
+  }
+  const p = inertPlan();
+  p.actions = Array.from({ length: 100 }, (_, i) => ({ ...p.actions[0],
+    files: [{ ...p.actions[0].files[0], path: `/inert/codex/${'long-directory-'.repeat(8)}项目/image-${i}.png` }],
+    estimatedSavingsBytes: i === 99 ? null : 1024,
+  }));
+  const answer = tree({ message: 'Cleanup files · Estimated savings', nodes: cleanupFileNodes([p]) }, term.context);
+  void answer.catch(() => {});
+  const current = () => screenLines(term.text()).filter(Boolean);
+  assert.ok(current().length < 12, '100 files should start as one collapsed directory');
+  assert.match(current().join('\n'), /项目 · 100 items\s+unknown/);
+  assert.doesNotMatch(current().join('\n'), /image-0/);
+  await term.key('\x1b[C'); await term.key('\x1b[C'); await term.key('j');
+  assert.match(current().join('\n'), /image-0\.png · Compress PNG \(lossless\)\s+1\.00 KiB/);
+  await term.key('\r');
+  assert.match(current().join('\n'), /Estimated savings: 1\.00 KiB\n  Source size: 4\.00 KiB/);
+  assert.ok(current().some(line => line === '  Full paths:'));
+  process.stdout.columns = 46; process.stdout.emit('resize'); await setImmediate();
+  await term.key('\x1b[F');
+  assert.match(current().join('\n'), /image-0\.png/);
+  assert.ok(current().every(line => measure(line).width <= 45), JSON.stringify(current()));
+  await term.key('q');
+  await term.key('\x1b[F');
+  assert.match(current().join('\n'), /image-99.*unknown/);
+  assert.ok(current().every(line => measure(line).width <= 45), JSON.stringify(current()));
+  await term.key('q'); await answer;
+});
+
 test('cleanup confirmation summarizes scope, offers file details, and only Enter can approve', async t => {
   const term = await terminal(t);
   for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
@@ -650,9 +749,13 @@ test('cleanup confirmation summarizes scope, offers file details, and only Enter
   assert.match(text, /Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable/);
   await term.key('2'); await term.key('\r');
   assert.equal(settled, false, 'file details must not approve cleanup');
+  assert.match(stripVTControlCharacters(term.text()), /generated_images · 1 item/);
+  await term.key('\x1b[C'); await term.key('\x1b[C'); await term.key('j'); await term.key('\r');
   assert.match(stripVTControlCharacters(term.text()), /\/inert\/codex\/generated_images\/图片\.png/);
-  assert.match(stripVTControlCharacters(term.text()), /source size 4\.00 KiB/);
+  assert.match(stripVTControlCharacters(term.text()), /Source size: 4\.00 KiB/);
   assert.match(stripVTControlCharacters(term.text()), /Estimated savings: 1\.00 KiB/);
+  await term.key('q');
+  assert.equal(settled, false, 'closing file details must return to the file list');
   await term.key('q');
   for (const key of ['1', '2', ' ', 'y', '\x1b[B']) {
     await term.key(key);
