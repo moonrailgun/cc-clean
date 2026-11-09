@@ -4,6 +4,18 @@ import { commandSchema, help, parseCommand, UsageError } from '../src/commands.t
 
 // Parser-only checks: these never plan or execute cleanup.
 const id = '12345678-1234-1234-1234-123456789abc';
+test('temporary-only cleanup is discoverable, exclusive and requires normal confirmation', () => {
+  assert.ok(commandSchema.commands[0].options.includes('temp-only'));
+  assert.match(help, /--temp-only/);
+  assert.equal(parseCommand(['clean', '--temp-only'], true).interactive, true);
+  assert.equal(parseCommand(['clean', '--temp-only', '--yes'], true).interactive, true);
+  assert.equal(parseCommand(['clean', '--temp-only', '--yes', '--json'], true).interactive, false);
+  assert.equal(parseCommand(['clean', '--temp-only', '--dry-run'], false).values['temp-only'], true);
+  assert.throws(() => parseCommand(['clean', '--temp-only', '--json'], true), /--yes/);
+  for (const args of [['analyze'], ['stats'], ['clean', '--remove-images'], ['clean', '--compact-tools'],
+    ['clean', '--remove-reasoning'], ['clean', '--provider', 'codex', '--file', '/tmp/report.md']])
+    assert.throws(() => parseCommand([...args, '--temp-only', '--yes'], false), /--temp-only/);
+});
 test('noninteractive cleanup requires explicit confirmation or preview', () => {
   for (const flags of [[], ['--json'], ['--no-interactive']]) {
     assert.throws(() => parseCommand(['clean', ...flags], false), UsageError);
@@ -87,17 +99,4 @@ test('machine discovery describes all commands and published flags in English', 
   assert.equal(/\p{Script=Han}/u.test(help + JSON.stringify(commandSchema)), false);
   assert.equal(parseCommand(['--help', '--json'], false).values.help, true);
   assert.equal(parseCommand(['--version', '--json'], false).values.version, true);
-});
-
-test('temporary-only cleanup is discoverable, exclusive and requires normal confirmation', () => {
-  assert.ok(commandSchema.commands[0].options.includes('temp-only'));
-  assert.match(help, /--temp-only/);
-  assert.equal(parseCommand(['clean', '--temp-only'], true).interactive, true);
-  assert.equal(parseCommand(['clean', '--temp-only', '--yes'], true).interactive, true);
-  assert.equal(parseCommand(['clean', '--temp-only', '--yes', '--json'], true).interactive, false);
-  assert.equal(parseCommand(['clean', '--temp-only', '--dry-run'], false).values['temp-only'], true);
-  assert.throws(() => parseCommand(['clean', '--temp-only', '--json'], true), /--yes/);
-  for (const args of [['analyze'], ['stats'], ['clean', '--remove-images'], ['clean', '--compact-tools'],
-    ['clean', '--remove-reasoning'], ['clean', '--provider', 'codex', '--file', '/tmp/report.md']])
-    assert.throws(() => parseCommand([...args, '--temp-only', '--yes'], false), /--temp-only/);
 });

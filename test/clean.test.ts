@@ -19,6 +19,32 @@ async function fixture() {
 }
 const inactive = async () => null;
 
+test('Quick clean combines history slimming with existing rules while standalone slimming stays scoped', async () => {
+  const f = await fixture(), history = join(f.root, 'sessions', 'example.jsonl');
+  await mkdir(join(f.root, 'sessions'));
+  await writeFile(history, JSON.stringify({type: 'session_meta', payload: {id: 'synthetic', cli_version: '0.167.0'}}) + '\n');
+  await utimes(history, new Date(f.now - 73*3600000), new Date(f.now - 73*3600000));
+  await mkdir(join(f.root, 'generated_images'));
+  await writeFile(join(f.root, 'generated_images', 'example.png'), pngFixture().input);
+  const inventory = await scanRoot(f.root, 'codex'), slim = {removeImages: true, compactTools: true};
+  const quick = await createPlan(inventory, {now: f.now, version: 'custom-build', slim, includeFileCleanup: true});
+  assert.deepEqual(quick.actions.map(a => a.kind).sort(), ['compress-png', 'delete-files', 'slim-history']);
+  assert.deepEqual(quick.actions.find(a => a.kind === 'slim-history')?.slimOptions, slim);
+  assert.equal(quick.explicitTarget, undefined, 'Quick clean must not waive bulk age protection');
+  const standalone = await createPlan(inventory, {now: f.now, version: '0.167.0', slim});
+  assert.deepEqual(standalone.actions.map(a => a.kind), ['slim-history']);
+
+  await writeFile(join(f.root, 'sessions', 'shared.jsonl'), JSON.stringify({type: 'session_meta', payload: {
+    id: 'shared', history_base: {thread_id: 'synthetic'},
+  }}) + '\n');
+  const unsupported = await scanRoot(f.root, 'codex');
+  const partial = await createPlan(unsupported, {now: f.now, slim, includeFileCleanup: true});
+  assert.deepEqual(partial.actions.map(a => a.kind).sort(), ['compress-png', 'delete-files']);
+  assert.ok(partial.warnings.some(w => /referenced by another rollout/.test(w)));
+  const blocked = await createPlan(unsupported, {now: f.now, version: '0.167.0', slim});
+  assert.equal(blocked.actions.length, 0);
+});
+
 test('automatic cleanup only plans verified old temporary files and dry-run leaves source intact', async () => {
   const f = await fixture();
   await writeFile(join(f.root, 'old-unknown.tmp'), 'protected');
@@ -295,31 +321,4 @@ test('Claude deletion groups structurally valid mixed-version files and preserve
   await assert.rejects(access(join(project,id+'.jsonl')));await assert.rejects(access(join(project,id,'subagents','agent-child.jsonl')));
   assert.equal(await readFile(join(project,'memory','MEMORY.md'),'utf8'),'retained memory');assert.equal(await readFile(join(root,'history.jsonl'),'utf8'),'retained history');
   assert.equal((await readStats(f.stateDir)).providers.claude.savedBytes,r.confirmedReductionBytes);
-});
-
-
-test('Quick clean combines history slimming with existing rules while standalone slimming stays scoped', async () => {
-  const f = await fixture(), history = join(f.root, 'sessions', 'example.jsonl');
-  await mkdir(join(f.root, 'sessions'));
-  await writeFile(history, JSON.stringify({type: 'session_meta', payload: {id: 'synthetic', cli_version: '0.167.0'}}) + '\n');
-  await utimes(history, new Date(f.now - 73*3600000), new Date(f.now - 73*3600000));
-  await mkdir(join(f.root, 'generated_images'));
-  await writeFile(join(f.root, 'generated_images', 'example.png'), pngFixture().input);
-  const inventory = await scanRoot(f.root, 'codex'), slim = {removeImages: true, compactTools: true};
-  const quick = await createPlan(inventory, {now: f.now, version: 'custom-build', slim, includeFileCleanup: true});
-  assert.deepEqual(quick.actions.map(a => a.kind).sort(), ['compress-png', 'delete-files', 'slim-history']);
-  assert.deepEqual(quick.actions.find(a => a.kind === 'slim-history')?.slimOptions, slim);
-  assert.equal(quick.explicitTarget, undefined, 'Quick clean must not waive bulk age protection');
-  const standalone = await createPlan(inventory, {now: f.now, version: '0.167.0', slim});
-  assert.deepEqual(standalone.actions.map(a => a.kind), ['slim-history']);
-
-  await writeFile(join(f.root, 'sessions', 'shared.jsonl'), JSON.stringify({type: 'session_meta', payload: {
-    id: 'shared', history_base: {thread_id: 'synthetic'},
-  }}) + '\n');
-  const unsupported = await scanRoot(f.root, 'codex');
-  const partial = await createPlan(unsupported, {now: f.now, slim, includeFileCleanup: true});
-  assert.deepEqual(partial.actions.map(a => a.kind).sort(), ['compress-png', 'delete-files']);
-  assert.ok(partial.warnings.some(w => /referenced by another rollout/.test(w)));
-  const blocked = await createPlan(unsupported, {now: f.now, version: '0.167.0', slim});
-  assert.equal(blocked.actions.length, 0);
 });

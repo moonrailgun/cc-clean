@@ -34,6 +34,32 @@ async function save(state: string, r: Receipt, name = r.operationId) {
   return dir;
 }
 
+test('system-temp receipts enforce the allowlist and keep selective accounting in logs', async t => {
+  const {base, state} = await fixture(t), r = receipt(base), a = r.actions[0], f = a.files[0];
+  r.systemTemp = {uid: 501, excludedRoots: [state]}; r.rootIdentity = {dev: 1, ino: 1};
+  f.relative = 'codex-app-installer-test/Codex.dmg'; f.path = join(r.root, f.relative);
+  f.uid = 501; f.category = 'installer'; a.targetId = f.relative;
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    {systemTemp: {uid: -1, excludedRoots: []}}, {systemTemp: {uid: 501, excludedRoots: ['relative']}},
+    {systemTemp: {uid: 501, excludedRoots: [r.root]}}, {systemTemp: {uid: 502, excludedRoots: []}},
+    {explicitTarget: f.path}, {source: 'analyze'}, {rootIdentity: undefined}, {codexIndexFingerprint: 'a'.repeat(64)},
+  ]) assert.throws(() => validateReceipt({...r, ...changes}), /receipt/);
+  for (const changes of [
+    {kind: 'compress-png'}, {sessionIds: [randomUUID()]}, {nativeStarted: false},
+    {slimOptions: {removeImages: true, compactTools: false}}, {beforeHash: 'a'.repeat(64)},
+  ]) assert.throws(() => validateReceipt({...r, actions: [{...a, ...changes}]}), /receipt/);
+  for (const changes of [
+    {uid: undefined}, {uid: 502}, {mode: 0o100666}, {mode: 0o120600}, {nlink: 2}, {category: 'temporary'},
+    {path: join(r.root, 'codex-app-installer-test/source.ts'), relative: 'codex-app-installer-test/source.ts'},
+    {path: join(r.root, '..', 'Codex.dmg'), relative: '../Codex.dmg'},
+  ]) assert.throws(() => validateReceipt({...r, actions: [{...a, files: [{...f, ...changes}]}]}), /receipt/);
+  await recordCleanup(state, r);
+  const [log] = await readCleanupLog(state);
+  assert.equal(log.scope, 'system-temp'); assert.equal(log.savedBytes, 19);
+  assert.equal(log.cleanedRecords, 1); assert.equal(log.cleanupTypes[0].type, 'delete-files');
+});
+
 test('receipt savings estimates are optional, bounded and separate from measured savings', () => {
   const r = receipt('/inert');
   for (const estimate of [undefined, null, 0, 10, 19]) {
@@ -44,6 +70,37 @@ test('receipt savings estimates are optional, bounded and separate from measured
     const invalid = structuredClone(r);
     Object.assign(invalid.actions[0], { estimatedSavingsBytes: estimate });
     assert.throws(() => validateReceipt(invalid));
+  }
+});
+
+test('session temporary receipts bind the creation scope and direct-file identity', () => {
+  const r = receipt('/inert'), a = r.actions[0], f = a.files[0];
+  r.root = '/tmp/generated-abc123'; r.rootIdentity = {dev: 1, ino: 2};
+  r.systemTemp = {uid: 501, excludedRoots: ['/inert/state'], session: {
+    path: r.root, kind: 'directory', callId: 'creation', startedAt: 1000, completedAt: 2000,
+    roots: {claude: '/inert/claude', codex: '/inert/codex'}, source: '/inert/codex/sessions/example.jsonl',
+    sessionId: 'example', fingerprint: 'a'.repeat(64), dev: 1, ino: 2, birthtimeMs: 1500,
+  }};
+  Object.assign(f, {path: join(r.root, 'report.md'), relative: 'report.md', uid: 501, category: 'session-output'});
+  a.targetId = f.relative;
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    {path: '/tmp/unrelated'}, {source: '/inert/codex/cache/example.jsonl'}, {fingerprint: ''},
+    {startedAt: 3000}, {birthtimeMs: 9000}, {roots: {claude: '/tmp', codex: '/inert/codex'}},
+  ]) {
+    const invalid = structuredClone(r); Object.assign(invalid.systemTemp!.session!, changes);
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  for (const name of ['image.png', 'code.ts', 'README.md', 'src/report.md', '../report.md']) {
+    const invalid = structuredClone(r);
+    Object.assign(invalid.actions[0].files[0], {path: join(r.root, name), relative: name});
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  Object.assign(r.systemTemp.session!, {path: f.path, kind: 'file', dev: f.dev, ino: f.ino});
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [{dev: 99}, {ino: 99}, {path: join(r.root, 'other.md'), relative: 'other.md'}]) {
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0].files[0], changes);
+    assert.throws(() => validateReceipt(invalid), /receipt/);
   }
 });
 
@@ -94,6 +151,71 @@ test('privateDir refuses an existing directory below a symlink ancestor', async 
   await assert.rejects(privateDir(join(base, 'alias', 'nested')), /symlink/i);
   await assert.rejects(privateDir(join(base, 'alias', 'new')), /symlink/i);
   await assert.rejects(lstat(join(base, 'external', 'new')), {code: 'ENOENT'});
+});
+
+test('history index receipts bind safe database identities, hashes and one rollout', () => {
+  const r = receipt('/synthetic'), action = r.actions[0];
+  action.kind = 'slim-history'; action.files[0].category = 'sessions';
+  action.beforeHash = 'a'.repeat(64); action.afterHash = 'b'.repeat(64);
+  action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 1, toolOutputs: 0};
+  const entry = {name: 'thread_history_1.sqlite', dev: 1, ino: 2, threadId: 'rollout',
+    schemaHash: 'c'.repeat(64), beforeHash: 'd'.repeat(64), afterHash: 'e'.repeat(64)};
+  for (const entries of [[], [entry], [entry, {...entry, name: 'thread_history_2.sqlite'}]]) {
+    action.codexProjection = entries;
+    assert.equal(validateReceipt(r), r);
+  }
+  for (const entries of [
+    null, {}, [entry, entry], [{...entry, name: '../thread_history_1.sqlite'}],
+    [{...entry, ino: -1}], [{...entry, dev: '1'}], [{...entry, threadId: ''}],
+    [{...entry, schemaHash: 'invalid'}], [{...entry, beforeHash: undefined}], [{...entry, afterHash: ''}],
+    [entry, {...entry, name: 'thread_history_2.sqlite', threadId: 'other'}],
+  ]) {
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0], {codexProjection: entries});
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  r.provider = 'claude'; assert.throws(() => validateReceipt(r), /receipt/);
+  r.provider = 'codex'; action.kind = 'delete-files'; assert.throws(() => validateReceipt(r), /receipt/);
+});
+
+test('duplicate receipts bind the retained copy and count only the removed original', async t => {
+  const {base, state} = await fixture(t), r = receipt(base), a = r.actions[0], f = a.files[0];
+  Object.assign(f, {path: join(r.root, 'sessions/one.jsonl'), relative: 'sessions/one.jsonl', category: 'sessions'});
+  Object.assign(a, {kind: 'deduplicate-history', targetId: f.relative, beforeBytes: 29, afterBytes: 10,
+    estimatedSavingsBytes: 19, beforeHash: 'a'.repeat(64), afterHash: 'b'.repeat(64), codexProjection: [],
+    files: [f, {...f, path: f.path + '.zst', relative: f.relative + '.zst', size: 10, ino: 2}]});
+  assert.equal(validateReceipt(r), r);
+  for (const recoveryState of ['prepared', 'applied', 'finalized'] as const) {
+    const copy = structuredClone(r); copy.actions[0].recoveryState = recoveryState;
+    if (recoveryState === 'prepared') {
+      copy.status = 'dry-run'; copy.actions[0].status = 'planned';
+      copy.actions[0].afterBytes = 29; copy.confirmedReductionBytes = 0;
+    }
+    assert.equal(validateReceipt(copy), copy);
+  }
+  const entry = {name: 'thread_history_1.sqlite', dev: 1, ino: 3, threadId: 'one',
+    schemaHash: 'c'.repeat(64), beforeHash: 'd'.repeat(64), afterHash: 'd'.repeat(64)};
+  a.codexProjection = [entry]; assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    {beforeHash: undefined}, {afterHash: undefined}, {codexProjection: undefined},
+    {codexProjection: [{...entry, afterHash: 'e'.repeat(64)}]},
+    {files: [...a.files].reverse()}, {files: [f]},
+    {files: [f, {...a.files[1], path: join(r.root, 'sessions/other.jsonl.zst'), relative: 'sessions/other.jsonl.zst'}]},
+    {files: [{...f, category: 'temporary'}, a.files[1]]},
+    {files: [f, {...a.files[1], ino: f.ino}]}, {files: [{...f, nlink: 2}, a.files[1]]},
+    {sessionIds: [randomUUID()]}, {nativeStarted: false},
+    {slimOptions: {removeImages: true, compactTools: false}}, {slimCounts: {images: 0, toolOutputs: 0}},
+    {slimSavingsBytes: {images: 19, toolOutputs: 0}},
+    {beforeBytes: 30}, {afterBytes: 29}, {afterBytes: 0}, {estimatedSavingsBytes: 10},
+  ]) {
+    const copy = structuredClone(r); Object.assign(copy.actions[0], changes);
+    assert.throws(() => validateReceipt(copy), /receipt/);
+  }
+  assert.throws(() => validateReceipt({...r, provider: 'claude'}), /receipt/);
+  await recordCleanup(state, r);
+  const [log] = await readCleanupLog(state);
+  assert.equal(log.savedBytes, 19); assert.equal(log.cleanedRecords, 1);
+  assert.deepEqual(log.cleanupTypes, [{type: 'deduplicate-history', cleanedRecords: 1}]);
+  assert.equal((await readStats(state)).savedBytes, 19);
 });
 
 test('directory checks reject lexical traversal that would hide a linked component', async t => {
@@ -412,41 +534,6 @@ test('pending Codex history rewrites require an explicit SQLite synchronization 
   }
 });
 
-test('pending Codex session files cannot bypass coordination through generic mutations', () => {
-  for (const kind of ['delete-files', 'compress-png'] as const) {
-    for (const [relative, category] of [['sessions/rollout.jsonl', 'temporary'], ['archived_sessions/rollout.jsonl.zst', 'temporary'], ['history.jsonl', 'sessions']]) {
-      const r = receipt('/inert'), a = r.actions[0], f = a.files[0];
-      a.kind = kind; a.status = 'planned'; a.recoveryState = 'prepared'; r.confirmedReductionBytes = 0;
-      f.relative = relative; f.path = join(r.root, relative); f.category = category;
-      assert.throws(() => validateReceipt(r), /receipt/);
-    }
-  }
-});
-
-test('history index receipts bind safe database identities, hashes and one rollout', () => {
-  const r = receipt('/synthetic'), action = r.actions[0];
-  action.kind = 'slim-history'; action.files[0].category = 'sessions';
-  action.beforeHash = 'a'.repeat(64); action.afterHash = 'b'.repeat(64);
-  action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 1, toolOutputs: 0};
-  const entry = {name: 'thread_history_1.sqlite', dev: 1, ino: 2, threadId: 'rollout',
-    schemaHash: 'c'.repeat(64), beforeHash: 'd'.repeat(64), afterHash: 'e'.repeat(64)};
-  for (const entries of [[], [entry], [entry, {...entry, name: 'thread_history_2.sqlite'}]]) {
-    action.codexProjection = entries;
-    assert.equal(validateReceipt(r), r);
-  }
-  for (const entries of [
-    null, {}, [entry, entry], [{...entry, name: '../thread_history_1.sqlite'}],
-    [{...entry, ino: -1}], [{...entry, dev: '1'}], [{...entry, threadId: ''}],
-    [{...entry, schemaHash: 'invalid'}], [{...entry, beforeHash: undefined}], [{...entry, afterHash: ''}],
-    [entry, {...entry, name: 'thread_history_2.sqlite', threadId: 'other'}],
-  ]) {
-    const invalid = structuredClone(r); Object.assign(invalid.actions[0], {codexProjection: entries});
-    assert.throws(() => validateReceipt(invalid), /receipt/);
-  }
-  r.provider = 'claude'; assert.throws(() => validateReceipt(r), /receipt/);
-  r.provider = 'codex'; action.kind = 'delete-files'; assert.throws(() => validateReceipt(r), /receipt/);
-});
-
 test('reasoning-only receipts validate enabled operations, counts and exact category savings', () => {
   const r = receipt('/inert'), a = r.actions[0];
   a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
@@ -468,63 +555,27 @@ test('reasoning-only receipts validate enabled operations, counts and exact cate
   }
 });
 
-test('system-temp receipts enforce the allowlist and keep selective accounting in logs', async t => {
-  const {base, state} = await fixture(t), r = receipt(base), a = r.actions[0], f = a.files[0];
-  r.systemTemp = {uid: 501, excludedRoots: [state]}; r.rootIdentity = {dev: 1, ino: 1};
-  f.relative = 'codex-app-installer-test/Codex.dmg'; f.path = join(r.root, f.relative);
-  f.uid = 501; f.category = 'installer'; a.targetId = f.relative;
+test('old snapshot receipts require Codex, an enabled option, exact savings and coordinated projections', () => {
+  const r = receipt('/inert'), a = r.actions[0];
+  a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
+  a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64); a.codexProjection = [];
+  a.recoveryState = 'applied'; r.confirmedReductionBytes = 9;
+  a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+  a.slimCounts = {images: 0, toolOutputs: 0, oldSnapshots: 1};
+  a.estimatedSavingsBytes = 9; a.slimSavingsBytes = {images: 0, toolOutputs: 0, oldSnapshots: 9};
   assert.equal(validateReceipt(r), r);
   for (const changes of [
-    {systemTemp: {uid: -1, excludedRoots: []}}, {systemTemp: {uid: 501, excludedRoots: ['relative']}},
-    {systemTemp: {uid: 501, excludedRoots: [r.root]}}, {systemTemp: {uid: 502, excludedRoots: []}},
-    {explicitTarget: f.path}, {source: 'analyze'}, {rootIdentity: undefined}, {codexIndexFingerprint: 'a'.repeat(64)},
-  ]) assert.throws(() => validateReceipt({...r, ...changes}), /receipt/);
-  for (const changes of [
-    {kind: 'compress-png'}, {sessionIds: [randomUUID()]}, {nativeStarted: false},
-    {slimOptions: {removeImages: true, compactTools: false}}, {beforeHash: 'a'.repeat(64)},
-  ]) assert.throws(() => validateReceipt({...r, actions: [{...a, ...changes}]}), /receipt/);
-  for (const changes of [
-    {uid: undefined}, {uid: 502}, {mode: 0o100666}, {mode: 0o120600}, {nlink: 2}, {category: 'temporary'},
-    {path: join(r.root, 'codex-app-installer-test/source.ts'), relative: 'codex-app-installer-test/source.ts'},
-    {path: join(r.root, '..', 'Codex.dmg'), relative: '../Codex.dmg'},
-  ]) assert.throws(() => validateReceipt({...r, actions: [{...a, files: [{...f, ...changes}]}]}), /receipt/);
-  await recordCleanup(state, r);
-  const [log] = await readCleanupLog(state);
-  assert.equal(log.scope, 'system-temp'); assert.equal(log.savedBytes, 19);
-  assert.equal(log.cleanedRecords, 1); assert.equal(log.cleanupTypes[0].type, 'delete-files');
-});
-
-test('session temporary receipts bind the creation scope and direct-file identity', () => {
-  const r = receipt('/inert'), a = r.actions[0], f = a.files[0];
-  r.root = '/tmp/generated-abc123'; r.rootIdentity = {dev: 1, ino: 2};
-  r.systemTemp = {uid: 501, excludedRoots: ['/inert/state'], session: {
-    path: r.root, kind: 'directory', callId: 'creation', startedAt: 1000, completedAt: 2000,
-    roots: {claude: '/inert/claude', codex: '/inert/codex'}, source: '/inert/codex/sessions/example.jsonl',
-    sessionId: 'example', fingerprint: 'a'.repeat(64), dev: 1, ino: 2, birthtimeMs: 1500,
-  }};
-  Object.assign(f, {path: join(r.root, 'report.md'), relative: 'report.md', uid: 501, category: 'session-output'});
-  a.targetId = f.relative;
-  assert.equal(validateReceipt(r), r);
-  for (const changes of [
-    {path: '/tmp/unrelated'}, {source: '/inert/codex/cache/example.jsonl'}, {fingerprint: ''},
-    {startedAt: 3000}, {birthtimeMs: 9000}, {roots: {claude: '/tmp', codex: '/inert/codex'}},
+    ...[false, undefined, null, 'true', 1].map(removeOldSnapshots => ({slimOptions: {...a.slimOptions, removeOldSnapshots}})),
+    ...[undefined, 0, -1, 0.5, '1', null].map(oldSnapshots => ({slimCounts: {...a.slimCounts, oldSnapshots}})),
+    ...[undefined, 0, 8, 10, -1, 0.5, '9', null].map(oldSnapshots => ({slimSavingsBytes: {...a.slimSavingsBytes, oldSnapshots}})),
+    {codexProjection: undefined},
   ]) {
-    const invalid = structuredClone(r); Object.assign(invalid.systemTemp!.session!, changes);
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0], changes);
     assert.throws(() => validateReceipt(invalid), /receipt/);
   }
-  for (const name of ['image.png', 'code.ts', 'README.md', 'src/report.md', '../report.md']) {
-    const invalid = structuredClone(r);
-    Object.assign(invalid.actions[0].files[0], {path: join(r.root, name), relative: name});
-    assert.throws(() => validateReceipt(invalid), /receipt/);
-  }
-  Object.assign(r.systemTemp.session!, {path: f.path, kind: 'file', dev: f.dev, ino: f.ino});
-  assert.equal(validateReceipt(r), r);
-  for (const changes of [{dev: 99}, {ino: 99}, {path: join(r.root, 'other.md'), relative: 'other.md'}]) {
-    const invalid = structuredClone(r); Object.assign(invalid.actions[0].files[0], changes);
-    assert.throws(() => validateReceipt(invalid), /receipt/);
-  }
+  const claude = structuredClone(r); claude.provider = 'claude'; delete claude.actions[0].codexProjection;
+  assert.throws(() => validateReceipt(claude), /receipt/);
 });
-
 
 test('Claude slimming receipts validate enabled operations, provider and exact category savings', () => {
   for (const [option, count] of [['removeRequestArchives', 'requestRecords'], ['compactHooks', 'hooks'], ['compactToolDefinitions', 'toolDefinitions'], ['compactSkillListings', 'skillListings']] as const) {
@@ -550,66 +601,13 @@ test('Claude slimming receipts validate enabled operations, provider and exact c
   }
 });
 
-
-test('duplicate receipts bind the retained copy and count only the removed original', async t => {
-  const {base, state} = await fixture(t), r = receipt(base), a = r.actions[0], f = a.files[0];
-  Object.assign(f, {path: join(r.root, 'sessions/one.jsonl'), relative: 'sessions/one.jsonl', category: 'sessions'});
-  Object.assign(a, {kind: 'deduplicate-history', targetId: f.relative, beforeBytes: 29, afterBytes: 10,
-    estimatedSavingsBytes: 19, beforeHash: 'a'.repeat(64), afterHash: 'b'.repeat(64), codexProjection: [],
-    files: [f, {...f, path: f.path + '.zst', relative: f.relative + '.zst', size: 10, ino: 2}]});
-  assert.equal(validateReceipt(r), r);
-  for (const recoveryState of ['prepared', 'applied', 'finalized'] as const) {
-    const copy = structuredClone(r); copy.actions[0].recoveryState = recoveryState;
-    if (recoveryState === 'prepared') {
-      copy.status = 'dry-run'; copy.actions[0].status = 'planned';
-      copy.actions[0].afterBytes = 29; copy.confirmedReductionBytes = 0;
+test('pending Codex session files cannot bypass coordination through generic mutations', () => {
+  for (const kind of ['delete-files', 'compress-png'] as const) {
+    for (const [relative, category] of [['sessions/rollout.jsonl', 'temporary'], ['archived_sessions/rollout.jsonl.zst', 'temporary'], ['history.jsonl', 'sessions']]) {
+      const r = receipt('/inert'), a = r.actions[0], f = a.files[0];
+      a.kind = kind; a.status = 'planned'; a.recoveryState = 'prepared'; r.confirmedReductionBytes = 0;
+      f.relative = relative; f.path = join(r.root, relative); f.category = category;
+      assert.throws(() => validateReceipt(r), /receipt/);
     }
-    assert.equal(validateReceipt(copy), copy);
   }
-  const entry = {name: 'thread_history_1.sqlite', dev: 1, ino: 3, threadId: 'one',
-    schemaHash: 'c'.repeat(64), beforeHash: 'd'.repeat(64), afterHash: 'd'.repeat(64)};
-  a.codexProjection = [entry]; assert.equal(validateReceipt(r), r);
-  for (const changes of [
-    {beforeHash: undefined}, {afterHash: undefined}, {codexProjection: undefined},
-    {codexProjection: [{...entry, afterHash: 'e'.repeat(64)}]},
-    {files: [...a.files].reverse()}, {files: [f]},
-    {files: [f, {...a.files[1], path: join(r.root, 'sessions/other.jsonl.zst'), relative: 'sessions/other.jsonl.zst'}]},
-    {files: [{...f, category: 'temporary'}, a.files[1]]},
-    {files: [f, {...a.files[1], ino: f.ino}]}, {files: [{...f, nlink: 2}, a.files[1]]},
-    {sessionIds: [randomUUID()]}, {nativeStarted: false},
-    {slimOptions: {removeImages: true, compactTools: false}}, {slimCounts: {images: 0, toolOutputs: 0}},
-    {slimSavingsBytes: {images: 19, toolOutputs: 0}},
-    {beforeBytes: 30}, {afterBytes: 29}, {afterBytes: 0}, {estimatedSavingsBytes: 10},
-  ]) {
-    const copy = structuredClone(r); Object.assign(copy.actions[0], changes);
-    assert.throws(() => validateReceipt(copy), /receipt/);
-  }
-  assert.throws(() => validateReceipt({...r, provider: 'claude'}), /receipt/);
-  await recordCleanup(state, r);
-  const [log] = await readCleanupLog(state);
-  assert.equal(log.savedBytes, 19); assert.equal(log.cleanedRecords, 1);
-  assert.deepEqual(log.cleanupTypes, [{type: 'deduplicate-history', cleanedRecords: 1}]);
-  assert.equal((await readStats(state)).savedBytes, 19);
-});
-
-test('old snapshot receipts require Codex, an enabled option, exact savings and coordinated projections', () => {
-  const r = receipt('/inert'), a = r.actions[0];
-  a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
-  a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64); a.codexProjection = [];
-  a.recoveryState = 'applied'; r.confirmedReductionBytes = 9;
-  a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
-  a.slimCounts = {images: 0, toolOutputs: 0, oldSnapshots: 1};
-  a.estimatedSavingsBytes = 9; a.slimSavingsBytes = {images: 0, toolOutputs: 0, oldSnapshots: 9};
-  assert.equal(validateReceipt(r), r);
-  for (const changes of [
-    ...[false, undefined, null, 'true', 1].map(removeOldSnapshots => ({slimOptions: {...a.slimOptions, removeOldSnapshots}})),
-    ...[undefined, 0, -1, 0.5, '1', null].map(oldSnapshots => ({slimCounts: {...a.slimCounts, oldSnapshots}})),
-    ...[undefined, 0, 8, 10, -1, 0.5, '9', null].map(oldSnapshots => ({slimSavingsBytes: {...a.slimSavingsBytes, oldSnapshots}})),
-    {codexProjection: undefined},
-  ]) {
-    const invalid = structuredClone(r); Object.assign(invalid.actions[0], changes);
-    assert.throws(() => validateReceipt(invalid), /receipt/);
-  }
-  const claude = structuredClone(r); claude.provider = 'claude'; delete claude.actions[0].codexProjection;
-  assert.throws(() => validateReceipt(claude), /receipt/);
 });

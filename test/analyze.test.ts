@@ -4,10 +4,13 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, link, readdir, realpa
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { zstdCompressSync } from 'node:zlib';
+import { randomBytes } from 'node:crypto';
 import { directoryEntries, scanRoot } from '../src/scan.ts';
 import { analyze } from '../src/analyze.ts';
 import { readCodexIndex } from '../src/providers/codex.ts';
 import { report, sessionStorageBytes } from '../src/app.ts';
+import { parseSession } from '../src/providers/jsonl.ts';
 import type { Inventory, ScanProgress } from '../src/types.ts';
 
 test('session storage includes protected histories and compressed copies, counting hard links once', () => {
@@ -37,6 +40,207 @@ async function file(root: string, path: string, content: string | Buffer) {
 }
 function jsonl(records: unknown[]) { return records.map(record => JSON.stringify(record)).join('\n') + '\n'; }
 const stamp = '2026-11-01T10:00:00.000Z';
+
+function codexHistory(id: string, input = 10) {
+  return jsonl([
+    { type: 'session_meta', payload: { id, cwd: '/project', timestamp: stamp, cli_version: '0.167.0' } },
+    { type: 'turn_context', payload: { model: 'test-model' } },
+    { type: 'event_msg', timestamp: stamp, payload: { type: 'user_message', message: '原始文本'.repeat(20_000) } },
+    { type: 'response_item', payload: { type: 'function_call', call_id: 'call-1' } },
+    { type: 'event_msg', timestamp: stamp, payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: 5, cached_input_tokens: 3, reasoning_output_tokens: 2 } } } },
+  ]);
+}
+
+test('Codex reads current and archived zstd histories with plain-path indexes and physical-byte progress', async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  const content = Buffer.from(codexHistory('current') + jsonl([{ type: 'padding', payload: randomBytes(192 * 1024).toString('base64') }]));
+  // Separate frames split a UTF-8 JSONL record, as a streaming decoder may do.
+  const compressed = Buffer.concat([zstdCompressSync(''), zstdCompressSync(content.subarray(0, 1111)), zstdCompressSync(content.subarray(1111))]);
+  assert.ok(compressed.length > 64 * 1024, 'compressed input must span multiple file reads');
+  const current = await file(root, 'sessions/current.jsonl.zst', compressed);
+  const archived = await file(root, 'archived_sessions/archived.jsonl.zst', zstdCompressSync(codexHistory('archived', 20)));
+  await file(base, 'reference/sessions/current.jsonl', content);
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  for (const [id, path] of [['current', current], ['archived', archived]]) db.prepare('INSERT INTO threads VALUES (?, ?, ?)').run(id, path.slice(0, -4), '/project');
+  db.close();
+  const inventory = await scanRoot(root, 'codex'), histories = inventory.files.filter(f => f.category === 'sessions');
+  assert.equal(histories.length, 2);
+  const plain = await parseSession((await scanRoot(join(base, 'reference'), 'codex')).files[0], 'codex', true);
+  assert.deepEqual(await parseSession(histories.find(f => f.path === current)!, 'codex', true), plain);
+  assert.equal((await parseSession(histories.find(f => f.path === current)!, 'codex', false)).complete, true);
+  for (let run = 0; run < 2; run++) {
+    const events: ScanProgress[] = [];
+    const result = await analyze(inventory, { deep: true, stateDir, onProgress: p => events.push(p) });
+    assert.equal(result.scanComplete, true);
+    assert.equal(result.sessions.length, 2);
+    assert.ok(result.sessions.every(s => s.complete && !s.indexOnly));
+    assert.equal(result.sessions.find(s => s.id === 'archived')?.archived, true);
+    assert.equal(result.usage.inputTokens, 30);
+    assert.equal(result.usage.outputTokens, 10);
+    assert.equal(result.usage.verified, true);
+    assert.equal(result.usage.byModel['test-model'].inputTokens, 30);
+    assert.equal(result.usage.byDate[stamp.slice(0, 10)].inputTokens, 30);
+    const diskBytes = histories.reduce((n, f) => n + f.size, 0);
+    assert.equal(result.projects[0].bytes, diskBytes);
+    assert.equal(result.projects[0].bytes + result.sharedBytes + result.unattributedBytes, result.totalBytes);
+    assert.ok(result.opportunities.recordTypes.reduce((n, item) => n + item.bytes, 0) > diskBytes);
+    const progress = events.filter(p => p.phase === 'sessions');
+    assert.equal(progress.at(-1)?.processedBytes, diskBytes);
+    assert.equal(progress.at(-1)?.totalBytes, diskBytes);
+    assert.equal(progress.at(-1)?.completed, 2);
+    for (let i = 1; i < progress.length; i++) assert.ok(progress[i].processedBytes! >= progress[i - 1].processedBytes! && progress[i].processedBytes! <= diskBytes);
+    assert.equal((await readdir(join(stateDir, 'providers/codex/cache'))).length, 2);
+    if (run) assert.equal(progress.length, 5, 'both compressed histories were served from cache');
+  }
+  assert.deepEqual(await readFile(current), compressed);
+  assert.equal((await scanRoot(root, 'claude')).files.filter(f => f.category === 'sessions').length, 0);
+});
+
+test('Codex prefers a plain sibling without double counting usage or assuming compressed contents match', async t => {
+  const root = await fixture(t);
+  const content = codexHistory('one');
+  const path = await file(root, 'sessions/one.jsonl', content);
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  db.prepare('INSERT INTO threads VALUES (?, ?)').run('one', path);
+  db.close();
+  for (const sibling of [zstdCompressSync(content), zstdCompressSync(codexHistory('stale-id', 999)), Buffer.from('not zstd')]) {
+    await file(root, 'sessions/one.jsonl.zst', sibling);
+    const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+    assert.equal(result.sessions.length, 1);
+    assert.equal(result.sessions[0].id, 'one');
+    assert.equal(result.sessions[0].files.length, 2);
+    assert.equal(result.sessions[0].bytes, Buffer.byteLength(content) + sibling.length);
+    assert.equal(result.usage.inputTokens, 10);
+    assert.equal(result.usage.verified, true, 'preferred plain usage remains verifiable');
+    assert.equal(result.usage.parsedFiles, 1);
+    assert.equal(result.usage.totalFiles, 1);
+    assert.equal(result.opportunities.recordTypes.find(r => r.type === 'session_meta')?.count, 1);
+    assert.equal(result.scanComplete, false, 'unverified sibling ownership must not authorize deletion');
+    assert.equal(result.sessions[0].complete, false);
+    assert.ok(result.warnings.some(w => w.includes('compressed sibling')));
+  }
+  await file(root, 'sessions/one.jsonl.zst', zstdCompressSync(content));
+  await writeFile(path, 'malformed plain history');
+  const brokenPlain = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(brokenPlain.usage.inputTokens, null, 'never fall back to potentially stale compressed usage');
+  await writeFile(path, content);
+  await file(root, 'sessions/unrelated.jsonl.zst', zstdCompressSync(content));
+  const duplicate = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(duplicate.usage.inputTokens, null, 'unrelated paths with duplicate IDs are still excluded');
+  assert.ok(duplicate.sessions[0].warnings.some(w => w.includes('Multiple distinct files')));
+});
+
+test('Codex compressed path aliases detect index/session identity mismatches', async t => {
+  const root = await fixture(t);
+  const path = await file(root, 'sessions/one.jsonl.zst', zstdCompressSync(codexHistory('one')));
+  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
+  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
+  db.prepare('INSERT INTO threads VALUES (?, ?)').run('different', path.slice(0, -4));
+  db.close();
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].complete, false);
+  assert.ok(result.sessions[0].warnings.includes('Index/session ID mismatch'));
+});
+
+test('compressed metadata sampling is bounded by decoded bytes while record visitors read the full stream', async t => {
+  const root = await fixture(t), limit = 1024 * 1024;
+  const header = jsonl([{ type: 'session_meta', payload: { id: 'one', cwd: '/first' } }]);
+  const exact = header + ' '.repeat(limit - Buffer.byteLength(header));
+  const path = await file(root, 'sessions/one.jsonl.zst', zstdCompressSync(exact));
+  assert.equal((await parseSession((await scanRoot(root, 'codex')).files[0], 'codex', false)).complete, true);
+  await writeFile(path, zstdCompressSync(exact + '\n' + jsonl([{ type: 'turn_context', payload: { cwd: '/later' } }])));
+  const entry = (await scanRoot(root, 'codex')).files[0];
+  assert.ok(entry.size < 1024, 'small disk size must not bypass the decoded sample limit');
+  const sampled = await parseSession(entry, 'codex', false);
+  assert.equal(sampled.complete, false);
+  assert.deepEqual(sampled.observedProjects, ['/first']);
+  assert.ok(sampled.warnings.some(w => w.includes('first 1 MiB')));
+  const records: unknown[] = [];
+  const full = await parseSession(entry, 'codex', false, undefined, undefined, row => records.push(row));
+  assert.equal(full.complete, true);
+  assert.deepEqual(full.observedProjects, ['/first', '/later']);
+  assert.equal(records.length, 2);
+});
+
+test('damaged zstd streams stay incomplete and uncached even after complete JSONL records', async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  const valid = zstdCompressSync(codexHistory('one'));
+  for (const damaged of [Buffer.alloc(0), Buffer.from('invalid frame'), valid.subarray(0, valid.length - 2), Buffer.concat([valid, Buffer.from('invalid trailing frame')]), Buffer.concat([valid, valid.subarray(0, valid.length - 2)])]) {
+    const path = await file(root, 'sessions/one.jsonl.zst', damaged);
+    const result = await analyze(await scanRoot(root, 'codex'), { deep: true, stateDir });
+    assert.equal(result.scanComplete, false);
+    assert.equal(result.usage.verified, false);
+    assert.ok(result.warnings.some(w => w.includes('Cannot read session')));
+    assert.deepEqual(await readdir(join(stateDir, 'providers/codex/cache')).catch(() => []), []);
+    assert.deepEqual(await readFile(path), damaged);
+  }
+});
+
+test('decoding can be cancelled without caching partial results or touching the compressed source', { timeout: 5000 }, async t => {
+  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
+  const compressed = zstdCompressSync(codexHistory('one') + jsonl([{ type: 'padding', payload: 'x'.repeat(4096) }]).repeat(2048));
+  const path = await file(root, 'sessions/one.jsonl.zst', compressed);
+  const controller = new AbortController();
+  const result = await analyze(await scanRoot(root, 'codex'), { deep: true, stateDir, signal: controller.signal, onProgress: p => {
+    if (p.phase === 'sessions' && p.processedBytes! > 0) controller.abort();
+  } });
+  assert.equal(controller.signal.aborted, true);
+  assert.equal(result.scanComplete, false);
+  assert.equal(result.usage.verified, false);
+  assert.equal(result.sessions[0].complete, false);
+  assert.deepEqual(await readdir(join(stateDir, 'providers/codex/cache')).catch(() => []), []);
+  assert.deepEqual(await readFile(path), compressed);
+});
+
+test('Claude workflow journals remain inventoried without being parsed as conversations', async t => {
+  const root = await fixture(t);
+  await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main' }]));
+  const journal = await file(root, 'projects/p/main/subagents/workflows/wf-one/journal.jsonl', jsonl([{ event: 'started' }]));
+  await file(root, 'projects/p/main/subagents/agent-child.jsonl', jsonl([{ type: 'user', sessionId: 'main', agentId: 'child' }]));
+  const inventory = await scanRoot(root, 'claude');
+  assert.equal(inventory.files.find(f => f.path === journal)?.category, 'attachments');
+  const result = await analyze(inventory, { deep: true });
+  assert.equal(result.scanComplete, true);
+  assert.deepEqual(result.sessions.map(s => s.id).sort(), ['child', 'main']);
+  assert.ok(result.sessions.every(s => s.files.every(f => f.path !== journal)));
+  assert.equal(result.fileCount, 3);
+  await file(root, 'projects/p/unknown.jsonl', jsonl([{ event: 'unknown' }]));
+  const unknown = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(unknown.scanComplete, false, 'unrecognized transcript files must still be reported');
+});
+
+test('Claude tool-ID maps are counted as fields without exhausting the field group limit', async t => {
+  const root = await fixture(t);
+  const wireToolInputs = Object.fromEntries(Array.from({ length: 1100 }, (_, i) => [`toolu_${i}`, { command: 'private command' }]));
+  const wireIngestContext = Object.fromEntries(Array.from({ length: 1100 }, (_, i) => [`toolu_${i}`, { source: 'private context' }]));
+  await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main', wireToolInputs, wireIngestContext, message: { content: 'hello' } }]));
+  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+  assert.equal(result.scanComplete, true);
+  for (const [path, value] of Object.entries({ wireToolInputs, wireIngestContext })) {
+    assert.deepEqual(result.opportunities.fields.find(f => f.path === path), { path, bytes: Buffer.byteLength(JSON.stringify(value)), count: 1 });
+  }
+  assert.ok(result.opportunities.fields.some(f => f.path === 'message.content'));
+  assert.ok(result.opportunities.fields.every(f => !f.path.includes('toolu_')));
+});
+
+test('changed or unreadable transcripts report the read failure without cascading identity warnings', async t => {
+  const root = await fixture(t);
+  const path = await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main' }]));
+  const inventory = await scanRoot(root, 'claude');
+  await writeFile(path, 'changed');
+  const changed = await parseSession(inventory.files[0], 'claude', true);
+  assert.equal(changed.complete, false);
+  assert.deepEqual(changed.warnings, ['Cannot read session: FILE_CHANGED']);
+  const unreadable = await parseSession({ ...inventory.files[0], path: join(root, 'missing.jsonl') }, 'claude', true);
+  assert.equal(unreadable.complete, false);
+  assert.deepEqual(unreadable.warnings, ['Cannot read session: ENOENT']);
+  const malformed = await parseSession((await scanRoot(root, 'claude')).files[0], 'claude', true);
+  assert.equal(malformed.complete, false);
+  assert.ok(malformed.warnings.some(w => w.includes('malformed JSONL')));
+});
 
 test('analysis progress counts unique session files and bytes, including cache hits', async t => {
   const base = await fixture(t), root = join(base, 'root');
@@ -422,6 +626,36 @@ test('analysis cache never writes or evicts through a symlinked state ancestor',
   assert.equal((await readdir(cache)).length, 514);
 });
 
+test('mixed Claude versions do not make a structurally consistent session incomplete', async t => {
+  const root = await fixture(t);
+  for (const version of ['unknown-new-format', '2.1.300']) {
+    await file(root, 'projects/p/s1.jsonl', jsonl([
+      { type: 'user', sessionId: 's1', version, message: { content: 'first' } },
+      { type: 'user', sessionId: 's1', version: '2.1.319', message: { content: 'second' } },
+    ]));
+    const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+    assert.equal(result.sessions[0].complete, true);
+    assert.equal(result.scanComplete, true);
+    assert.equal(result.sessions[0].version, '2.1.319');
+  }
+});
+
+test('Codex metadata versions do not hide identity conflicts or block consistent records', async t => {
+  const root = await fixture(t);
+  for (const id of ['s1', 'different-session']) {
+    const content = jsonl([
+      { type: 'session_meta', payload: { id: 's1', cli_version: '0.154.0' } },
+      { type: 'session_meta', payload: { id, cli_version: 'custom-build' } },
+    ]);
+    const path = await file(root, 'sessions/s1.jsonl', content);
+    const result = await parseSession((await scanRoot(root, 'codex')).files[0], 'codex', true);
+    assert.equal(result.version, 'custom-build');
+    assert.equal(result.complete, id === 's1');
+    assert.deepEqual(result.warnings, id === 's1' ? [] : ['Multiple session identities in one rollout']);
+    assert.equal(await readFile(path, 'utf8'), content);
+  }
+});
+
 test('cyclic session graphs are incomplete instead of an empty deletion root set', async t => {
   const root = await fixture(t);
   const first = await file(root, 'sessions/first.jsonl', jsonl([{ type: 'session_meta', payload: { id: 'first', source: { subagent: { thread_spawn: { parent_thread_id: 'second' } } } } }]));
@@ -478,250 +712,4 @@ test('Codex spawn graph exceeding its bounded row limit cannot validate deletion
   assert.equal(result.complete, false);
   assert.equal(result.fingerprint, null);
   assert.match(result.warnings.join(' '), /edge limit/);
-});
-import { parseSession } from '../src/providers/jsonl.ts';
-
-test('mixed Claude versions do not make a structurally consistent session incomplete', async t => {
-  const root = await fixture(t);
-  for (const version of ['unknown-new-format', '2.1.300']) {
-    await file(root, 'projects/p/s1.jsonl', jsonl([
-      { type: 'user', sessionId: 's1', version, message: { content: 'first' } },
-      { type: 'user', sessionId: 's1', version: '2.1.319', message: { content: 'second' } },
-    ]));
-    const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
-    assert.equal(result.sessions[0].complete, true);
-    assert.equal(result.scanComplete, true);
-    assert.equal(result.sessions[0].version, '2.1.319');
-  }
-});
-
-test('Codex metadata versions do not hide identity conflicts or block consistent records', async t => {
-  const root = await fixture(t);
-  for (const id of ['s1', 'different-session']) {
-    const content = jsonl([
-      { type: 'session_meta', payload: { id: 's1', cli_version: '0.154.0' } },
-      { type: 'session_meta', payload: { id, cli_version: 'custom-build' } },
-    ]);
-    const path = await file(root, 'sessions/s1.jsonl', content);
-    const result = await parseSession((await scanRoot(root, 'codex')).files[0], 'codex', true);
-    assert.equal(result.version, 'custom-build');
-    assert.equal(result.complete, id === 's1');
-    assert.deepEqual(result.warnings, id === 's1' ? [] : ['Multiple session identities in one rollout']);
-    assert.equal(await readFile(path, 'utf8'), content);
-  }
-});
-
-
-test('Claude workflow journals remain inventoried without being parsed as conversations', async t => {
-  const root = await fixture(t);
-  await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main' }]));
-  const journal = await file(root, 'projects/p/main/subagents/workflows/wf-one/journal.jsonl', jsonl([{ event: 'started' }]));
-  await file(root, 'projects/p/main/subagents/agent-child.jsonl', jsonl([{ type: 'user', sessionId: 'main', agentId: 'child' }]));
-  const inventory = await scanRoot(root, 'claude');
-  assert.equal(inventory.files.find(f => f.path === journal)?.category, 'attachments');
-  const result = await analyze(inventory, { deep: true });
-  assert.equal(result.scanComplete, true);
-  assert.deepEqual(result.sessions.map(s => s.id).sort(), ['child', 'main']);
-  assert.ok(result.sessions.every(s => s.files.every(f => f.path !== journal)));
-  assert.equal(result.fileCount, 3);
-  await file(root, 'projects/p/unknown.jsonl', jsonl([{ event: 'unknown' }]));
-  const unknown = await analyze(await scanRoot(root, 'claude'), { deep: true });
-  assert.equal(unknown.scanComplete, false, 'unrecognized transcript files must still be reported');
-});
-
-
-test('Claude tool-ID maps are counted as fields without exhausting the field group limit', async t => {
-  const root = await fixture(t);
-  const wireToolInputs = Object.fromEntries(Array.from({ length: 1100 }, (_, i) => [`toolu_${i}`, { command: 'private command' }]));
-  const wireIngestContext = Object.fromEntries(Array.from({ length: 1100 }, (_, i) => [`toolu_${i}`, { source: 'private context' }]));
-  await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main', wireToolInputs, wireIngestContext, message: { content: 'hello' } }]));
-  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
-  assert.equal(result.scanComplete, true);
-  for (const [path, value] of Object.entries({ wireToolInputs, wireIngestContext })) {
-    assert.deepEqual(result.opportunities.fields.find(f => f.path === path), { path, bytes: Buffer.byteLength(JSON.stringify(value)), count: 1 });
-  }
-  assert.ok(result.opportunities.fields.some(f => f.path === 'message.content'));
-  assert.ok(result.opportunities.fields.every(f => !f.path.includes('toolu_')));
-});
-
-
-test('changed or unreadable transcripts report the read failure without cascading identity warnings', async t => {
-  const root = await fixture(t);
-  const path = await file(root, 'projects/p/main.jsonl', jsonl([{ type: 'user', sessionId: 'main' }]));
-  const inventory = await scanRoot(root, 'claude');
-  await writeFile(path, 'changed');
-  const changed = await parseSession(inventory.files[0], 'claude', true);
-  assert.equal(changed.complete, false);
-  assert.deepEqual(changed.warnings, ['Cannot read session: FILE_CHANGED']);
-  const unreadable = await parseSession({ ...inventory.files[0], path: join(root, 'missing.jsonl') }, 'claude', true);
-  assert.equal(unreadable.complete, false);
-  assert.deepEqual(unreadable.warnings, ['Cannot read session: ENOENT']);
-  const malformed = await parseSession((await scanRoot(root, 'claude')).files[0], 'claude', true);
-  assert.equal(malformed.complete, false);
-  assert.ok(malformed.warnings.some(w => w.includes('malformed JSONL')));
-});
-
-import { zstdCompressSync } from 'node:zlib';
-
-import { randomBytes } from 'node:crypto';
-
-
-function codexHistory(id: string, input = 10) {
-  return jsonl([
-    { type: 'session_meta', payload: { id, cwd: '/project', timestamp: stamp, cli_version: '0.167.0' } },
-    { type: 'turn_context', payload: { model: 'test-model' } },
-    { type: 'event_msg', timestamp: stamp, payload: { type: 'user_message', message: '原始文本'.repeat(20_000) } },
-    { type: 'response_item', payload: { type: 'function_call', call_id: 'call-1' } },
-    { type: 'event_msg', timestamp: stamp, payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: 5, cached_input_tokens: 3, reasoning_output_tokens: 2 } } } },
-  ]);
-}
-
-
-test('Codex reads current and archived zstd histories with plain-path indexes and physical-byte progress', async t => {
-  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
-  const content = Buffer.from(codexHistory('current') + jsonl([{ type: 'padding', payload: randomBytes(192 * 1024).toString('base64') }]));
-  // Separate frames split a UTF-8 JSONL record, as a streaming decoder may do.
-  const compressed = Buffer.concat([zstdCompressSync(''), zstdCompressSync(content.subarray(0, 1111)), zstdCompressSync(content.subarray(1111))]);
-  assert.ok(compressed.length > 64 * 1024, 'compressed input must span multiple file reads');
-  const current = await file(root, 'sessions/current.jsonl.zst', compressed);
-  const archived = await file(root, 'archived_sessions/archived.jsonl.zst', zstdCompressSync(codexHistory('archived', 20)));
-  await file(base, 'reference/sessions/current.jsonl', content);
-  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
-  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
-  for (const [id, path] of [['current', current], ['archived', archived]]) db.prepare('INSERT INTO threads VALUES (?, ?, ?)').run(id, path.slice(0, -4), '/project');
-  db.close();
-  const inventory = await scanRoot(root, 'codex'), histories = inventory.files.filter(f => f.category === 'sessions');
-  assert.equal(histories.length, 2);
-  const plain = await parseSession((await scanRoot(join(base, 'reference'), 'codex')).files[0], 'codex', true);
-  assert.deepEqual(await parseSession(histories.find(f => f.path === current)!, 'codex', true), plain);
-  assert.equal((await parseSession(histories.find(f => f.path === current)!, 'codex', false)).complete, true);
-  for (let run = 0; run < 2; run++) {
-    const events: ScanProgress[] = [];
-    const result = await analyze(inventory, { deep: true, stateDir, onProgress: p => events.push(p) });
-    assert.equal(result.scanComplete, true);
-    assert.equal(result.sessions.length, 2);
-    assert.ok(result.sessions.every(s => s.complete && !s.indexOnly));
-    assert.equal(result.sessions.find(s => s.id === 'archived')?.archived, true);
-    assert.equal(result.usage.inputTokens, 30);
-    assert.equal(result.usage.outputTokens, 10);
-    assert.equal(result.usage.verified, true);
-    assert.equal(result.usage.byModel['test-model'].inputTokens, 30);
-    assert.equal(result.usage.byDate[stamp.slice(0, 10)].inputTokens, 30);
-    const diskBytes = histories.reduce((n, f) => n + f.size, 0);
-    assert.equal(result.projects[0].bytes, diskBytes);
-    assert.equal(result.projects[0].bytes + result.sharedBytes + result.unattributedBytes, result.totalBytes);
-    assert.ok(result.opportunities.recordTypes.reduce((n, item) => n + item.bytes, 0) > diskBytes);
-    const progress = events.filter(p => p.phase === 'sessions');
-    assert.equal(progress.at(-1)?.processedBytes, diskBytes);
-    assert.equal(progress.at(-1)?.totalBytes, diskBytes);
-    assert.equal(progress.at(-1)?.completed, 2);
-    for (let i = 1; i < progress.length; i++) assert.ok(progress[i].processedBytes! >= progress[i - 1].processedBytes! && progress[i].processedBytes! <= diskBytes);
-    assert.equal((await readdir(join(stateDir, 'providers/codex/cache'))).length, 2);
-    if (run) assert.equal(progress.length, 5, 'both compressed histories were served from cache');
-  }
-  assert.deepEqual(await readFile(current), compressed);
-  assert.equal((await scanRoot(root, 'claude')).files.filter(f => f.category === 'sessions').length, 0);
-});
-
-
-test('Codex prefers a plain sibling without double counting usage or assuming compressed contents match', async t => {
-  const root = await fixture(t);
-  const content = codexHistory('one');
-  const path = await file(root, 'sessions/one.jsonl', content);
-  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
-  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
-  db.prepare('INSERT INTO threads VALUES (?, ?)').run('one', path);
-  db.close();
-  for (const sibling of [zstdCompressSync(content), zstdCompressSync(codexHistory('stale-id', 999)), Buffer.from('not zstd')]) {
-    await file(root, 'sessions/one.jsonl.zst', sibling);
-    const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
-    assert.equal(result.sessions.length, 1);
-    assert.equal(result.sessions[0].id, 'one');
-    assert.equal(result.sessions[0].files.length, 2);
-    assert.equal(result.sessions[0].bytes, Buffer.byteLength(content) + sibling.length);
-    assert.equal(result.usage.inputTokens, 10);
-    assert.equal(result.usage.verified, true, 'preferred plain usage remains verifiable');
-    assert.equal(result.usage.parsedFiles, 1);
-    assert.equal(result.usage.totalFiles, 1);
-    assert.equal(result.opportunities.recordTypes.find(r => r.type === 'session_meta')?.count, 1);
-    assert.equal(result.scanComplete, false, 'unverified sibling ownership must not authorize deletion');
-    assert.equal(result.sessions[0].complete, false);
-    assert.ok(result.warnings.some(w => w.includes('compressed sibling')));
-  }
-  await file(root, 'sessions/one.jsonl.zst', zstdCompressSync(content));
-  await writeFile(path, 'malformed plain history');
-  const brokenPlain = await analyze(await scanRoot(root, 'codex'), { deep: true });
-  assert.equal(brokenPlain.usage.inputTokens, null, 'never fall back to potentially stale compressed usage');
-  await writeFile(path, content);
-  await file(root, 'sessions/unrelated.jsonl.zst', zstdCompressSync(content));
-  const duplicate = await analyze(await scanRoot(root, 'codex'), { deep: true });
-  assert.equal(duplicate.usage.inputTokens, null, 'unrelated paths with duplicate IDs are still excluded');
-  assert.ok(duplicate.sessions[0].warnings.some(w => w.includes('Multiple distinct files')));
-});
-
-
-test('Codex compressed path aliases detect index/session identity mismatches', async t => {
-  const root = await fixture(t);
-  const path = await file(root, 'sessions/one.jsonl.zst', zstdCompressSync(codexHistory('one')));
-  const db = new DatabaseSync(join(root, 'state_5.sqlite'));
-  db.exec('CREATE TABLE threads (id TEXT, rollout_path TEXT); CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)');
-  db.prepare('INSERT INTO threads VALUES (?, ?)').run('different', path.slice(0, -4));
-  db.close();
-  const result = await analyze(await scanRoot(root, 'codex'), { deep: true });
-  assert.equal(result.sessions.length, 1);
-  assert.equal(result.sessions[0].complete, false);
-  assert.ok(result.sessions[0].warnings.includes('Index/session ID mismatch'));
-});
-
-
-test('compressed metadata sampling is bounded by decoded bytes while record visitors read the full stream', async t => {
-  const root = await fixture(t), limit = 1024 * 1024;
-  const header = jsonl([{ type: 'session_meta', payload: { id: 'one', cwd: '/first' } }]);
-  const exact = header + ' '.repeat(limit - Buffer.byteLength(header));
-  const path = await file(root, 'sessions/one.jsonl.zst', zstdCompressSync(exact));
-  assert.equal((await parseSession((await scanRoot(root, 'codex')).files[0], 'codex', false)).complete, true);
-  await writeFile(path, zstdCompressSync(exact + '\n' + jsonl([{ type: 'turn_context', payload: { cwd: '/later' } }])));
-  const entry = (await scanRoot(root, 'codex')).files[0];
-  assert.ok(entry.size < 1024, 'small disk size must not bypass the decoded sample limit');
-  const sampled = await parseSession(entry, 'codex', false);
-  assert.equal(sampled.complete, false);
-  assert.deepEqual(sampled.observedProjects, ['/first']);
-  assert.ok(sampled.warnings.some(w => w.includes('first 1 MiB')));
-  const records: unknown[] = [];
-  const full = await parseSession(entry, 'codex', false, undefined, undefined, row => records.push(row));
-  assert.equal(full.complete, true);
-  assert.deepEqual(full.observedProjects, ['/first', '/later']);
-  assert.equal(records.length, 2);
-});
-
-
-test('damaged zstd streams stay incomplete and uncached even after complete JSONL records', async t => {
-  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
-  const valid = zstdCompressSync(codexHistory('one'));
-  for (const damaged of [Buffer.alloc(0), Buffer.from('invalid frame'), valid.subarray(0, valid.length - 2), Buffer.concat([valid, Buffer.from('invalid trailing frame')]), Buffer.concat([valid, valid.subarray(0, valid.length - 2)])]) {
-    const path = await file(root, 'sessions/one.jsonl.zst', damaged);
-    const result = await analyze(await scanRoot(root, 'codex'), { deep: true, stateDir });
-    assert.equal(result.scanComplete, false);
-    assert.equal(result.usage.verified, false);
-    assert.ok(result.warnings.some(w => w.includes('Cannot read session')));
-    assert.deepEqual(await readdir(join(stateDir, 'providers/codex/cache')).catch(() => []), []);
-    assert.deepEqual(await readFile(path), damaged);
-  }
-});
-
-
-test('decoding can be cancelled without caching partial results or touching the compressed source', { timeout: 5000 }, async t => {
-  const base = await fixture(t), root = join(base, 'root'), stateDir = join(base, 'state');
-  const compressed = zstdCompressSync(codexHistory('one') + jsonl([{ type: 'padding', payload: 'x'.repeat(4096) }]).repeat(2048));
-  const path = await file(root, 'sessions/one.jsonl.zst', compressed);
-  const controller = new AbortController();
-  const result = await analyze(await scanRoot(root, 'codex'), { deep: true, stateDir, signal: controller.signal, onProgress: p => {
-    if (p.phase === 'sessions' && p.processedBytes! > 0) controller.abort();
-  } });
-  assert.equal(controller.signal.aborted, true);
-  assert.equal(result.scanComplete, false);
-  assert.equal(result.usage.verified, false);
-  assert.equal(result.sessions[0].complete, false);
-  assert.deepEqual(await readdir(join(stateDir, 'providers/codex/cache')).catch(() => []), []);
-  assert.deepEqual(await readFile(path), compressed);
 });

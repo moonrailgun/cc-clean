@@ -25,7 +25,189 @@ const snapshot = (n: number) => ({type: 'compacted', payload: {
   replacement_history: [{type: 'message', role: 'user', content: [{type: 'input_text', text: `Checkpoint ${n}`}]}],
   replacement_history_metadata: [{}],
 }});
+const archives = [
+  {type: 'api-request-blob', sessionId: 'synthetic', hash: 'blob', message: {role: 'user', content: 'archived prompt'}},
+  {type: 'api-request-shape', sessionId: 'synthetic', shapeHash: 'shape', shape: {model: 'example'}},
+  {type: 'api-request', sessionId: 'synthetic', id: 'request', shapeHash: 'shape', params: {}, base: 'previous', keep: 0, tail: ['blob'], cacheControl: [], requestDigest: 'digest'},
+];
+const successfulHook = {
+  type: 'attachment', sessionId: 'synthetic', uuid: 'hook-id', parentUuid: 'user-id', timestamp: '2026-11-01T00:00:00Z',
+  attachment: {type: 'hook_success', hookName: 'SessionStart:resume', hookEvent: 'SessionStart', toolUseID: 'tool-id',
+    command: 'echo saved-command', content: 'saved context', stdout: 'saved output', stderr: 'saved diagnostic', exitCode: 0, durationMs: 12},
+  rendered: [{content: 'model-facing context'}],
+};
+const toolSnapshot = {
+  type: 'attachment', sessionId: 'synthetic', uuid: 'snapshot-id', parentUuid: 'user-id', timestamp: '2026-11-01T00:00:00Z',
+  attachment: {type: 'prompt_snapshot', systemPrompt: ['Keep system instructions'], cliPrefix: 'keep', reminderFold: true,
+    systemTurns: true, toolChangeHeader: true, inlineTools: true, keptReminders: true, echoWireToolInputs: false, contextRendering: 'keep',
+    tools: [{name: 'Read', description: 'Read a file', schema: {name: 'Read', description: 'Read a file',
+      input_schema: {type: 'object', properties: {path: {type: 'string'}}, required: ['path']}, eager_input_streaming: true}}]},
+};
+const skillListing = {
+  type: 'attachment', sessionId: 'synthetic', uuid: 'skills-id', parentUuid: 'snapshot-id', timestamp: '2026-11-01T00:00:00Z',
+  attachment: {type: 'skill_listing', content: 'Available skills and their descriptions', names: ['example'], skillCount: 1, isInitial: true},
+  rendered: [{content: 'Rendered skill descriptions'}], renderedRole: 'user',
+};
+
+test('Claude tool and skill slimming preserve raw prompts, chat, cost and graph while resetting skill discovery', () => {
+  const user = JSON.stringify(claude('user', [{type: 'text', text: 'Keep 用户 text'}], {uuid: 'user-id', parentUuid: null}));
+  const assistant = JSON.stringify(claude('assistant', [{type: 'thinking', thinking: 'keep', signature: 'keep-signature'}],
+    {uuid: 'assistant-id', parentUuid: 'skills-id', usage: {input_tokens: 123, output_tokens: 45}}));
+  const cost = '{ "type":"cost-state", "sessionId":"synthetic", "cost":1.230000, "large":9007199254740993 }';
+  const rawSnapshot = JSON.stringify(toolSnapshot).replace('"cliPrefix":"keep"', '"cliPrefix" : "keep"')
+    .replace('"timestamp":', '"extra":9007199254740993, "timestamp":');
+  const listing = JSON.stringify(skillListing).replace('"skillCount":1', '"skillCount" : 1');
+  const clearedSnapshot = rawSnapshot.replace(JSON.stringify(toolSnapshot.attachment.tools), '[]');
+  const clearedListing = listing.replace(JSON.stringify(skillListing.attachment.content), '""')
+    .replace(JSON.stringify(skillListing.attachment.names), '[]').replace('"skillCount" : 1', '"skillCount" : 0')
+    .replace(JSON.stringify(skillListing.rendered), '[]');
+  for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
+    const rows = [user, rawSnapshot, listing, assistant, cost];
+    const input = Buffer.from(rows.join(newline) + finalNewline);
+    for (const [compactToolDefinitions, compactSkillListings] of [[true, false], [false, true], [true, true]]) {
+      const options = {removeImages: false, compactTools: false, compactToolDefinitions, compactSkillListings};
+      const result = slimHistory(input, 'claude', options);
+      assert.equal(result.output?.toString(), [user, compactToolDefinitions ? clearedSnapshot : rawSnapshot,
+        compactSkillListings ? clearedListing : listing, assistant, cost].join(newline) + finalNewline);
+      assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
+        ...(compactToolDefinitions ? {toolDefinitions: 1} : {}), ...(compactSkillListings ? {skillListings: 1} : {})});
+      assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
+      assert.equal(slimHistory(result.output!, 'claude', options).output, null);
+    }
+  }
+});
+
+test('Claude slimming clears every recognized snapshot and resets initial and subsequent skill inventories', () => {
+  const tool = toolSnapshot.attachment.tools[0];
+  const nextSnapshot = {...toolSnapshot, uuid: 'snapshot-2', parentUuid: skillListing.uuid,
+    attachment: {...toolSnapshot.attachment, systemPrompt: ['Keep updated instructions'],
+      tools: [tool, {...tool, name: 'Other', schema: {...tool.schema, name: 'Other'}}]}};
+  const nextListing = {...skillListing, uuid: 'skills-2', parentUuid: nextSnapshot.uuid, rendered: undefined,
+    attachment: {...skillListing.attachment, content: '', isInitial: false,
+      names: Array.from({length: 12}, (_, i) => `skill-${i}`), skillCount: 12}};
+  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true, compactSkillListings: true};
+  const input = jsonl(toolSnapshot, skillListing, nextSnapshot, nextListing);
+  const result = slimHistory(input, 'claude', options);
+  assert.deepEqual(result.output, jsonl(
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: []}},
+    {...skillListing, attachment: {...skillListing.attachment, content: '', names: [], skillCount: 0}, rendered: []},
+    {...nextSnapshot, attachment: {...nextSnapshot.attachment, tools: []}},
+    {...nextListing, attachment: {...nextListing.attachment, content: '', names: [], skillCount: 0}},
+  ));
+  assert.deepEqual(result.counts, {images: 0, toolOutputs: 0, toolDefinitions: 3, skillListings: 2});
+  assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
+  assert.equal(slimHistory(result.output!, 'claude', options).output, null);
+});
+
+test('tool and skill slimming retains unknown shapes, other attachments and disabled or Codex content', () => {
+  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true, compactSkillListings: true};
+  const tool = toolSnapshot.attachment.tools[0];
+  for (const row of [
+    {...toolSnapshot, uuid: undefined}, {...toolSnapshot, parentUuid: undefined},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, newContext: 'retain'}},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, systemPrompt: 'unexpected'}},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: [{...tool, signature: 'retain'}]}},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: [{...tool, schema: {name: 'Read'}}]}},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: [{...tool, schema: {...tool.schema, newState: 'retain'}}]}},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: undefined}},
+    {...toolSnapshot, attachment: {...toolSnapshot.attachment, reminderFold: 'unexpected'}},
+    {...skillListing, attachment: {...skillListing.attachment, names: ['example', 'mismatch']}},
+    {...skillListing, attachment: {...skillListing.attachment, skillCount: -1}},
+    {...skillListing, attachment: {...skillListing.attachment, content: null}},
+    {...skillListing, attachment: {...skillListing.attachment, newState: 'retain'}},
+    {...skillListing, attachment: {...skillListing.attachment, isInitial: 'unexpected'}},
+    {...skillListing, rendered: [{content: 'keep', signature: 'retain'}]},
+    {...skillListing, rendered: 'unknown'}, {...skillListing, attachment: {...skillListing.attachment, type: 'other'}},
+    successfulHook,
+  ]) assert.equal(slimHistory(jsonl(row), 'claude', options).output, null);
+  assert.equal(slimHistory(jsonl(toolSnapshot, skillListing), 'claude', {removeImages: false, compactTools: false}).output, null);
+  assert.equal(slimHistory(jsonl(meta, toolSnapshot, skillListing), 'codex', options).output, null);
+  const result = slimHistory(jsonl({...skillListing, rendered: undefined}, {...toolSnapshot, version: 'future-version'}), 'claude', options);
+  assert.equal(result.counts.skillListings, 1);
+  assert.equal(result.counts.toolDefinitions, 1);
+  assert.equal(JSON.parse(result.output!.toString().split('\n')[0]).attachment.skillCount, 0);
+});
+
+test('Claude archive and hook slimming preserve raw conversation, cost and graph bytes independently and together', () => {
+  const user = JSON.stringify(claude('user', [{type: 'text', text: 'Keep 用户 text'}], {uuid: 'user-id', parentUuid: null}));
+  const assistant = JSON.stringify(claude('assistant', [{type: 'thinking', thinking: 'keep', signature: 'keep-signature'}],
+    {uuid: 'assistant-id', parentUuid: 'hook-id', usage: {input_tokens: 123, output_tokens: 45}}));
+  const cost = '{ "type":"cost-state", "sessionId":"synthetic", "cost":1.230000, "large":9007199254740993 }';
+  const hook = JSON.stringify(successfulHook).replace('"durationMs":12', '"durationMs":12.000');
+  const cleared = JSON.stringify({...successfulHook, attachment: {...successfulHook.attachment,
+    command: '', content: '', stdout: '', stderr: ''}, rendered: []}).replace('"durationMs":12', '"durationMs":12.000');
+  for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
+    const rows = [user, hook, ...archives.map(row => JSON.stringify(row)), assistant, cost];
+    const input = Buffer.from(rows.join(newline) + finalNewline);
+    for (const [removeRequestArchives, compactHooks] of [[true, false], [false, true], [true, true]]) {
+      const options = {removeImages: false, compactTools: false, removeRequestArchives, compactHooks};
+      const result = slimHistory(input, 'claude', options);
+      const expected = [user, compactHooks ? cleared : hook, ...(removeRequestArchives ? [] : rows.slice(2, 5)), assistant, cost];
+      assert.equal(result.output?.toString(), expected.join(newline) + finalNewline);
+      assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
+        ...(removeRequestArchives ? {requestRecords: 3} : {}), ...(compactHooks ? {hooks: 1} : {})});
+      assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
+      assert.equal(slimHistory(result.output!, 'claude', options).output, null);
+    }
+  }
+});
+
+test('Claude archives handle a final row without newline and retain unknown archive families or archive-only files', () => {
+  const options = {removeImages: false, compactTools: false, removeRequestArchives: true};
+  const conversation = jsonl(claude('user', []));
+  const input = Buffer.concat([conversation, Buffer.from(JSON.stringify(archives[0]))]);
+  const result = slimHistory(input, 'claude', options);
+  assert.deepEqual(result.output, conversation);
+  assert.equal(result.savingsBytes.requestRecords, input.length - conversation.length);
+  assert.equal(slimHistory(jsonl(...archives), 'claude', options).output, null);
+  for (const unknown of [
+    {...archives[0], usage: {input_tokens: 123}}, {...archives[0], message: 'unexpected'},
+    {...archives[1], shape: null}, {...archives[2], tail: [12]}, {...archives[2], keep: -1},
+    {type: 'api-request-new', sessionId: 'synthetic'},
+  ]) assert.equal(slimHistory(jsonl(claude('user', []), ...archives, unknown), 'claude', options).output, null);
+  assert.throws(() => slimHistory(jsonl(claude('user', []), {...archives[0], sessionId: 'other'}), 'claude', options), /Mixed/);
+  assert.throws(() => slimHistory(Buffer.concat([input, Buffer.from('\nnot-json')]), 'claude', options), /Malformed/);
+});
+
+test('hook compaction retains failures, unknown payloads, prompt snapshots and graph-less records', () => {
+  const options = {removeImages: false, compactTools: false, compactHooks: true};
+  for (const hook of [
+    {...successfulHook, attachment: {...successfulHook.attachment, exitCode: 1}},
+    {...successfulHook, attachment: {...successfulHook.attachment, type: 'hook_error'}},
+    {...successfulHook, attachment: {...successfulHook.attachment, type: 'prompt_snapshot'}},
+    {...successfulHook, attachment: {...successfulHook.attachment, content: null}},
+    {...successfulHook, attachment: {...successfulHook.attachment, newContext: 'retain'}},
+    {...successfulHook, uuid: undefined}, {...successfulHook, parentUuid: undefined},
+    {...successfulHook, rendered: [{content: 'keep', signature: 'new-field'}]},
+    {...successfulHook, rendered: 'unrecognized'},
+  ]) assert.equal(slimHistory(jsonl(claude('user', []), hook), 'claude', options).output, null);
+  const withoutRendered = {...successfulHook, rendered: undefined};
+  assert.equal(slimHistory(jsonl(withoutRendered), 'claude', options).counts.hooks, 1);
+  const input = jsonl(meta, ...archives, successfulHook);
+  assert.equal(slimHistory(input, 'codex', {...options, removeRequestArchives: true}).output, null);
+});
 const matches = Array.from({length: 40}, (_, i) => `src/very-long-directory-name/example.ts:${i + 1}:matching source line ${i}`).join('\n');
+test('Claude Quick clean combines all history operations without double counting', () => {
+  const input = jsonl(
+    claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}]),
+    claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: matches}]),
+    ...archives, successfulHook, toolSnapshot, skillListing,
+  );
+  const options = {...both, removeRequestArchives: true, compactHooks: true, compactToolDefinitions: true, compactSkillListings: true};
+  const result = slimHistory(input, 'claude', options);
+  assert.ok(result.output);
+  assert.deepEqual(result.counts, {images: 1, toolOutputs: 1, requestRecords: 3, hooks: 1, toolDefinitions: 1, skillListings: 1});
+  let savings = 0;
+  for (const option of ['removeImages', 'compactTools', 'removeRequestArchives', 'compactHooks', 'compactToolDefinitions', 'compactSkillListings'] as const) {
+    const separate = slimHistory(input, 'claude', {removeImages: false, compactTools: false, [option]: true});
+    assert.ok(separate.output);
+    savings += input.length - separate.output.length;
+  }
+  assert.equal(savings, input.length - result.output.length);
+  assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), savings);
+  assert.equal(slimHistory(result.output, 'claude', options).output, null);
+});
+
 const compacted = (buffer: Buffer, provider: 'claude' | 'codex', options = both) => {
   const result = slimHistory(buffer, provider, options);
   assert.ok(result.output);
@@ -68,6 +250,28 @@ test('Claude image replacement preserves untouched bytes, signatures, numeric li
   assert.equal(result.output!.toString(), raw.replace(JSON.stringify(image), JSON.stringify({type: 'text', text: '[image removed]'})));
   assert.deepEqual(input, before);
   assert.deepEqual(result.counts, {images: 1, toolOutputs: 0});
+});
+
+test('Claude slimming follows record shape across old, new and mixed versions', () => {
+  const versions = ['2.1.246', '2.1.277', '2.1.300', '2.1.319', '2.1.320', '3.0.0', 'custom-build', undefined];
+  for (const version of versions) {
+    const call = claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}], {version, uuid: 'call'});
+    for (const resultVersion of [version, '2.1.319']) {
+      const result = claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: matches}], {version: resultVersion, uuid: 'result', parentUuid: 'call'});
+      const input = jsonl(call, result), before = Buffer.from(input);
+      const originals = input.toString().trim().split('\n').map(line => JSON.parse(line));
+      const rewritten = compacted(input, 'claude');
+      assert.deepEqual(rewritten.counts, {images: 1, toolOutputs: 1});
+      const rows = rewritten.output!.toString().trim().split('\n').map(line => JSON.parse(line));
+      assert.deepEqual(rows[0], originals[0]);
+      assert.deepEqual(rows[1], {...originals[1], message: {content: [
+        {type: 'text', text: '[image removed]'},
+        {type: 'tool_result', tool_use_id: 'a', is_error: false, content: rows[1].message.content[1].content},
+      ]}});
+      assert.match(rows[1].message.content[1].content, /RTK output compacted/);
+      assert.deepEqual(input, before);
+    }
+  }
 });
 
 test('Codex legacy slimming follows record shape rather than the CLI version', () => {
@@ -315,220 +519,6 @@ test('reasoning removal preserves compaction, nested history, unknown ciphertext
     ...[null, '', 123, {data: 'opaque'}].map(encrypted_content => codex({...encrypted, encrypted_content})));
   assert.equal(slimHistory(input, 'codex', options).output, null);
   assert.equal(slimHistory(jsonl(claude('assistant', [{type: 'thinking', thinking: 'Keep', encrypted_content: 'opaque', signature: 'signed'}])), 'claude', options).output, null);
-});
-
-test('Claude slimming follows record shape across old, new and mixed versions', () => {
-  const versions = ['2.1.246', '2.1.277', '2.1.300', '2.1.319', '2.1.320', '3.0.0', 'custom-build', undefined];
-  for (const version of versions) {
-    const call = claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}], {version, uuid: 'call'});
-    for (const resultVersion of [version, '2.1.319']) {
-      const result = claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: matches}], {version: resultVersion, uuid: 'result', parentUuid: 'call'});
-      const input = jsonl(call, result), before = Buffer.from(input);
-      const originals = input.toString().trim().split('\n').map(line => JSON.parse(line));
-      const rewritten = compacted(input, 'claude');
-      assert.deepEqual(rewritten.counts, {images: 1, toolOutputs: 1});
-      const rows = rewritten.output!.toString().trim().split('\n').map(line => JSON.parse(line));
-      assert.deepEqual(rows[0], originals[0]);
-      assert.deepEqual(rows[1], {...originals[1], message: {content: [
-        {type: 'text', text: '[image removed]'},
-        {type: 'tool_result', tool_use_id: 'a', is_error: false, content: rows[1].message.content[1].content},
-      ]}});
-      assert.match(rows[1].message.content[1].content, /RTK output compacted/);
-      assert.deepEqual(input, before);
-    }
-  }
-});
-
-const archives = [
-  {type: 'api-request-blob', sessionId: 'synthetic', hash: 'blob', message: {role: 'user', content: 'archived prompt'}},
-  {type: 'api-request-shape', sessionId: 'synthetic', shapeHash: 'shape', shape: {model: 'example'}},
-  {type: 'api-request', sessionId: 'synthetic', id: 'request', shapeHash: 'shape', params: {}, base: 'previous', keep: 0, tail: ['blob'], cacheControl: [], requestDigest: 'digest'},
-];
-
-const successfulHook = {
-  type: 'attachment', sessionId: 'synthetic', uuid: 'hook-id', parentUuid: 'user-id', timestamp: '2026-11-01T00:00:00Z',
-  attachment: {type: 'hook_success', hookName: 'SessionStart:resume', hookEvent: 'SessionStart', toolUseID: 'tool-id',
-    command: 'echo saved-command', content: 'saved context', stdout: 'saved output', stderr: 'saved diagnostic', exitCode: 0, durationMs: 12},
-  rendered: [{content: 'model-facing context'}],
-};
-
-
-test('Claude archive and hook slimming preserve raw conversation, cost and graph bytes independently and together', () => {
-  const user = JSON.stringify(claude('user', [{type: 'text', text: 'Keep 用户 text'}], {uuid: 'user-id', parentUuid: null}));
-  const assistant = JSON.stringify(claude('assistant', [{type: 'thinking', thinking: 'keep', signature: 'keep-signature'}],
-    {uuid: 'assistant-id', parentUuid: 'hook-id', usage: {input_tokens: 123, output_tokens: 45}}));
-  const cost = '{ "type":"cost-state", "sessionId":"synthetic", "cost":1.230000, "large":9007199254740993 }';
-  const hook = JSON.stringify(successfulHook).replace('"durationMs":12', '"durationMs":12.000');
-  const cleared = JSON.stringify({...successfulHook, attachment: {...successfulHook.attachment,
-    command: '', content: '', stdout: '', stderr: ''}, rendered: []}).replace('"durationMs":12', '"durationMs":12.000');
-  for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
-    const rows = [user, hook, ...archives.map(row => JSON.stringify(row)), assistant, cost];
-    const input = Buffer.from(rows.join(newline) + finalNewline);
-    for (const [removeRequestArchives, compactHooks] of [[true, false], [false, true], [true, true]]) {
-      const options = {removeImages: false, compactTools: false, removeRequestArchives, compactHooks};
-      const result = slimHistory(input, 'claude', options);
-      const expected = [user, compactHooks ? cleared : hook, ...(removeRequestArchives ? [] : rows.slice(2, 5)), assistant, cost];
-      assert.equal(result.output?.toString(), expected.join(newline) + finalNewline);
-      assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
-        ...(removeRequestArchives ? {requestRecords: 3} : {}), ...(compactHooks ? {hooks: 1} : {})});
-      assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
-      assert.equal(slimHistory(result.output!, 'claude', options).output, null);
-    }
-  }
-});
-
-
-test('Claude archives handle a final row without newline and retain unknown archive families or archive-only files', () => {
-  const options = {removeImages: false, compactTools: false, removeRequestArchives: true};
-  const conversation = jsonl(claude('user', []));
-  const input = Buffer.concat([conversation, Buffer.from(JSON.stringify(archives[0]))]);
-  const result = slimHistory(input, 'claude', options);
-  assert.deepEqual(result.output, conversation);
-  assert.equal(result.savingsBytes.requestRecords, input.length - conversation.length);
-  assert.equal(slimHistory(jsonl(...archives), 'claude', options).output, null);
-  for (const unknown of [
-    {...archives[0], usage: {input_tokens: 123}}, {...archives[0], message: 'unexpected'},
-    {...archives[1], shape: null}, {...archives[2], tail: [12]}, {...archives[2], keep: -1},
-    {type: 'api-request-new', sessionId: 'synthetic'},
-  ]) assert.equal(slimHistory(jsonl(claude('user', []), ...archives, unknown), 'claude', options).output, null);
-  assert.throws(() => slimHistory(jsonl(claude('user', []), {...archives[0], sessionId: 'other'}), 'claude', options), /Mixed/);
-  assert.throws(() => slimHistory(Buffer.concat([input, Buffer.from('\nnot-json')]), 'claude', options), /Malformed/);
-});
-
-
-test('hook compaction retains failures, unknown payloads, prompt snapshots and graph-less records', () => {
-  const options = {removeImages: false, compactTools: false, compactHooks: true};
-  for (const hook of [
-    {...successfulHook, attachment: {...successfulHook.attachment, exitCode: 1}},
-    {...successfulHook, attachment: {...successfulHook.attachment, type: 'hook_error'}},
-    {...successfulHook, attachment: {...successfulHook.attachment, type: 'prompt_snapshot'}},
-    {...successfulHook, attachment: {...successfulHook.attachment, content: null}},
-    {...successfulHook, attachment: {...successfulHook.attachment, newContext: 'retain'}},
-    {...successfulHook, uuid: undefined}, {...successfulHook, parentUuid: undefined},
-    {...successfulHook, rendered: [{content: 'keep', signature: 'new-field'}]},
-    {...successfulHook, rendered: 'unrecognized'},
-  ]) assert.equal(slimHistory(jsonl(claude('user', []), hook), 'claude', options).output, null);
-  const withoutRendered = {...successfulHook, rendered: undefined};
-  assert.equal(slimHistory(jsonl(withoutRendered), 'claude', options).counts.hooks, 1);
-  const input = jsonl(meta, ...archives, successfulHook);
-  assert.equal(slimHistory(input, 'codex', {...options, removeRequestArchives: true}).output, null);
-});
-
-const toolSnapshot = {
-  type: 'attachment', sessionId: 'synthetic', uuid: 'snapshot-id', parentUuid: 'user-id', timestamp: '2026-11-01T00:00:00Z',
-  attachment: {type: 'prompt_snapshot', systemPrompt: ['Keep system instructions'], cliPrefix: 'keep', reminderFold: true,
-    systemTurns: true, toolChangeHeader: true, inlineTools: true, keptReminders: true, echoWireToolInputs: false, contextRendering: 'keep',
-    tools: [{name: 'Read', description: 'Read a file', schema: {name: 'Read', description: 'Read a file',
-      input_schema: {type: 'object', properties: {path: {type: 'string'}}, required: ['path']}, eager_input_streaming: true}}]},
-};
-
-const skillListing = {
-  type: 'attachment', sessionId: 'synthetic', uuid: 'skills-id', parentUuid: 'snapshot-id', timestamp: '2026-11-01T00:00:00Z',
-  attachment: {type: 'skill_listing', content: 'Available skills and their descriptions', names: ['example'], skillCount: 1, isInitial: true},
-  rendered: [{content: 'Rendered skill descriptions'}], renderedRole: 'user',
-};
-
-
-test('Claude tool and skill slimming preserve raw prompts, chat, cost and graph while resetting skill discovery', () => {
-  const user = JSON.stringify(claude('user', [{type: 'text', text: 'Keep 用户 text'}], {uuid: 'user-id', parentUuid: null}));
-  const assistant = JSON.stringify(claude('assistant', [{type: 'thinking', thinking: 'keep', signature: 'keep-signature'}],
-    {uuid: 'assistant-id', parentUuid: 'skills-id', usage: {input_tokens: 123, output_tokens: 45}}));
-  const cost = '{ "type":"cost-state", "sessionId":"synthetic", "cost":1.230000, "large":9007199254740993 }';
-  const rawSnapshot = JSON.stringify(toolSnapshot).replace('"cliPrefix":"keep"', '"cliPrefix" : "keep"')
-    .replace('"timestamp":', '"extra":9007199254740993, "timestamp":');
-  const listing = JSON.stringify(skillListing).replace('"skillCount":1', '"skillCount" : 1');
-  const clearedSnapshot = rawSnapshot.replace(JSON.stringify(toolSnapshot.attachment.tools), '[]');
-  const clearedListing = listing.replace(JSON.stringify(skillListing.attachment.content), '""')
-    .replace(JSON.stringify(skillListing.attachment.names), '[]').replace('"skillCount" : 1', '"skillCount" : 0')
-    .replace(JSON.stringify(skillListing.rendered), '[]');
-  for (const newline of ['\n', '\r\n']) for (const finalNewline of ['', newline]) {
-    const rows = [user, rawSnapshot, listing, assistant, cost];
-    const input = Buffer.from(rows.join(newline) + finalNewline);
-    for (const [compactToolDefinitions, compactSkillListings] of [[true, false], [false, true], [true, true]]) {
-      const options = {removeImages: false, compactTools: false, compactToolDefinitions, compactSkillListings};
-      const result = slimHistory(input, 'claude', options);
-      assert.equal(result.output?.toString(), [user, compactToolDefinitions ? clearedSnapshot : rawSnapshot,
-        compactSkillListings ? clearedListing : listing, assistant, cost].join(newline) + finalNewline);
-      assert.deepEqual(result.counts, {images: 0, toolOutputs: 0,
-        ...(compactToolDefinitions ? {toolDefinitions: 1} : {}), ...(compactSkillListings ? {skillListings: 1} : {})});
-      assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
-      assert.equal(slimHistory(result.output!, 'claude', options).output, null);
-    }
-  }
-});
-
-
-test('Claude slimming clears every recognized snapshot and resets initial and subsequent skill inventories', () => {
-  const tool = toolSnapshot.attachment.tools[0];
-  const nextSnapshot = {...toolSnapshot, uuid: 'snapshot-2', parentUuid: skillListing.uuid,
-    attachment: {...toolSnapshot.attachment, systemPrompt: ['Keep updated instructions'],
-      tools: [tool, {...tool, name: 'Other', schema: {...tool.schema, name: 'Other'}}]}};
-  const nextListing = {...skillListing, uuid: 'skills-2', parentUuid: nextSnapshot.uuid, rendered: undefined,
-    attachment: {...skillListing.attachment, content: '', isInitial: false,
-      names: Array.from({length: 12}, (_, i) => `skill-${i}`), skillCount: 12}};
-  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true, compactSkillListings: true};
-  const input = jsonl(toolSnapshot, skillListing, nextSnapshot, nextListing);
-  const result = slimHistory(input, 'claude', options);
-  assert.deepEqual(result.output, jsonl(
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: []}},
-    {...skillListing, attachment: {...skillListing.attachment, content: '', names: [], skillCount: 0}, rendered: []},
-    {...nextSnapshot, attachment: {...nextSnapshot.attachment, tools: []}},
-    {...nextListing, attachment: {...nextListing.attachment, content: '', names: [], skillCount: 0}},
-  ));
-  assert.deepEqual(result.counts, {images: 0, toolOutputs: 0, toolDefinitions: 3, skillListings: 2});
-  assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), input.length - result.output!.length);
-  assert.equal(slimHistory(result.output!, 'claude', options).output, null);
-});
-
-
-test('tool and skill slimming retains unknown shapes, other attachments and disabled or Codex content', () => {
-  const options = {removeImages: false, compactTools: false, compactToolDefinitions: true, compactSkillListings: true};
-  const tool = toolSnapshot.attachment.tools[0];
-  for (const row of [
-    {...toolSnapshot, uuid: undefined}, {...toolSnapshot, parentUuid: undefined},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, newContext: 'retain'}},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, systemPrompt: 'unexpected'}},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: [{...tool, signature: 'retain'}]}},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: [{...tool, schema: {name: 'Read'}}]}},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: [{...tool, schema: {...tool.schema, newState: 'retain'}}]}},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, tools: undefined}},
-    {...toolSnapshot, attachment: {...toolSnapshot.attachment, reminderFold: 'unexpected'}},
-    {...skillListing, attachment: {...skillListing.attachment, names: ['example', 'mismatch']}},
-    {...skillListing, attachment: {...skillListing.attachment, skillCount: -1}},
-    {...skillListing, attachment: {...skillListing.attachment, content: null}},
-    {...skillListing, attachment: {...skillListing.attachment, newState: 'retain'}},
-    {...skillListing, attachment: {...skillListing.attachment, isInitial: 'unexpected'}},
-    {...skillListing, rendered: [{content: 'keep', signature: 'retain'}]},
-    {...skillListing, rendered: 'unknown'}, {...skillListing, attachment: {...skillListing.attachment, type: 'other'}},
-    successfulHook,
-  ]) assert.equal(slimHistory(jsonl(row), 'claude', options).output, null);
-  assert.equal(slimHistory(jsonl(toolSnapshot, skillListing), 'claude', {removeImages: false, compactTools: false}).output, null);
-  assert.equal(slimHistory(jsonl(meta, toolSnapshot, skillListing), 'codex', options).output, null);
-  const result = slimHistory(jsonl({...skillListing, rendered: undefined}, {...toolSnapshot, version: 'future-version'}), 'claude', options);
-  assert.equal(result.counts.skillListings, 1);
-  assert.equal(result.counts.toolDefinitions, 1);
-  assert.equal(JSON.parse(result.output!.toString().split('\n')[0]).attachment.skillCount, 0);
-});
-
-test('Claude Quick clean combines all history operations without double counting', () => {
-  const input = jsonl(
-    claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}]),
-    claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: matches}]),
-    ...archives, successfulHook, toolSnapshot, skillListing,
-  );
-  const options = {...both, removeRequestArchives: true, compactHooks: true, compactToolDefinitions: true, compactSkillListings: true};
-  const result = slimHistory(input, 'claude', options);
-  assert.ok(result.output);
-  assert.deepEqual(result.counts, {images: 1, toolOutputs: 1, requestRecords: 3, hooks: 1, toolDefinitions: 1, skillListings: 1});
-  let savings = 0;
-  for (const option of ['removeImages', 'compactTools', 'removeRequestArchives', 'compactHooks', 'compactToolDefinitions', 'compactSkillListings'] as const) {
-    const separate = slimHistory(input, 'claude', {removeImages: false, compactTools: false, [option]: true});
-    assert.ok(separate.output);
-    savings += input.length - separate.output.length;
-  }
-  assert.equal(savings, input.length - result.output.length);
-  assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), savings);
-  assert.equal(slimHistory(result.output, 'claude', options).output, null);
 });
 
 test('old snapshots remove paired arrays only and preserve latest history, summaries and usage bytes', () => {

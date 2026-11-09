@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { zstdCompressSync } from 'node:zlib';
 import { slimHistory, slimCodexItem } from '../src/slim.ts';
 import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout, verifyCodexDeletionHistories, decodeDuplicateHistory } from '../src/providers/codex-history.ts';
+import { assertCodexDeleteCapabilities } from '../src/codex-delete.ts';
 import { scanRoot } from '../src/scan.ts';
 
 const options = {removeImages: true, compactTools: true};
@@ -15,6 +16,30 @@ const lines = (...rows: unknown[]) => Buffer.from(rows.map(r => JSON.stringify(r
 const header = {type: 'session_meta', payload: {id: 'rollout', session_id: 'stable-thread', history_mode: 'paginated'}};
 const item = {type: 'UserMessage', id: 'u', content: [{type: 'text', text: '保留', text_elements: []}, {type: 'image', url}]};
 const input = lines(header, {ordinal: 0, type: 'event_msg', payload: {type: 'item_completed', item}}, {ordinal: 1, type: 'future', payload: {text: '保留'}});
+
+test('duplicate comparison decodes every frame and preserves exact bytes across Unicode boundaries', async () => {
+  const split = input.indexOf(Buffer.from('保留')) + 1;
+  const compressed = Buffer.concat([zstdCompressSync(''), zstdCompressSync(input.subarray(0, split)),
+    zstdCompressSync(input.subarray(split)), zstdCompressSync('')]);
+  assert.deepEqual(await decodeDuplicateHistory(compressed, input.length), input);
+  const changed = Buffer.from(input); changed[changed.indexOf(Buffer.from('保留'))] ^= 1;
+  assert.equal((await decodeDuplicateHistory(zstdCompressSync(changed), input.length)).equals(input), false);
+  const shorter = input.subarray(0, input.length - 1);
+  assert.equal((await decodeDuplicateHistory(zstdCompressSync(shorter), input.length)).equals(input), false);
+  await assert.rejects(decodeDuplicateHistory(Buffer.concat([compressed, zstdCompressSync('extra')]), input.length), /differs|size/);
+});
+
+test('duplicate decoding rejects damaged streams, output overruns and cancellation', async () => {
+  const valid = zstdCompressSync(input);
+  for (const data of [Buffer.alloc(0), Buffer.from('invalid frame'), valid.subarray(0, valid.length - 2),
+    Buffer.concat([valid, Buffer.from('invalid trailing frame')]), Buffer.concat([valid, valid.subarray(0, valid.length - 2)])])
+    await assert.rejects(decodeDuplicateHistory(data, input.length * 2));
+  for (const limit of [0, -1, 0.5, NaN, Infinity, 64 * 1024 * 1024 + 1])
+    await assert.rejects(decodeDuplicateHistory(valid, limit), /limit|empty/);
+  await assert.rejects(decodeDuplicateHistory(valid, input.length - 1), /differs|size/);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(decodeDuplicateHistory(valid, input.length, controller.signal), {name: 'AbortError'});
+});
 
 test('paginated canonical events preserve ordinals and unknown bytes', () => {
   const result = slimHistory(input, 'codex', options);
@@ -66,6 +91,19 @@ function fixture() {
   return db;
 }
 
+test('identical history bytes leave SQLite offsets, ordinals and cache text unchanged', () => {
+  const db = fixture();
+  try {
+    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+    const after = rewriteProjection(before, byteOffsetMap(input, input), {removeImages: false, compactTools: false});
+    assert.deepEqual(after, structuredClone(before));
+    assert.equal(projectionHash(after), projectionHash(before));
+    applyProjection(db, before, after);
+    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
+    assert.deepEqual(projectionSnapshot(db, 'other'), other);
+  } finally { db.close(); }
+});
+
 test('projection maps UTF-8 line boundaries and cached items without touching other threads', () => {
   const db = fixture();
   try {
@@ -89,6 +127,38 @@ test('projection recovery distinguishes before, after, unchanged and conflicts',
   assert.equal(projectionState('b', {beforeHash: 'a', afterHash: 'b'}), 'after');
   assert.equal(projectionState('a', {beforeHash: 'a', afterHash: 'a'}), 'after');
   assert.throws(() => projectionState('c', {beforeHash: 'a', afterHash: 'b'}), /changed/);
+});
+
+test('old snapshot slimming coordinates line offsets and recovery hashes while preserving caches and ordinals', () => {
+  const opts = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+  const snapshot = {type: 'compacted', payload: {message: 'Keep summary', window_number: 1,
+    replacement_history: [{type: 'message', role: 'user', content: [{type: 'input_text', text: 'Old context'}]}],
+    replacement_history_metadata: [{}]}};
+  const source = lines(header, {...snapshot, ordinal: 0}, {ordinal: 1, type: 'event_msg', payload: {type: 'item_completed', item}},
+    {...snapshot, ordinal: 2, payload: {...snapshot.payload, window_number: 2}});
+  const result = slimHistory(source, 'codex', opts), output = result.output!;
+  const start = lines(header, {...snapshot, ordinal: 0}).length;
+  const db = fixture();
+  try {
+    db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=?, next_rollout_ordinal=3').run(source.length);
+    db.prepare("UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=?, rollout_ordinal=1 WHERE thread_id='rollout'").run(start, source.length);
+    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+    const after = rewriteProjection(before, byteOffsetMap(source, output), opts);
+    assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
+    assert.equal(after.thread_turns[0].rollout_byte_offset, BigInt(start - result.savingsBytes.oldSnapshots!));
+    assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.length));
+    assert.equal(after.thread_turns[0].rollout_ordinal, 1n);
+    assert.equal(after.thread_history_projection_state[0].next_rollout_ordinal, 3n);
+    assert.deepEqual(after.thread_items, structuredClone(before.thread_items));
+    const receipt = {beforeHash: projectionHash(before), afterHash: projectionHash(after)};
+    assert.notEqual(receipt.beforeHash, receipt.afterHash);
+    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'before');
+    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('ROLLBACK');
+    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
+    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
+    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'after');
+    assert.deepEqual(projectionSnapshot(db, 'other'), other);
+  } finally { db.close(); }
 });
 
 test('in-memory projection updates commit or roll back as a unit and preserve other threads', () => {
@@ -115,76 +185,6 @@ test('in-memory projection updates commit or roll back as a unit and preserve ot
     const invalid = structuredClone(after); invalid.thread_items[0].item_id = 'different';
     assert.throws(() => applyProjection(db, after, invalid), /Unexpected/);
   } finally { db.close(); }
-});
-
-async function layout(t: TestContext) {
-  const root = await realpath(await mkdtemp(join(tmpdir(), 'cc-clean-header-')));
-  const inherited = process.env.CODEX_SQLITE_HOME;
-  delete process.env.CODEX_SQLITE_HOME;
-  t.after(async () => {
-    if (inherited === undefined) delete process.env.CODEX_SQLITE_HOME; else process.env.CODEX_SQLITE_HOME = inherited;
-    await rm(root, {recursive: true, force: true});
-  });
-  await mkdir(join(root, 'sessions')); await mkdir(join(root, 'archived_sessions'));
-  const put = async (name: string, meta: Record<string, unknown>) => {
-    const path = join(root, name), data = lines({type: 'session_meta', payload: meta}, {type: 'future', text: '保留'.repeat(10000)});
-    await writeFile(path, name.endsWith('.zst') ? zstdCompressSync(data) : data);
-    return path;
-  };
-  return {root, put};
-}
-
-test('header inspection supports plain and compressed layouts and rejects stale snapshots', async t => {
-  const {root, put} = await layout(t);
-  const plain = await put('sessions/one.jsonl', {id: 'one', history_mode: 'paginated'});
-  await put('archived_sessions/two.jsonl.zst', {id: 'two'});
-  const inv = await scanRoot(root, 'codex');
-  for (const file of inv.files) {
-    const original = await readFile(file.path);
-    assert.ok((await readCodexHeader(file)).payload.id);
-    assert.deepEqual(await readFile(file.path), original);
-  }
-  await writeFile(plain, lines(header));
-  await assert.rejects(readCodexHeader(inv.files.find(f => f.path === plain)!), /changed/);
-});
-
-test('unrelated compressed and hardlinked histories do not block an independent paginated target', async t => {
-  const {root, put} = await layout(t);
-  const independent = await put('sessions/independent.jsonl', {id: 'independent', history_mode: 'paginated'});
-  const zipped = await put('archived_sessions/zipped.jsonl.zst', {id: 'zipped'});
-  const linked = await put('sessions/linked.jsonl', {id: 'linked'});
-  await link(linked, join(root, 'linked-copy'));
-  await writeFile(join(root, 'thread_history_1.sqlite'), 'layout-only sentinel');
-  const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
-  assert.equal(blocked.has(independent), false);
-  assert.match(blocked.get(zipped)!, /Compressed/);
-  assert.match(blocked.get(linked)!, /hard links/);
-});
-
-test('inbound references through rollout and session identities retain only dependent histories', async t => {
-  const {root, put} = await layout(t);
-  const source = await put('sessions/source.jsonl', {id: 'source', session_id: 'stable-source', history_mode: 'paginated'});
-  const independent = await put('sessions/independent.jsonl', {id: 'independent'});
-  for (const id of ['source', 'stable-source']) {
-    const dependent = await put('archived_sessions/shared.jsonl.zst', {id: 'dependent', history_base: {thread_id: id, end_byte_offset: 99}});
-    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
-    assert.match(blocked.get(source)!, /referenced/);
-    assert.equal(blocked.has(independent), false);
-    assert.equal(blocked.has(dependent), true);
-  }
-});
-
-test('unknown offset-bearing schemas and update triggers are refused explicitly', () => {
-  const db = fixture();
-  try {
-    db.exec('ALTER TABLE thread_turns ADD COLUMN future_byte_offset INTEGER');
-    assert.throws(() => projectionSnapshot(db, 'rollout'), /offset/);
-  } finally { db.close(); }
-  const triggered = fixture();
-  try {
-    triggered.exec('CREATE TRIGGER surprise AFTER UPDATE ON thread_items BEGIN DELETE FROM thread_turns; END');
-    assert.throws(() => projectionSnapshot(triggered, 'rollout'), /trigger/);
-  } finally { triggered.close(); }
 });
 
 test('reasoning-only and combined slimming synchronize offsets and caches in memory', () => {
@@ -233,76 +233,23 @@ test('reasoning-only and combined slimming synchronize offsets and caches in mem
     } finally { db.close(); }
   }
 });
-import { assertCodexDeleteCapabilities } from '../src/codex-delete.ts';
 
-test('native ownership checks allow unrelated copies but reject unpreviewed owned rollouts and references', async t => {
-  const {root, put} = await layout(t);
-  const target = await put('sessions/target.jsonl', {id: 'immutable', session_id: 'selected'});
-  const unrelated = await put('archived_sessions/unrelated.jsonl.zst', {id: 'unrelated'});
-  await link(unrelated, join(root, 'linked-copy'));
-  const ids = new Set(['selected']), paths = new Set([target]);
-  await verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths);
-  for (const meta of [
-    {id: 'another-immutable', session_id: 'selected'},
-    {id: 'dependent', history_base: {thread_id: 'immutable', end_byte_offset: 99}},
-  ]) {
-    const path = await put('archived_sessions/other.jsonl.zst', meta);
-    await assert.rejects(verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths), /unpreviewed|referenced/);
-    await rm(path);
-  }
-  await put('sessions/target.jsonl.zst', {id: 'immutable'});
-  await assert.rejects(verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths), /unpreviewed/);
-});
-
-test('native capability validation depends on advertised behavior, not versions', () => {
-  const help = 'Usage: codex delete [OPTIONS] <SESSION>\n -c, --config <key=value>\n --force';
-  const features = 'local_thread_store_compression experimental false\nbackground_paginated_rollout_migration experimental false\n';
-  assert.doesNotThrow(() => assertCodexDeleteCapabilities(help, features));
-  for (const text of [help.replace('--force', ''), help.replace('<SESSION>', '[SESSION]'), help.replace('--config', '--other')])
-    assert.throws(() => assertCodexDeleteCapabilities(text, features), /capabilit/);
-  assert.throws(() => assertCodexDeleteCapabilities(help, features.replace('experimental false', 'experimental true')), /capabilit/);
-});
-
-
-test('duplicate comparison decodes every frame and preserves exact bytes across Unicode boundaries', async () => {
-  const split = input.indexOf(Buffer.from('保留')) + 1;
-  const compressed = Buffer.concat([zstdCompressSync(''), zstdCompressSync(input.subarray(0, split)),
-    zstdCompressSync(input.subarray(split)), zstdCompressSync('')]);
-  assert.deepEqual(await decodeDuplicateHistory(compressed, input.length), input);
-  const changed = Buffer.from(input); changed[changed.indexOf(Buffer.from('保留'))] ^= 1;
-  assert.equal((await decodeDuplicateHistory(zstdCompressSync(changed), input.length)).equals(input), false);
-  const shorter = input.subarray(0, input.length - 1);
-  assert.equal((await decodeDuplicateHistory(zstdCompressSync(shorter), input.length)).equals(input), false);
-  await assert.rejects(decodeDuplicateHistory(Buffer.concat([compressed, zstdCompressSync('extra')]), input.length), /differs|size/);
-});
-
-
-test('duplicate decoding rejects damaged streams, output overruns and cancellation', async () => {
-  const valid = zstdCompressSync(input);
-  for (const data of [Buffer.alloc(0), Buffer.from('invalid frame'), valid.subarray(0, valid.length - 2),
-    Buffer.concat([valid, Buffer.from('invalid trailing frame')]), Buffer.concat([valid, valid.subarray(0, valid.length - 2)])])
-    await assert.rejects(decodeDuplicateHistory(data, input.length * 2));
-  for (const limit of [0, -1, 0.5, NaN, Infinity, 64 * 1024 * 1024 + 1])
-    await assert.rejects(decodeDuplicateHistory(valid, limit), /limit|empty/);
-  await assert.rejects(decodeDuplicateHistory(valid, input.length - 1), /differs|size/);
-  const controller = new AbortController(); controller.abort();
-  await assert.rejects(decodeDuplicateHistory(valid, input.length, controller.signal), {name: 'AbortError'});
-});
-
-
-test('identical history bytes leave SQLite offsets, ordinals and cache text unchanged', () => {
-  const db = fixture();
-  try {
-    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
-    const after = rewriteProjection(before, byteOffsetMap(input, input), {removeImages: false, compactTools: false});
-    assert.deepEqual(after, structuredClone(before));
-    assert.equal(projectionHash(after), projectionHash(before));
-    applyProjection(db, before, after);
-    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
-    assert.deepEqual(projectionSnapshot(db, 'other'), other);
-  } finally { db.close(); }
-});
-
+async function layout(t: TestContext) {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cc-clean-header-')));
+  const inherited = process.env.CODEX_SQLITE_HOME;
+  delete process.env.CODEX_SQLITE_HOME;
+  t.after(async () => {
+    if (inherited === undefined) delete process.env.CODEX_SQLITE_HOME; else process.env.CODEX_SQLITE_HOME = inherited;
+    await rm(root, {recursive: true, force: true});
+  });
+  await mkdir(join(root, 'sessions')); await mkdir(join(root, 'archived_sessions'));
+  const put = async (name: string, meta: Record<string, unknown>) => {
+    const path = join(root, name), data = lines({type: 'session_meta', payload: meta}, {type: 'future', text: '保留'.repeat(10000)});
+    await writeFile(path, name.endsWith('.zst') ? zstdCompressSync(data) : data);
+    return path;
+  };
+  return {root, put};
+}
 
 test('duplicate layout allows only the same-basename pair and retains additional identity copies', async t => {
   const {root, put} = await layout(t);
@@ -321,7 +268,6 @@ test('duplicate layout allows only the same-basename pair and retains additional
     }
   }
 });
-
 
 test('duplicate layout retains shared, hardlinked and unknown-format pairs', async t => {
   const {root, put} = await layout(t);
@@ -346,34 +292,83 @@ test('duplicate layout retains shared, hardlinked and unknown-format pairs', asy
   }
 });
 
-test('old snapshot slimming coordinates line offsets and recovery hashes while preserving caches and ordinals', () => {
-  const opts = {removeImages: false, compactTools: false, removeOldSnapshots: true};
-  const snapshot = {type: 'compacted', payload: {message: 'Keep summary', window_number: 1,
-    replacement_history: [{type: 'message', role: 'user', content: [{type: 'input_text', text: 'Old context'}]}],
-    replacement_history_metadata: [{}]}};
-  const source = lines(header, {...snapshot, ordinal: 0}, {ordinal: 1, type: 'event_msg', payload: {type: 'item_completed', item}},
-    {...snapshot, ordinal: 2, payload: {...snapshot.payload, window_number: 2}});
-  const result = slimHistory(source, 'codex', opts), output = result.output!;
-  const start = lines(header, {...snapshot, ordinal: 0}).length;
+test('header inspection supports plain and compressed layouts and rejects stale snapshots', async t => {
+  const {root, put} = await layout(t);
+  const plain = await put('sessions/one.jsonl', {id: 'one', history_mode: 'paginated'});
+  await put('archived_sessions/two.jsonl.zst', {id: 'two'});
+  const inv = await scanRoot(root, 'codex');
+  for (const file of inv.files) {
+    const original = await readFile(file.path);
+    assert.ok((await readCodexHeader(file)).payload.id);
+    assert.deepEqual(await readFile(file.path), original);
+  }
+  await writeFile(plain, lines(header));
+  await assert.rejects(readCodexHeader(inv.files.find(f => f.path === plain)!), /changed/);
+});
+
+test('unrelated compressed and hardlinked histories do not block an independent paginated target', async t => {
+  const {root, put} = await layout(t);
+  const independent = await put('sessions/independent.jsonl', {id: 'independent', history_mode: 'paginated'});
+  const zipped = await put('archived_sessions/zipped.jsonl.zst', {id: 'zipped'});
+  const linked = await put('sessions/linked.jsonl', {id: 'linked'});
+  await link(linked, join(root, 'linked-copy'));
+  await writeFile(join(root, 'thread_history_1.sqlite'), 'layout-only sentinel');
+  const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
+  assert.equal(blocked.has(independent), false);
+  assert.match(blocked.get(zipped)!, /Compressed/);
+  assert.match(blocked.get(linked)!, /hard links/);
+});
+
+test('inbound references through rollout and session identities retain only dependent histories', async t => {
+  const {root, put} = await layout(t);
+  const source = await put('sessions/source.jsonl', {id: 'source', session_id: 'stable-source', history_mode: 'paginated'});
+  const independent = await put('sessions/independent.jsonl', {id: 'independent'});
+  for (const id of ['source', 'stable-source']) {
+    const dependent = await put('archived_sessions/shared.jsonl.zst', {id: 'dependent', history_base: {thread_id: id, end_byte_offset: 99}});
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
+    assert.match(blocked.get(source)!, /referenced/);
+    assert.equal(blocked.has(independent), false);
+    assert.equal(blocked.has(dependent), true);
+  }
+});
+
+test('native ownership checks allow unrelated copies but reject unpreviewed owned rollouts and references', async t => {
+  const {root, put} = await layout(t);
+  const target = await put('sessions/target.jsonl', {id: 'immutable', session_id: 'selected'});
+  const unrelated = await put('archived_sessions/unrelated.jsonl.zst', {id: 'unrelated'});
+  await link(unrelated, join(root, 'linked-copy'));
+  const ids = new Set(['selected']), paths = new Set([target]);
+  await verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths);
+  for (const meta of [
+    {id: 'another-immutable', session_id: 'selected'},
+    {id: 'dependent', history_base: {thread_id: 'immutable', end_byte_offset: 99}},
+  ]) {
+    const path = await put('archived_sessions/other.jsonl.zst', meta);
+    await assert.rejects(verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths), /unpreviewed|referenced/);
+    await rm(path);
+  }
+  await put('sessions/target.jsonl.zst', {id: 'immutable'});
+  await assert.rejects(verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths), /unpreviewed/);
+});
+
+test('unknown offset-bearing schemas and update triggers are refused explicitly', () => {
   const db = fixture();
   try {
-    db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=?, next_rollout_ordinal=3').run(source.length);
-    db.prepare("UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=?, rollout_ordinal=1 WHERE thread_id='rollout'").run(start, source.length);
-    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
-    const after = rewriteProjection(before, byteOffsetMap(source, output), opts);
-    assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
-    assert.equal(after.thread_turns[0].rollout_byte_offset, BigInt(start - result.savingsBytes.oldSnapshots!));
-    assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.length));
-    assert.equal(after.thread_turns[0].rollout_ordinal, 1n);
-    assert.equal(after.thread_history_projection_state[0].next_rollout_ordinal, 3n);
-    assert.deepEqual(after.thread_items, structuredClone(before.thread_items));
-    const receipt = {beforeHash: projectionHash(before), afterHash: projectionHash(after)};
-    assert.notEqual(receipt.beforeHash, receipt.afterHash);
-    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'before');
-    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('ROLLBACK');
-    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
-    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
-    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'after');
-    assert.deepEqual(projectionSnapshot(db, 'other'), other);
+    db.exec('ALTER TABLE thread_turns ADD COLUMN future_byte_offset INTEGER');
+    assert.throws(() => projectionSnapshot(db, 'rollout'), /offset/);
   } finally { db.close(); }
+  const triggered = fixture();
+  try {
+    triggered.exec('CREATE TRIGGER surprise AFTER UPDATE ON thread_items BEGIN DELETE FROM thread_turns; END');
+    assert.throws(() => projectionSnapshot(triggered, 'rollout'), /trigger/);
+  } finally { triggered.close(); }
+});
+
+test('native capability validation depends on advertised behavior, not versions', () => {
+  const help = 'Usage: codex delete [OPTIONS] <SESSION>\n -c, --config <key=value>\n --force';
+  const features = 'local_thread_store_compression experimental false\nbackground_paginated_rollout_migration experimental false\n';
+  assert.doesNotThrow(() => assertCodexDeleteCapabilities(help, features));
+  for (const text of [help.replace('--force', ''), help.replace('<SESSION>', '[SESSION]'), help.replace('--config', '--other')])
+    assert.throws(() => assertCodexDeleteCapabilities(text, features), /capabilit/);
+  assert.throws(() => assertCodexDeleteCapabilities(help, features.replace('experimental false', 'experimental true')), /capabilit/);
 });

@@ -759,6 +759,113 @@ test('cleanup file tree stays compact, shows folder suffixes and opens multiline
   await term.key('q'); await answer;
 });
 
+test('Quick clean selects all supported history operations alongside file cleanup without prompting', async t => {
+  const term = await terminal(t);
+  assert.deepEqual(await cleanOptions(false, term.context.signal), {
+    includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: true, removeRequestArchives: true, compactHooks: true,
+    compactToolDefinitions: true, compactSkillListings: true, removeOldSnapshots: true,
+  });
+  assert.equal(term.text(), '');
+  assert.equal((await cleanOptions(false, term.context.signal, false))?.removeOldSnapshots, false);
+  assert.equal((await cleanOptions(false, term.context.signal, false))?.removeReasoning, false);
+  const codexOnly = await cleanOptions(false, term.context.signal, true, false);
+  assert.equal(codexOnly?.removeRequestArchives, false);
+  assert.equal(codexOnly?.compactHooks, false);
+  assert.equal(codexOnly?.compactToolDefinitions, false);
+  assert.equal(codexOnly?.compactSkillListings, false);
+});
+
+test('temporary cleanup menu can be opened and cancelled before any scan', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, {configurable: true, value});
+    t.after(() => Object.defineProperty(process, name, descriptor));
+  }
+  const running = menu({roots: {claude: '/inert/claude', codex: '/inert/codex'}, stateDir: '/inert/state'}, term.context.signal);
+  void running.catch(() => {});
+  await term.key('1');
+  assert.match(stripVTControlCharacters(term.text()), /4\. Clean temporary files/);
+  await term.key('4');
+  assert.match(stripVTControlCharacters(term.text()), /Claude Code/);
+  await term.key('q'); await term.key('q'); await running;
+  assert.doesNotMatch(stripVTControlCharacters(term.text()), /Scanning|Deep Scan|Confirm cleanup|Incomplete:/);
+});
+
+test('standalone Slim history starts unchecked and only includes the selected operations', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const original = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, get: () => value });
+    t.after(() => Object.defineProperty(process, name, original));
+  }
+  let answer = cleanOptions(true, term.context.signal);
+  await term.key('\r'); assert.equal(await answer, null);
+  for (const keys of ['1', '2', '12', '3', '123', '4', '5', '45', '12345', '6', '7', '67', '1234567', '8', '12345678']) {
+    answer = cleanOptions(true, term.context.signal);
+    for (const key of keys) await term.key(key);
+    await term.key('\r');
+    assert.deepEqual(await answer, { removeImages: keys.includes('1'), compactTools: keys.includes('2'),
+      removeReasoning: keys.includes('3'), removeRequestArchives: keys.includes('4'), compactHooks: keys.includes('5'),
+      compactToolDefinitions: keys.includes('6'), compactSkillListings: keys.includes('7'), removeOldSnapshots: keys.includes('8') });
+  }
+  answer = cleanOptions(true, term.context.signal, false, true);
+  await term.key('3'); await term.key('4'); await term.key('5'); await term.key('6'); await term.key('\r');
+  assert.deepEqual(await answer, {removeImages: false, compactTools: false, removeReasoning: false, removeRequestArchives: true, compactHooks: true, compactToolDefinitions: true, compactSkillListings: true, removeOldSnapshots: false});
+  answer = cleanOptions(true, term.context.signal, true, false);
+  await term.key('3'); await term.key('4'); await term.key('\r');
+  assert.deepEqual(await answer, {removeImages: false, compactTools: false, removeReasoning: true, removeRequestArchives: false, compactHooks: false, compactToolDefinitions: false, compactSkillListings: false, removeOldSnapshots: true});
+  answer = cleanOptions(true, term.context.signal);
+  await term.key('q'); assert.equal(await answer, null);
+  assert.match(stripVTControlCharacters(term.text()), /irreversible; no undo/);
+  assert.match(stripVTControlCharacters(term.text()), /more than 72 hours/);
+});
+
+test('empty Claude file plans explain available rules and summarize repeated notes without flooding paths', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = { ...inertPlan(), provider: 'claude' as const, actions: [], warnings: [
+    CLAUDE_FILE_CLEANUP_NOTICE,
+    ...Array.from({ length: 40 }, (_, i) => `projects/p/session-${i}.jsonl: Mixed session format versions require unverified compatibility`),
+    ...Array.from({ length: 2 }, (_, i) => `72-hour protection: projects/p/recent-${i}.jsonl; Entire operation retained.`),
+    ...Array.from({ length: 7 }, (_, i) => `Additional reason ${i}`),
+  ] };
+  const original = [...p.warnings];
+  printPlan(p);
+  const text = lines.join('\n');
+  assert.match(text, /Quick clean also checks known system temporary files/);
+  assert.match(text, /Slim history/);
+  assert.match(text, /40 × Mixed session format versions/);
+  assert.match(text, /2 × 72-hour protection: modified within the last 3 days, or file time is invalid; kept unchanged/);
+  assert.match(text, /Scan notes.*50 notices/);
+  assert.match(text, /One file can have several notices/);
+  assert.match(text, /Plus 4 more note types/);
+  assert.match(text, /--json/);
+  assert.doesNotMatch(text, /projects\/p\/session-/);
+  assert.ok(lines.length < 25);
+  assert.deepEqual(p.warnings, original, 'full warnings remain available in JSON and details');
+});
+
+test('cleanup notes and menu descriptions use readable terminal foreground in color mode', t => {
+  const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+  const noColor = process.env.NO_COLOR, term = process.env.TERM;
+  Object.defineProperty(process.stdout, 'isTTY', {configurable: true, value: true});
+  delete process.env.NO_COLOR; process.env.TERM = 'xterm-256color';
+  t.after(() => {
+    if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete (process.stdout as any).isTTY;
+    if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor;
+    if (term === undefined) delete process.env.TERM; else process.env.TERM = term;
+  });
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  printPlan({...inertPlan(), actions: [], warnings: ['Kept unchanged: unrecognized image format']});
+  assert.doesNotMatch(lines.join('\n'), /\x1b\[(?:90|2)m/);
+  assert.match(lines.join('\n'), /\x1b\[1m.*Scan notes/);
+  const description = menuRow({name: 'View scan notes', description: 'Full paths and reasons', value: 'notes'}, 0, false, 100, {total: 0, max: 0, labelWidth: 20, color: true});
+  assert.match(description, /Full paths and reasons/);
+  assert.doesNotMatch(description, /\x1b\[(?:90|2)m/);
+});
+
 test('More folds scan notes and returning to review still requires Enter to confirm', async t => {
   const term = await terminal(t);
   for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
@@ -894,6 +1001,29 @@ test('plan estimates distinguish unknown savings and measured results', t => {
   assert.match(lines.join('\n'), /session without descendants/);
 });
 
+test('duplicate cleanup shows plaintext savings once and identifies the retained compressed copy', t => {
+  const output: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => output.push(args.join(' ')));
+  const p = inertPlan(), a = p.actions[0], f = a.files[0];
+  Object.assign(f, {path: `${p.root}/sessions/one.jsonl`, relative: 'sessions/one.jsonl', category: 'sessions'});
+  Object.assign(a, {kind: 'deduplicate-history', targetId: f.relative, beforeBytes: 5120, afterBytes: 5120,
+    estimatedSavingsBytes: 4096, files: [f, {...f, path: f.path + '.zst', relative: f.relative + '.zst', size: 1024, ino: 1}]});
+  const original = structuredClone(p);
+  printPlan(p);
+  const text = stripVTControlCharacters(output.join('\n'));
+  assert.match(text, /4\.00 KiB\s+Remove duplicate originals \(keep zstd\) · 1 file/);
+  assert.match(text, /4\.00 KiB\s+Total estimated savings/);
+  assert.equal(text.match(/Remove duplicate originals/g)?.length, 1);
+  assert.match(text, /identical compressed histories are retained/);
+  assert.match(text, /No undo copy/);
+  assert.doesNotMatch(text, /one\.jsonl/);
+  const [provider] = cleanupFileNodes([p]), leaf = provider.children![0].children![0];
+  assert.equal(provider.bytes, 4096); assert.equal(leaf.bytes, 4096);
+  assert.match(leaf.detail!, /Remove duplicate original \(keep zstd\)/);
+  assert.ok(leaf.detail!.includes(`Remove: ${f.path}\nKeep: ${f.path}.zst`));
+  assert.deepEqual(p, original, 'rendering must not mutate the plan');
+});
+
 test('history plan rendering shows irreversible choices, counts and savings using inert data', t => {
   const lines: string[] = [];
   t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
@@ -910,74 +1040,6 @@ test('history plan rendering shows irreversible choices, counts and savings usin
   assert.match(text, /Irreversible:.*No undo/);
   assert.match(text, /1\.00 KiB\s+Total estimated savings/);
   assert.match(text, /View files/);
-});
-
-test('ordinary menus keep their default selection and abort restores the terminal', async t => {
-  const term = await terminal(t);
-  const answer = select({ message: 'Confirm', choices: [{ name: 'Cancel', value: false }, { name: 'Confirm', value: true }] }, term.context);
-  await term.key('\r'); assert.equal(await answer, false);
-  const aborted = select({ message: 'Choose', choices }, term.context);
-  const rejected = assert.rejects(aborted, { name: 'AbortPromptError' });
-  term.abort(); await rejected;
-  assert.ok(term.text().includes('\x1b[?25h'));
-});
-
-test('NO_COLOR suppresses colors even in a terminal', () => {
-  const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
-  const original = process.env.NO_COLOR;
-  try {
-    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
-    process.env.NO_COLOR = '';
-    assert.equal(paint('purple', 'Title'), 'Title');
-  } finally {
-    if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete process.stdout.isTTY;
-    if (original === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = original;
-  }
-});
-
-test('Quick clean selects all supported history operations alongside file cleanup without prompting', async t => {
-  const term = await terminal(t);
-  assert.deepEqual(await cleanOptions(false, term.context.signal), {
-    includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: true, removeRequestArchives: true, compactHooks: true,
-    compactToolDefinitions: true, compactSkillListings: true, removeOldSnapshots: true,
-  });
-  assert.equal(term.text(), '');
-  assert.equal((await cleanOptions(false, term.context.signal, false))?.removeOldSnapshots, false);
-  assert.equal((await cleanOptions(false, term.context.signal, false))?.removeReasoning, false);
-  const codexOnly = await cleanOptions(false, term.context.signal, true, false);
-  assert.equal(codexOnly?.removeRequestArchives, false);
-  assert.equal(codexOnly?.compactHooks, false);
-  assert.equal(codexOnly?.compactToolDefinitions, false);
-  assert.equal(codexOnly?.compactSkillListings, false);
-});
-
-test('standalone Slim history starts unchecked and only includes the selected operations', async t => {
-  const term = await terminal(t);
-  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
-    const original = Object.getOwnPropertyDescriptor(process, name)!;
-    Object.defineProperty(process, name, { configurable: true, get: () => value });
-    t.after(() => Object.defineProperty(process, name, original));
-  }
-  let answer = cleanOptions(true, term.context.signal);
-  await term.key('\r'); assert.equal(await answer, null);
-  for (const keys of ['1', '2', '12', '3', '123', '4', '5', '45', '12345', '6', '7', '67', '1234567', '8', '12345678']) {
-    answer = cleanOptions(true, term.context.signal);
-    for (const key of keys) await term.key(key);
-    await term.key('\r');
-    assert.deepEqual(await answer, { removeImages: keys.includes('1'), compactTools: keys.includes('2'),
-      removeReasoning: keys.includes('3'), removeRequestArchives: keys.includes('4'), compactHooks: keys.includes('5'),
-      compactToolDefinitions: keys.includes('6'), compactSkillListings: keys.includes('7'), removeOldSnapshots: keys.includes('8') });
-  }
-  answer = cleanOptions(true, term.context.signal, false, true);
-  await term.key('3'); await term.key('4'); await term.key('5'); await term.key('6'); await term.key('\r');
-  assert.deepEqual(await answer, {removeImages: false, compactTools: false, removeReasoning: false, removeRequestArchives: true, compactHooks: true, compactToolDefinitions: true, compactSkillListings: true, removeOldSnapshots: false});
-  answer = cleanOptions(true, term.context.signal, true, false);
-  await term.key('3'); await term.key('4'); await term.key('\r');
-  assert.deepEqual(await answer, {removeImages: false, compactTools: false, removeReasoning: true, removeRequestArchives: false, compactHooks: false, compactToolDefinitions: false, compactSkillListings: false, removeOldSnapshots: true});
-  answer = cleanOptions(true, term.context.signal);
-  await term.key('q'); assert.equal(await answer, null);
-  assert.match(stripVTControlCharacters(term.text()), /irreversible; no undo/);
-  assert.match(stripVTControlCharacters(term.text()), /more than 72 hours/);
 });
 
 test('hundreds of history actions render one bounded category summary including zero-saving operations', t => {
@@ -1048,24 +1110,6 @@ test('system temps show category estimates and selective accounting without list
   assert.doesNotMatch(lines.join('\n'), /Directory before|Directory after/);
 });
 
-test('temporary cleanup menu can be opened and cancelled before any scan', async t => {
-  const term = await terminal(t);
-  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
-    const descriptor = Object.getOwnPropertyDescriptor(process, name)!;
-    Object.defineProperty(process, name, {configurable: true, value});
-    t.after(() => Object.defineProperty(process, name, descriptor));
-  }
-  const running = menu({roots: {claude: '/inert/claude', codex: '/inert/codex'}, stateDir: '/inert/state'}, term.context.signal);
-  void running.catch(() => {});
-  await term.key('1');
-  assert.match(stripVTControlCharacters(term.text()), /4\. Clean temporary files/);
-  await term.key('4');
-  assert.match(stripVTControlCharacters(term.text()), /Claude Code/);
-  await term.key('q'); await term.key('q'); await running;
-  assert.doesNotMatch(stripVTControlCharacters(term.text()), /Scanning|Deep Scan|Confirm cleanup|Incomplete:/);
-});
-
-
 test('cleanup categories combine providers and temporary roots without double-counting history savings', t => {
   const lines: string[] = [];
   t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
@@ -1129,71 +1173,25 @@ test('cleanup categories combine providers and temporary roots without double-co
   assert.ok(lines.join('\n').startsWith(text), 'text-only previews use the same combined summary');
 });
 
-
-test('duplicate cleanup shows plaintext savings once and identifies the retained compressed copy', t => {
-  const output: string[] = [];
-  t.mock.method(console, 'log', (...args: unknown[]) => output.push(args.join(' ')));
-  const p = inertPlan(), a = p.actions[0], f = a.files[0];
-  Object.assign(f, {path: `${p.root}/sessions/one.jsonl`, relative: 'sessions/one.jsonl', category: 'sessions'});
-  Object.assign(a, {kind: 'deduplicate-history', targetId: f.relative, beforeBytes: 5120, afterBytes: 5120,
-    estimatedSavingsBytes: 4096, files: [f, {...f, path: f.path + '.zst', relative: f.relative + '.zst', size: 1024, ino: 1}]});
-  const original = structuredClone(p);
-  printPlan(p);
-  const text = stripVTControlCharacters(output.join('\n'));
-  assert.match(text, /4\.00 KiB\s+Remove duplicate originals \(keep zstd\) · 1 file/);
-  assert.match(text, /4\.00 KiB\s+Total estimated savings/);
-  assert.equal(text.match(/Remove duplicate originals/g)?.length, 1);
-  assert.match(text, /identical compressed histories are retained/);
-  assert.match(text, /No undo copy/);
-  assert.doesNotMatch(text, /one\.jsonl/);
-  const [provider] = cleanupFileNodes([p]), leaf = provider.children![0].children![0];
-  assert.equal(provider.bytes, 4096); assert.equal(leaf.bytes, 4096);
-  assert.match(leaf.detail!, /Remove duplicate original \(keep zstd\)/);
-  assert.ok(leaf.detail!.includes(`Remove: ${f.path}\nKeep: ${f.path}.zst`));
-  assert.deepEqual(p, original, 'rendering must not mutate the plan');
+test('ordinary menus keep their default selection and abort restores the terminal', async t => {
+  const term = await terminal(t);
+  const answer = select({ message: 'Confirm', choices: [{ name: 'Cancel', value: false }, { name: 'Confirm', value: true }] }, term.context);
+  await term.key('\r'); assert.equal(await answer, false);
+  const aborted = select({ message: 'Choose', choices }, term.context);
+  const rejected = assert.rejects(aborted, { name: 'AbortPromptError' });
+  term.abort(); await rejected;
+  assert.ok(term.text().includes('\x1b[?25h'));
 });
 
-test('cleanup notes and menu descriptions use readable terminal foreground in color mode', t => {
+test('NO_COLOR suppresses colors even in a terminal', () => {
   const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
-  const noColor = process.env.NO_COLOR, term = process.env.TERM;
-  Object.defineProperty(process.stdout, 'isTTY', {configurable: true, value: true});
-  delete process.env.NO_COLOR; process.env.TERM = 'xterm-256color';
-  t.after(() => {
-    if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete (process.stdout as any).isTTY;
-    if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor;
-    if (term === undefined) delete process.env.TERM; else process.env.TERM = term;
-  });
-  const lines: string[] = [];
-  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
-  printPlan({...inertPlan(), actions: [], warnings: ['Kept unchanged: unrecognized image format']});
-  assert.doesNotMatch(lines.join('\n'), /\x1b\[(?:90|2)m/);
-  assert.match(lines.join('\n'), /\x1b\[1m.*Scan notes/);
-  const description = menuRow({name: 'View scan notes', description: 'Full paths and reasons', value: 'notes'}, 0, false, 100, {total: 0, max: 0, labelWidth: 20, color: true});
-  assert.match(description, /Full paths and reasons/);
-  assert.doesNotMatch(description, /\x1b\[(?:90|2)m/);
-});
-
-test('empty Claude file plans explain available rules and summarize repeated notes without flooding paths', t => {
-  const lines: string[] = [];
-  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
-  const p = { ...inertPlan(), provider: 'claude' as const, actions: [], warnings: [
-    CLAUDE_FILE_CLEANUP_NOTICE,
-    ...Array.from({ length: 40 }, (_, i) => `projects/p/session-${i}.jsonl: Mixed session format versions require unverified compatibility`),
-    ...Array.from({ length: 2 }, (_, i) => `72-hour protection: projects/p/recent-${i}.jsonl; Entire operation retained.`),
-    ...Array.from({ length: 7 }, (_, i) => `Additional reason ${i}`),
-  ] };
-  const original = [...p.warnings];
-  printPlan(p);
-  const text = lines.join('\n');
-  assert.match(text, /Quick clean also checks known system temporary files/);
-  assert.match(text, /Slim history/);
-  assert.match(text, /40 × Mixed session format versions/);
-  assert.match(text, /2 × 72-hour protection: modified within the last 3 days, or file time is invalid; kept unchanged/);
-  assert.match(text, /Scan notes.*50 notices/);
-  assert.match(text, /One file can have several notices/);
-  assert.match(text, /Plus 4 more note types/);
-  assert.match(text, /--json/);
-  assert.doesNotMatch(text, /projects\/p\/session-/);
-  assert.ok(lines.length < 25);
-  assert.deepEqual(p.warnings, original, 'full warnings remain available in JSON and details');
+  const original = process.env.NO_COLOR;
+  try {
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: true });
+    process.env.NO_COLOR = '';
+    assert.equal(paint('purple', 'Title'), 'Title');
+  } finally {
+    if (tty) Object.defineProperty(process.stdout, 'isTTY', tty); else delete process.stdout.isTTY;
+    if (original === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = original;
+  }
 });
