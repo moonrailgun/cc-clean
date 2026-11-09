@@ -49,7 +49,7 @@ test('system temps join quick and ordinary cleanup, never manual or history-only
   for (const options of [{}, {includeFileCleanup: true, removeImages: true, compactTools: true}])
     assert.equal(includesSystemTemp(options), true);
   for (const options of [
-    {manual: true}, {files: ['/inert/file']}, {sessions: [uuid]}, {removeImages: true}, {compactTools: true}, {removeReasoning: true},
+    {manual: true}, {files: ['/inert/file']}, {sessions: [uuid]}, {removeImages: true}, {compactTools: true}, {removeReasoning: true}, {removeOldSnapshots: true},
     {removeRequestArchives: true}, {compactHooks: true}, {compactToolDefinitions: true}, {compactSkillListings: true}, {removeRequestArchives: true, compactHooks: true},
     {removeImages: true, compactTools: true}, {manual: true, includeFileCleanup: true},
     {files: ['/inert/file'], includeFileCleanup: true},

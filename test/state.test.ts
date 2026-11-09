@@ -591,3 +591,25 @@ test('duplicate receipts bind the retained copy and count only the removed origi
   assert.deepEqual(log.cleanupTypes, [{type: 'deduplicate-history', cleanedRecords: 1}]);
   assert.equal((await readStats(state)).savedBytes, 19);
 });
+
+test('old snapshot receipts require Codex, an enabled option, exact savings and coordinated projections', () => {
+  const r = receipt('/inert'), a = r.actions[0];
+  a.kind = 'slim-history'; a.files[0].category = 'sessions'; a.afterBytes = 10;
+  a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64); a.codexProjection = [];
+  a.recoveryState = 'applied'; r.confirmedReductionBytes = 9;
+  a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+  a.slimCounts = {images: 0, toolOutputs: 0, oldSnapshots: 1};
+  a.estimatedSavingsBytes = 9; a.slimSavingsBytes = {images: 0, toolOutputs: 0, oldSnapshots: 9};
+  assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    ...[false, undefined, null, 'true', 1].map(removeOldSnapshots => ({slimOptions: {...a.slimOptions, removeOldSnapshots}})),
+    ...[undefined, 0, -1, 0.5, '1', null].map(oldSnapshots => ({slimCounts: {...a.slimCounts, oldSnapshots}})),
+    ...[undefined, 0, 8, 10, -1, 0.5, '9', null].map(oldSnapshots => ({slimSavingsBytes: {...a.slimSavingsBytes, oldSnapshots}})),
+    {codexProjection: undefined},
+  ]) {
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0], changes);
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  const claude = structuredClone(r); claude.provider = 'claude'; delete claude.actions[0].codexProjection;
+  assert.throws(() => validateReceipt(claude), /receipt/);
+});

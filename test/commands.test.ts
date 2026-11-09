@@ -29,6 +29,11 @@ test('history flags are independent clean-only opt-ins and keep confirmation req
   assert.equal(quick.values['remove-images'], undefined);
   assert.equal(quick.values['compact-tools'], undefined);
   assert.equal(quick.values['remove-reasoning'], undefined);
+  assert.equal(quick.values['remove-old-snapshots'], undefined);
+  assert.throws(() => parseCommand(['clean', '--provider', 'claude', '--remove-old-snapshots', '--yes'], false), /Codex/);
+  assert.throws(() => parseCommand(['clean', '--temp-only', '--remove-old-snapshots', '--yes'], false), /--temp-only/);
+  assert.ok(commandSchema.commands[0].options.includes('remove-old-snapshots'));
+  assert.ok(help.includes('--remove-old-snapshots'));
   assert.equal(quick.values['remove-request-archives'], undefined);
   assert.equal(quick.values['compact-hooks'], undefined);
   assert.throws(() => parseCommand(['clean', '--provider', 'claude', '--remove-reasoning', '--yes'], false), /Codex/);
@@ -39,7 +44,7 @@ test('history flags are independent clean-only opt-ins and keep confirmation req
     assert.ok(commandSchema.commands[0].options.includes(flag.slice(2)));
     assert.ok(help.includes(flag));
   }
-  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-request-archives'], ['--compact-hooks'], ['--compact-tool-definitions'], ['--compact-skill-listings'], ['--remove-images', '--compact-tools', '--remove-reasoning', '--remove-request-archives', '--compact-hooks', '--compact-tool-definitions', '--compact-skill-listings']]) {
+  for (const flags of [['--remove-images'], ['--compact-tools'], ['--remove-reasoning'], ['--remove-old-snapshots'], ['--remove-request-archives'], ['--compact-hooks'], ['--compact-tool-definitions'], ['--compact-skill-listings'], ['--remove-images', '--compact-tools', '--remove-reasoning', '--remove-old-snapshots', '--remove-request-archives', '--compact-hooks', '--compact-tool-definitions', '--compact-skill-listings']]) {
     assert.throws(() => parseCommand(['clean', ...flags, '--json'], true), /--yes/);
     const parsed = parseCommand(['clean', ...flags, '--yes', '--json'], true);
     assert.equal(parsed.interactive, false);

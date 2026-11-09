@@ -22,7 +22,7 @@
 
 ## 三天保护（后续迭代的基本要求）
 
-- Quick clean、自动选择和批量操作中的一切有损或不可逆修改（包括删除、移除内嵌图片、精简工具输出、移除 Codex 加密推理状态、移除 Claude 请求存档、精简成功 hook、工具定义及技能列表），只允许处理最后修改时间严格早于当前时间 72 小时的内容。按文件 `mtime` 判断，不按会话创建时间；最近修改、恰好 72 小时、未来或无效时间均保留。
+- Quick clean、自动选择和批量操作中的一切有损或不可逆修改（包括删除、移除内嵌图片、精简工具输出、移除 Codex 加密推理状态及旧压缩快照、移除 Claude 请求存档、精简成功 hook、工具定义及技能列表），只允许处理最后修改时间严格早于当前时间 72 小时的内容。按文件 `mtime` 判断，不按会话创建时间；最近修改、恰好 72 小时、未来或无效时间均保留。
 - 唯一年龄例外是用户主动明确选定一个文件或一个不含子会话的会话进行单独操作。多选、选择整个 provider、批量扫描最后只剩一个候选、`--yes` 均不构成例外；会话展开后包含子会话时，整个删除范围按批量保护，范围内任一文件受保护则保留整个操作。
 - 无损且保留图片内容和元数据的 PNG 重压缩不受此年龄限制。单目标例外只豁免年龄，仍须通过格式兼容性、活动状态、引用、完整性及确认等既有检查。
 - 规划时排除受保护内容，不计入预计节省空间，并说明保留原因；执行前复核年龄与文件状态。不得通过新增入口或参数绕过此规则。年龄规则测试使用纯内存元数据，不运行清理规划器或执行器。
@@ -37,9 +37,9 @@
 ## 历史瘦身操作
 
 - 用户已接受移除会话内嵌 Base64 图片后无法再查看原图，以及精简命令输出后无法恢复被省略内容；也接受无法重建精确历史 API 请求、丢失成功 hook 的命令/输出/注入上下文和历史工具定义/技能列表，以及恢复后可能增加成本或缺少非关键上下文。目标是保留可追溯信息和继续聊天的能力，不要求完全还原当时场景；这不代表授权开发期间实际执行清理。
-- Claude Code 和 Codex 的 `Clean → Quick clean` 均默认将 `Remove inline images` 和 `Compact shell output` 纳入预估，与既有临时文件清理、无损 PNG 压缩合并展示，遵守三天保护及活动保护并等待用户主动按 Enter 才执行。Codex 另默认纳入 `Remove encrypted reasoning (Codex)`；Claude 另默认纳入 `Remove API request archives (Claude)`、`Compact successful hooks (Claude)`、`Compact tool definitions (Claude)`、`Compact skill listings (Claude)`。独立的 `Clean → Slim history` 所有选项默认不勾选，仅展示所选 provider 支持的操作；CLI 通过显式 `--remove-images` / `--compact-tools` / `--remove-reasoning` / `--remove-request-archives` / `--compact-hooks` / `--compact-tool-definitions` / `--compact-skill-listings` 启用历史瘦身。
+- Claude Code 和 Codex 的 `Clean → Quick clean` 均默认将 `Remove inline images` 和 `Compact shell output` 纳入预估，与既有临时文件清理、无损 PNG 压缩合并展示，遵守三天保护及活动保护并等待用户主动按 Enter 才执行。Codex 另默认纳入 `Remove encrypted reasoning (Codex)` 和 `Remove old compaction snapshots (Codex)`；Claude 另默认纳入 `Remove API request archives (Claude)`、`Compact successful hooks (Claude)`、`Compact tool definitions (Claude)` 和 `Compact skill listings (Claude)`。独立的 `Clean → Slim history` 所有选项默认不勾选，仅展示所选 provider 支持的操作；CLI 通过显式 `--remove-images` / `--compact-tools` / `--remove-reasoning` / `--remove-request-archives` / `--compact-hooks` / `--compact-tool-definitions` / `--compact-skill-listings` / `--remove-old-snapshots` 启用历史瘦身。
 - 操作顺序固定为扫描、深度扫描、按操作分类展示数量及预计节省空间（图片移除、输出精简和推理密文移除单独统计）、展示总额及不可逆提示，再等待用户主动按 Enter。默认不逐条展示文件；完整路径及逐文件预估保留在 `View files` 和 JSON 中。交互模式的 `--yes` 不得跳过回车确认；非交互和 JSON 模式通过显式 `--yes` 执行，不得弹出提示。
-- 分类预估必须合并本次选中的所有 provider 和临时目录，每种操作与总额只展示一次；图片移除、无损 PNG 压缩、终端输出精简、Codex 推理密文移除、Claude 请求存档移除、成功 hook 精简、工具定义精简、技能列表精简及各类临时文件分别统计，不重复计入历史瘦身总额，未知预估不得显示为零。
+- 分类预估必须合并本次选中的所有 provider 和临时目录，每种操作与总额只展示一次；图片移除、无损 PNG 压缩、终端输出精简、Codex 推理密文移除、旧压缩快照移除、Claude 请求存档移除、成功 hook 精简、工具定义精简、技能列表精简及各类临时文件分别统计，不重复计入历史瘦身总额，未知预估不得显示为零。
 - Claude 请求存档仅在存在独立对话记录且整个存档族结构已识别时，一起移除 `api-request`、`api-request-shape`、`api-request-blob`；未知存档类型或字段保留整个存档族。成功 hook 仅清空已识别 `hook_success` 且 `exitCode=0` 的 `command`、`content`、`stdout`、`stderr` 及已记录 `rendered`；保留整条记录的 UUID、parentUuid、时间、状态及其他未修改字节。此 hook 操作保留失败或未知 hook、`prompt_snapshot`、instructions、`skill_listing`。原生验证及组合操作的合成验证边界见兼容性文档。
 - 用户已明确要求将 Claude 工具定义及技能列表精简纳入 Quick clean 默认项。工具定义仅清空已识别 `prompt_snapshot.attachment.tools`；保留系统提示词。技能列表仅清空已识别 `skill_listing.attachment.content` 及已记录 `rendered`，并将 `names` 重置为 `[]`、`skillCount` 重置为 `0`，避免旧发现状态抑制重新发现技能；即使计数改写不节省字节也必须完成。保留整条记录及身份/关联字段，未知结构保留。两项单独预估，沿用保护、原子替换及恢复流程；兼容性文档中的有限原生继续对话证据不代表所有工具、MCP/插件或版本都已验证。
 - 按已验证的 provider 格式替换图片块或精简成功的命令输出；保留会话/工具调用身份、签名、关联信息及未修改字段的原始字节。无法识别、失败、仍在运行的输出保持原样。Codex 独立的普通 legacy/paginated JSONL 可瘦身，须同步更新已识别的 SQLite 字节偏移和缓存项；跨 rollout 共享引用及未知偏移结构在实现关联更新前禁止重写。
@@ -48,6 +48,7 @@
 - 必须复用原子替换和恢复机制，执行前重新验证预览哈希及文件状态。Codex 替换 JSONL 时持有索引写事务，索引核验成功后才能删除临时原文；中断恢复须核对原文及索引前后哈希并补齐索引，不能盲目删除备份。成功后不保留可撤销副本；预览必须说明不可逆。
 - Codex 推理移除仅删除直接 `response_item.payload.type=reasoning` 中非空字符串 `encrypted_content`；保留摘要、content、签名、ID、compaction 密文及嵌套替换历史。移除后的推理状态不可恢复，须在确认前说明。
 - 只读测试可使用内存中的合成 JSONL、内存 SQLite 和临时布局/回执 fixture；不得因此调用清理规划器、执行器、清理预览命令或原生恢复/删除探针。
+- Codex 旧压缩快照清理仅移除最新完整 `compacted` 之前的 `replacement_history` 及配套 `replacement_history_metadata`，保留最新快照整行、所有摘要、普通聊天、用量和其他未修改字节。最新快照缺失或不完整、任一压缩记录结构未知、出现回滚事件时保留该文件；共享引用及未知依赖仍受保护。旧快照不可恢复，回到更早位置分叉或回滚的上下文可能不同，须在确认前说明。Quick clean 默认启用，独立 Slim history 默认不勾选，CLI 显式使用 `--remove-old-snapshots`；单独统计数量和节省空间并沿用索引同步及恢复流程。
 - Codex 普通清理及 Quick clean 默认纳入同名 `.jsonl` / `.jsonl.zst` 去重；仅在完整解压所有帧后逐字节相同时移除原文，压缩版保持原样。两份文件均须严格超过 72 小时且不处于活动状态，显式选择原文不豁免这组文件的年龄保护。共享引用、额外身份副本、链接、未知依赖或损坏流均保留；复用索引事务、回执及中断恢复，禁止走普通文件删除捷径。单独统计移除的一个原文及其节省空间；临时文件专用和独立历史瘦身模式不加入去重。
 - 所有新增 Codex 历史变更必须复用 JSONL、SQLite 偏移/缓存及已知关联依赖的同步主流程，包含预估、执行和中断恢复；不得从普通删除/压缩入口绕过。待执行/恢复的改写必须携带 `codexProjection`，无索引也须显式为空数组；未知依赖或结构不得改写。每次扩展同步更新必要的索引/缓存处理、合成测试和兼容性文档，整会话删除继续使用原生协调路径。
 

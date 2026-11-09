@@ -19,6 +19,12 @@ const claude = (type: string, content: unknown[], extra = {}) => ({type, session
 const meta = {type: 'session_meta', payload: {id: 'synthetic', cli_version: '0.167.0'}};
 const codex = (payload: unknown) => ({type: 'response_item', payload});
 const jsonl = (...rows: unknown[]) => Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+const oldSnapshots = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+const snapshot = (n: number) => ({type: 'compacted', payload: {
+  message: `Summary ${n}`, window_id: n,
+  replacement_history: [{type: 'message', role: 'user', content: [{type: 'input_text', text: `Checkpoint ${n}`}]}],
+  replacement_history_metadata: [{}],
+}});
 const matches = Array.from({length: 40}, (_, i) => `src/very-long-directory-name/example.ts:${i + 1}:matching source line ${i}`).join('\n');
 const compacted = (buffer: Buffer, provider: 'claude' | 'codex', options = both) => {
   const result = slimHistory(buffer, provider, options);
@@ -523,4 +529,125 @@ test('Claude Quick clean combines all history operations without double counting
   assert.equal(savings, input.length - result.output.length);
   assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), savings);
   assert.equal(slimHistory(result.output, 'claude', options).output, null);
+});
+
+test('old snapshots remove paired arrays only and preserve latest history, summaries and usage bytes', () => {
+  const usage = {input_tokens: 100, cached_input_tokens: 10, output_tokens: 20, reasoning_output_tokens: 3, total_tokens: 120};
+  const usageRecord = {thread_id: '00000000-0000-0000-0000-000000000001', session_id: '00000000-0000-0000-0000-000000000002',
+    turn_id: 'turn', root_turn_id: 'root', response_id: 'response', usage, turn_token_usage: usage, thread_token_usage: usage};
+  for (const paginated of [false, true]) for (const eol of ['\n', '\r\n']) for (const ending of ['', eol]) {
+    const rows = [meta, codex({type: 'message', role: 'user', content: [{type: 'input_text', text: 'Original question'}]}),
+      snapshot(1), {type: 'token_usage_record', payload: usageRecord}, snapshot(2), snapshot(3),
+      codex({type: 'message', role: 'assistant', content: [{type: 'output_text', text: 'Latest answer'}]})];
+    const old = rows[2] as ReturnType<typeof snapshot>;
+    Object.assign(old.payload, {latest_token_usage_record: usageRecord, compaction_response_id: 'response',
+      resume_metadata: {multi_agent_version: 'v2', previous_turn_settings: {model: 'synthetic', comp_hash: 'hash'}}});
+    if (paginated) rows[0] = {...meta, payload: {...meta.payload, history_mode: 'paginated'} as typeof meta.payload};
+    const raw = rows.map((row, n) => JSON.stringify(paginated && n ? {...row, ordinal: n - 1} : row));
+    const input = Buffer.from(raw.join(eol) + ending), before = Buffer.from(input);
+    const result = slimHistory(input, 'codex', oldSnapshots);
+    assert.ok(result.output);
+    assert.deepEqual(result.counts, {images: 0, toolOutputs: 0, oldSnapshots: 2});
+    assert.deepEqual(result.savingsBytes, {images: 0, toolOutputs: 0, oldSnapshots: input.length - result.output.length});
+    const after = result.output.toString().split(eol);
+    for (const n of [0, 1, 3, 5, 6]) assert.equal(after[n], raw[n]);
+    for (const n of [2, 4]) {
+      const expected = JSON.parse(raw[n]);
+      delete expected.payload.replacement_history; delete expected.payload.replacement_history_metadata;
+      assert.equal(after[n], JSON.stringify(expected));
+    }
+    assert.deepEqual(input, before);
+    assert.equal(slimHistory(result.output, 'codex', oldSnapshots).output, null);
+    assert.equal(slimHistory(input, 'codex', {removeImages: false, compactTools: false}).output, null);
+  }
+});
+
+test('paired snapshot removal preserves raw spans for every member position and absent or null metadata', () => {
+  const history = '"replacement_history" : []', metadata = '"replacement_history_metadata" : []';
+  const rest = '"message" : "Keep \\u0061", "window_number":1';
+  for (const [payload, expected] of [
+    [`{${history}, ${metadata}, ${rest}}`, `{  ${rest}}`],
+    [`{${rest}, ${history}, ${metadata}}`, `{${rest}}`],
+    [`{${history}, ${rest}, ${metadata}}`, `{ ${rest}}`],
+    [`{${metadata}, ${rest}, ${history}}`, `{ ${rest}}`],
+    [`{${rest}, ${metadata}, ${history}}`, `{${rest}}`],
+    [`{${history}, ${rest}}`, `{ ${rest}}`],
+    [`{${history}, "replacement_history_metadata":null, ${rest}}`, `{  ${rest}}`],
+  ]) {
+    const prefix = jsonl(meta).toString(), suffix = jsonl(snapshot(2)).toString();
+    const row = `{"type":"compacted","payload":${payload}}\r\n`;
+    const input = Buffer.from(prefix + row + suffix);
+    const result = slimHistory(input, 'codex', oldSnapshots);
+    assert.equal(result.output?.toString(), prefix + row.replace(payload, expected) + suffix);
+    assert.equal(result.savingsBytes.oldSnapshots, input.length - result.output!.length);
+  }
+});
+
+test('latest empty checkpoint is preserved and old-snapshot cleanup composes with other operations', () => {
+  const latest = {type: 'compacted', payload: {message: 'Latest empty', window_number: 2, replacement_history: [], replacement_history_metadata: []}};
+  const input = jsonl(meta, snapshot(1), latest);
+  assert.deepEqual(JSON.parse(slimHistory(input, 'codex', oldSnapshots).output!.toString().trim().split('\n').at(-1)!), latest);
+  for (const rows of [[meta], [meta, latest], [meta, {type: 'compacted', payload: {message: 'Only summary'}}]])
+    assert.equal(slimHistory(jsonl(...rows), 'codex', oldSnapshots).output, null);
+  assert.equal(slimHistory(jsonl(claude('user', ['Keep']), snapshot(1), snapshot(2)), 'claude', oldSnapshots).output, null);
+  const reasoning = {type: 'reasoning', summary: [{type: 'summary_text', text: 'Keep'}], encrypted_content: 'opaque'};
+  const message = {type: 'message', role: 'user', content: [{type: 'input_image', image_url: 'data:image/png;base64,' + data}]};
+  const checkpoint = {type: 'compacted', payload: {message: 'Keep latest', window_number: 2, replacement_history: [reasoning, message]}};
+  const combined = {...oldSnapshots, removeImages: true, removeReasoning: true};
+  const source = jsonl(meta, snapshot(1), checkpoint, codex(reasoning), codex(message));
+  const result = slimHistory(source, 'codex', combined);
+  assert.deepEqual(result.counts, {images: 1, toolOutputs: 0, reasoning: 1, oldSnapshots: 1});
+  assert.equal(Object.values(result.savingsBytes).reduce((a, b) => a + b, 0), source.length - result.output!.length);
+  assert.equal(result.output!.toString().split('\n')[2], JSON.stringify(checkpoint));
+});
+
+test('supported snapshot tools and metadata preserve the latest row independently of version', () => {
+  const history = [
+    {type: 'message', role: 'assistant', phase: 'final_answer', content: [{type: 'output_text', text: 'Keep', annotations: [], logprobs: []}]},
+    {type: 'function_call', name: 'exec_command', arguments: '{}', call_id: 'function', encrypted_function_args: ['opaque']},
+    {type: 'function_call_output', call_id: 'function', output: 'Keep output'},
+    {type: 'custom_tool_call', name: 'apply_patch', input: 'patch', call_id: 'custom'},
+    {type: 'custom_tool_call_output', call_id: 'custom', output: 'Keep result'},
+    {type: 'compaction', encrypted_content: 'opaque'}, {type: 'context_compaction'},
+  ];
+  const latest = {type: 'compacted', payload: {message: 'Keep summary', window_number: 2, window_id: 'window',
+    replacement_history: history, replacement_history_metadata: history.map(() => ({client_authored: false, guardian_sources: []})),
+    resume_metadata: {multi_agent_version: 'v2', previous_turn_settings: {model: 'synthetic', realtime_active: false}}}};
+  for (const cli_version of [undefined, '0.167.0', 'future-custom']) {
+    const input = jsonl({...meta, payload: {...meta.payload, cli_version}}, snapshot(1),
+      {type: 'compacted', payload: {message: 'Earlier summary without checkpoint'}}, latest);
+    const result = slimHistory(input, 'codex', oldSnapshots);
+    assert.equal(result.counts.oldSnapshots, 1);
+    assert.equal(result.output!.toString().trim().split('\n').at(-1), JSON.stringify(latest));
+  }
+  for (const invalid of [
+    {...history[1], arguments: {}}, {...history[1], encrypted_function_args: [1]},
+    {...history[3], input: null}, {...history[5], encrypted_content: null},
+  ]) {
+    const payload = {...latest.payload, replacement_history: [invalid], replacement_history_metadata: [{}]};
+    assert.throws(() => slimHistory(jsonl(meta, snapshot(1), {...latest, payload}), 'codex', oldSnapshots), /snapshots retained/);
+  }
+});
+
+test('ambiguous snapshots and rollback histories cannot remove earlier checkpoints', () => {
+  const latest = snapshot(2);
+  for (const payload of [
+    {...latest.payload, replacement_history: undefined}, {...latest.payload, replacement_history: null},
+    {...latest.payload, replacement_history: {}}, {...latest.payload, replacement_history_metadata: []},
+    {...latest.payload, replacement_history_metadata: [null]}, {...latest.payload, replacement_history_metadata: [{unknown: true}]},
+    {...latest.payload, replacement_history: [{type: 'message', role: 'user'}]},
+    {...latest.payload, replacement_history: [{type: 'unknown'}]},
+    {...latest.payload, replacement_history: [{type: 'reasoning', summary: [{}]}]},
+    {...latest.payload, replacement_history: [{type: 'function_call_output', call_id: 'id', output: [{type: 'text', text: 'Keep'}]}]},
+    {...latest.payload, message: null}, {...latest.payload, window_id: 'id'},
+    {...latest.payload, window_number: -1}, {...latest.payload, future: true},
+    {...latest.payload, resume_metadata: {multi_agent_version: 'future'}},
+    {...latest.payload, latest_token_usage_record: {}}, {...latest.payload, retained_context: {}},
+  ]) assert.throws(() => slimHistory(jsonl(meta, snapshot(1), {...latest, payload}), 'codex', oldSnapshots), /snapshots retained/);
+  for (const n of [1, 2, 3]) {
+    const rows: unknown[] = [meta, snapshot(1), snapshot(2)];
+    rows.splice(n, 0, {type: 'event_msg', payload: {type: 'thread_rolled_back', num_turns: 1}});
+    assert.throws(() => slimHistory(jsonl(...rows), 'codex', oldSnapshots), /rollback/);
+  }
+  assert.throws(() => slimHistory(jsonl(meta, {...snapshot(1), future: true}, latest), 'codex', oldSnapshots), /snapshots retained/);
 });

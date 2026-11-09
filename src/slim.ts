@@ -1,10 +1,11 @@
 import type { Provider } from './types.ts';
 import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
+import { knownCompactionSnapshot, completeCompactionSnapshot } from './providers/codex-snapshots.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
-export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean }
-export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number }
-export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number }
+export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean; removeOldSnapshots?: boolean }
+export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number; oldSnapshots?: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number; oldSnapshots?: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
@@ -241,6 +242,9 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   if (options.compactHooks) { counts.hooks = 0; savingsBytes.hooks = 0; }
   if (options.compactToolDefinitions) { counts.toolDefinitions = 0; savingsBytes.toolDefinitions = 0; }
   if (options.compactSkillListings) { counts.skillListings = 0; savingsBytes.skillListings = 0; }
+  if (options.removeOldSnapshots) { counts.oldSnapshots = 0; savingsBytes.oldSnapshots = 0; }
+  const snapshots: number[] = [];
+  let lastCompaction = -1, latestComplete = false, snapshotsKnown = true, rollback = false;
   const requestLines = new Set<number>();
   let requestsKnown = true, conversationRecords = 0;
   const calls = new Map<string, RtkFilter | undefined>();
@@ -342,6 +346,15 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           counts.images += count;
         }
       }
+      if (options.removeOldSnapshots) {
+        if (row.type === 'compacted') {
+          lastCompaction = n;
+          latestComplete = completeCompactionSnapshot(row);
+          snapshotsKnown &&= knownCompactionSnapshot(row);
+          if (Array.isArray(payload?.replacement_history)) snapshots.push(n);
+        }
+        if (row.type === 'event_msg' && payload?.type === 'thread_rolled_back') rollback = true;
+      }
       if (row.type === 'response_item' && object(payload)) {
         if (options.removeReasoning && payload.type === 'reasoning' && typeof payload.encrypted_content === 'string' && payload.encrypted_content.length) {
           parsed.remove(payload, 'encrypted_content', 'reasoning');
@@ -371,6 +384,22 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     if (options.compactSkillListings) savingsBytes.skillListings! += parsed.savingsBytes.skillListings ?? 0;
   }
   if (!records || !session) throw new Error('History format or session identity could not be established');
+  const oldSnapshots = snapshots.filter(n => n < lastCompaction);
+  if (oldSnapshots.length) {
+    if (!snapshotsKnown || !latestComplete || rollback)
+      throw new Error('Old compaction snapshots retained: incomplete or unsupported checkpoint, or rollback history');
+    for (const n of oldSnapshots) {
+      // Remove in separate passes so adjacent members cannot overlap their comma spans.
+      for (const key of ['replacement_history', 'replacement_history_metadata']) {
+        const parsed = parseLine(lines[n]);
+        if (!Object.hasOwn(parsed.row.payload, key)) continue;
+        parsed.remove(parsed.row.payload, key, 'oldSnapshots');
+        lines[n] = parsed.render();
+        savingsBytes.oldSnapshots! += parsed.savingsBytes.oldSnapshots!;
+      }
+      counts.oldSnapshots!++;
+    }
+  }
   // Remove the entire known archive family together; unknown siblings may still reference it.
   if (requestsKnown && conversationRecords) {
     if (options.removeRequestArchives) counts.requestRecords = requestLines.size;

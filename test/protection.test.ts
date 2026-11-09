@@ -237,3 +237,19 @@ test('duplicate pairs require both files older than 72 hours even with an explic
     assert.match(p.warnings.join('\n'), /Activity protection/);
   }
 });
+
+test('old snapshot removal inherits strict age and active-client protection', async () => {
+  for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
+    const a = action('slim-history', mtime);
+    a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+    a.slimCounts = {images: 0, toolOutputs: 0, oldSnapshots: 1};
+    const p = protectRecentContent(plan([a]), now);
+    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+  }
+  const a = action('slim-history', cutoff - 1);
+  a.slimOptions = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+  const p = plan([a], a.files[0].path);
+  await protectActiveContent(p, async () => 'Idle client remains open');
+  assert.deepEqual(p.actions, []);
+  assert.match(p.warnings.join('\n'), /Activity protection/);
+});

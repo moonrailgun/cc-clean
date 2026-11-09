@@ -163,7 +163,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   }
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
-  if(options.slim?.removeImages||options.slim?.compactTools||options.slim?.removeReasoning||options.slim?.removeRequestArchives||options.slim?.compactHooks||options.slim?.compactToolDefinitions||options.slim?.compactSkillListings) {
+  if(options.slim?.removeImages||options.slim?.compactTools||options.slim?.removeReasoning||options.slim?.removeRequestArchives||options.slim?.compactHooks||options.slim?.compactToolDefinitions||options.slim?.compactSkillListings||options.slim?.removeOldSnapshots) {
     let layoutValid=true,blocked=new Map<string,string>();
     if(inv.provider==='codex') {
       try {blocked=await verifyCodexRewriteLayout(inv);}catch(error){plan.warnings.push((error as Error).message);layoutValid=false;}

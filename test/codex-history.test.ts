@@ -345,3 +345,35 @@ test('duplicate layout retains shared, hardlinked and unknown-format pairs', asy
     assert.equal(blocked.has(plain), true); assert.equal(blocked.has(zipped), true);
   }
 });
+
+test('old snapshot slimming coordinates line offsets and recovery hashes while preserving caches and ordinals', () => {
+  const opts = {removeImages: false, compactTools: false, removeOldSnapshots: true};
+  const snapshot = {type: 'compacted', payload: {message: 'Keep summary', window_number: 1,
+    replacement_history: [{type: 'message', role: 'user', content: [{type: 'input_text', text: 'Old context'}]}],
+    replacement_history_metadata: [{}]}};
+  const source = lines(header, {...snapshot, ordinal: 0}, {ordinal: 1, type: 'event_msg', payload: {type: 'item_completed', item}},
+    {...snapshot, ordinal: 2, payload: {...snapshot.payload, window_number: 2}});
+  const result = slimHistory(source, 'codex', opts), output = result.output!;
+  const start = lines(header, {...snapshot, ordinal: 0}).length;
+  const db = fixture();
+  try {
+    db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=?, next_rollout_ordinal=3').run(source.length);
+    db.prepare("UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=?, rollout_ordinal=1 WHERE thread_id='rollout'").run(start, source.length);
+    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+    const after = rewriteProjection(before, byteOffsetMap(source, output), opts);
+    assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
+    assert.equal(after.thread_turns[0].rollout_byte_offset, BigInt(start - result.savingsBytes.oldSnapshots!));
+    assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.length));
+    assert.equal(after.thread_turns[0].rollout_ordinal, 1n);
+    assert.equal(after.thread_history_projection_state[0].next_rollout_ordinal, 3n);
+    assert.deepEqual(after.thread_items, structuredClone(before.thread_items));
+    const receipt = {beforeHash: projectionHash(before), afterHash: projectionHash(after)};
+    assert.notEqual(receipt.beforeHash, receipt.afterHash);
+    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'before');
+    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('ROLLBACK');
+    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
+    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
+    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'after');
+    assert.deepEqual(projectionSnapshot(db, 'other'), other);
+  } finally { db.close(); }
+});

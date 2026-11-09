@@ -10,7 +10,7 @@ export const commandSchema = {
   stateDirectory: '~/.config/cc-clean/',
   ageProtection: { hours: 72, basis: 'File modification time; strictly older than 72 hours', scope: 'Bulk deletion and history slimming', exception: 'One explicitly selected file or one session without descendants; --yes and multi-selection do not bypass protection', losslessPng: 'Exempt' },
   commands: [
-    { command: 'clean', description: 'Clean known temporary outputs, PNGs and identical Codex history copies (keep zstd), or explicitly slim history', mutates: true, options: [...common, 'file', 'temp-only', 'remove-images', 'compact-tools', 'remove-reasoning', 'remove-request-archives', 'compact-hooks', 'compact-tool-definitions', 'compact-skill-listings', 'dry-run', 'yes'] },
+    { command: 'clean', description: 'Clean known temporary outputs, PNGs and identical Codex history copies (keep zstd), or explicitly slim history', mutates: true, options: [...common, 'file', 'temp-only', 'remove-images', 'compact-tools', 'remove-reasoning', 'remove-request-archives', 'compact-hooks', 'compact-tool-definitions', 'compact-skill-listings', 'remove-old-snapshots', 'dry-run', 'yes'] },
     { command: 'analyze', description: 'Report directory, project, session, usage and compression data', mutates: false, options: [...common, 'view', 'project'] },
     { command: 'analyze delete', description: 'Delete explicit sessions or eligible files', mutates: true, options: [...common, 'session', 'file', 'dry-run', 'yes'], requires: 'One provider and either session UUIDs or absolute file paths' },
     { command: 'stats', description: 'Report savings and operation history separately by provider', mutates: false, options: common },
@@ -25,6 +25,7 @@ export const commandSchema = {
     'remove-images': { type: 'boolean', description: 'Permanently replace inline history images with text (clean only)' },
     'compact-tools': { type: 'boolean', description: 'Permanently shorten recognized successful shell output using RTK filters (clean only)' },
     'remove-reasoning': { type: 'boolean', description: 'Permanently remove Codex encrypted reasoning state; summaries remain (clean only)' },
+    'remove-old-snapshots': { type: 'boolean', description: 'Remove superseded Codex compaction history and metadata; keep the latest complete snapshot (clean only)' },
     'remove-request-archives': { type: 'boolean', description: 'Permanently remove Claude API request archives; retain conversation and usage records (clean only)' },
     'compact-hooks': { type: 'boolean', description: 'Permanently clear successful Claude hook commands, output and injected context; retain identities (clean only)' },
     'compact-tool-definitions': { type: 'boolean', description: 'Clear recorded Claude tool definitions; preserve system prompts and tool calls (clean only)' },
@@ -47,7 +48,7 @@ Usage:
   cc-clean clean [--provider claude|codex|all] [--dry-run|--yes]
   cc-clean clean --temp-only [--provider claude|codex|all] [--dry-run|--yes]
   cc-clean clean --provider claude|codex --file <absolute-path> [--file <path>] [--dry-run|--yes]
-  cc-clean clean [--provider claude|codex|all] [--remove-images] [--compact-tools] [--remove-reasoning] [--remove-request-archives] [--compact-hooks] [--compact-tool-definitions] [--compact-skill-listings] [--dry-run|--yes]
+  cc-clean clean [--provider claude|codex|all] [--remove-images] [--compact-tools] [--remove-reasoning] [--remove-request-archives] [--compact-hooks] [--compact-tool-definitions] [--compact-skill-listings] [--remove-old-snapshots] [--dry-run|--yes]
   cc-clean analyze [--provider claude|codex|all] [--view directories|projects|sessions|usage|opportunities]
   cc-clean analyze delete --provider claude|codex --session <uuid> [--session <uuid>] [--dry-run|--yes]
   cc-clean analyze delete --provider claude|codex --file <absolute-path> [--file <path>] [--dry-run|--yes]
@@ -63,6 +64,7 @@ Options:
   --remove-images               Slim history: irreversibly replace inline images with text
   --compact-tools               Slim history: irreversibly filter recognized shell output with RTK
   --remove-reasoning             Slim Codex history: irreversibly remove encrypted reasoning state
+  --remove-old-snapshots         Slim Codex history: remove old snapshots; preserve the latest checkpoint
   --remove-request-archives     Slim Claude history: irreversibly remove API request archives
   --compact-hooks               Slim Claude history: clear successful hook commands, output and context
   --compact-tool-definitions    Slim Claude history: clear recorded tool definitions; keep system prompts
@@ -115,7 +117,7 @@ export function parseCommand(args: string[], tty: boolean) {
       session: { type: 'string', multiple: true }, file: { type: 'string', multiple: true },
       'dry-run': { type: 'boolean' }, json: { type: 'boolean' }, 'no-interactive': { type: 'boolean' },
       yes: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean' },
-      'remove-images': { type: 'boolean' }, 'compact-tools': { type: 'boolean' }, 'remove-reasoning': { type: 'boolean' },
+      'remove-images': { type: 'boolean' }, 'compact-tools': { type: 'boolean' }, 'remove-reasoning': { type: 'boolean' }, 'remove-old-snapshots': { type: 'boolean' },
       'remove-request-archives': { type: 'boolean' }, 'compact-hooks': { type: 'boolean' },
       'compact-tool-definitions': { type: 'boolean' }, 'compact-skill-listings': { type: 'boolean' },
       'temp-only': { type: 'boolean' },
@@ -133,8 +135,9 @@ export function parseCommand(args: string[], tty: boolean) {
     if (values.view && (command !== 'analyze' || deleting)) throw new UsageError('--view is only valid for analyze');
     if (values.project !== undefined && (command !== 'analyze' || deleting || view !== 'sessions' || !isAbsolute(values.project))) throw new UsageError('--project requires analyze --view sessions and an absolute project path');
     if (values.session && !deleting) throw new UsageError('--session is only valid for analyze delete');
-    if (values['temp-only'] && (command !== 'clean' || values.file || values.session || values['remove-images'] || values['compact-tools'] || values['remove-reasoning'] || values['remove-request-archives'] || values['compact-hooks'] || values['compact-tool-definitions'] || values['compact-skill-listings'])) throw new UsageError('--temp-only requires clean without explicit targets or history slimming flags');
-    if ((values['remove-images'] !== undefined || values['compact-tools'] !== undefined || values['remove-reasoning'] !== undefined || values['remove-request-archives'] !== undefined || values['compact-hooks'] !== undefined || values['compact-tool-definitions'] !== undefined || values['compact-skill-listings'] !== undefined) && command !== 'clean') throw new UsageError('History slimming flags require clean');
+    if (values['temp-only'] && (command !== 'clean' || values.file || values.session || values['remove-images'] || values['compact-tools'] || values['remove-reasoning'] || values['remove-request-archives'] || values['compact-hooks'] || values['compact-tool-definitions'] || values['compact-skill-listings'] || values['remove-old-snapshots'])) throw new UsageError('--temp-only requires clean without explicit targets or history slimming flags');
+    if ((values['remove-images'] !== undefined || values['compact-tools'] !== undefined || values['remove-reasoning'] !== undefined || values['remove-request-archives'] !== undefined || values['compact-hooks'] !== undefined || values['compact-tool-definitions'] !== undefined || values['compact-skill-listings'] !== undefined || values['remove-old-snapshots'] !== undefined) && command !== 'clean') throw new UsageError('History slimming flags require clean');
+    if (values['remove-old-snapshots'] && provider === 'claude') throw new UsageError('--remove-old-snapshots applies only to Codex; use --provider codex or all');
     if (values['remove-reasoning'] && provider === 'claude') throw new UsageError('--remove-reasoning applies only to Codex; use --provider codex or all');
     if ((values['remove-request-archives'] || values['compact-hooks'] || values['compact-tool-definitions'] || values['compact-skill-listings']) && provider === 'codex') throw new UsageError('--remove-request-archives, --compact-hooks, --compact-tool-definitions and --compact-skill-listings apply only to Claude; use --provider claude or all');
     if ((values.yes || values['dry-run'] || values.file) && !mutating) throw new UsageError('--yes, --dry-run and --file require a cleanup or deletion command');

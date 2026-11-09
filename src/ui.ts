@@ -103,6 +103,7 @@ export function printPlans(plans: Plan[]) {
       ['images', 'removeImages', 'Remove inline images', 'images'],
       ['toolOutputs', 'compactTools', 'Compact shell output', 'outputs'],
       ['reasoning', 'removeReasoning', 'Remove encrypted reasoning (Codex)', 'blocks'],
+      ['oldSnapshots', 'removeOldSnapshots', 'Remove old compaction snapshots (Codex)', 'snapshots'],
       ['requestRecords', 'removeRequestArchives', 'Remove API request archives (Claude)', 'records'],
       ['hooks', 'compactHooks', 'Compact successful hooks (Claude)', 'hooks'],
       ['toolDefinitions', 'compactToolDefinitions', 'Compact tool definitions (Claude)', 'definitions'],
@@ -131,6 +132,7 @@ export function printPlans(plans: Plan[]) {
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
   if (actions.some(a => a.kind === 'deduplicate-history')) note('Duplicate plaintext files will be removed; identical compressed histories are retained. Both files must be more than 72 hours old. No undo copy is kept.');
   if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
+  if (actions.some(a => a.slimOptions?.removeOldSnapshots)) note('Irreversible: older compaction snapshots will be deleted; the latest complete snapshot is preserved. Context for forks or rollbacks to older positions may differ.');
   if (actions.some(a => a.slimOptions?.removeRequestArchives)) note('API request archives will be deleted; exact historical requests cannot be reconstructed.');
   if (actions.some(a => a.slimOptions?.compactHooks)) note('Successful hook commands, output and injected context will be cleared. Resumed context may differ.');
   if (actions.some(a => a.slimOptions?.compactToolDefinitions || a.slimOptions?.compactSkillListings))
@@ -348,6 +350,7 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
             ['images', 'removeImages', 'images', 'Remove inline images'],
             ['toolOutputs', 'compactTools', 'outputs', 'Compact shell output'],
             ['reasoning', 'removeReasoning', 'reasoning blocks', 'Remove encrypted reasoning'],
+            ['oldSnapshots', 'removeOldSnapshots', 'old snapshots', 'Remove old compaction snapshots'],
             ['requestRecords', 'removeRequestArchives', 'request records', 'Remove API request archives'],
             ['hooks', 'compactHooks', 'hooks', 'Compact successful hooks'],
             ['toolDefinitions', 'compactToolDefinitions', 'tool definitions', 'Compact tool definitions'],
@@ -404,7 +407,7 @@ export async function confirmPlans(plans: Plan[], signal?: AbortSignal) {
   }
 }
 export async function cleanOptions(slim: boolean, signal?: AbortSignal, codex = true, claude = true) {
-  if (!slim) return { includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: codex, removeRequestArchives: claude, compactHooks: claude, compactToolDefinitions: claude, compactSkillListings: claude };
+  if (!slim) return { includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: codex, removeRequestArchives: claude, compactHooks: claude, compactToolDefinitions: claude, compactSkillListings: claude, removeOldSnapshots: codex };
   const fields = await checkbox({ message: 'Slim history (irreversible; no undo)', subtitle: 'Only history files last modified more than 72 hours ago.', choices: [
     { name: 'Remove inline images', description: 'Replace Base64 image blocks with text', value: 'images' },
     { name: 'Compact shell output', description: 'Use RTK filters on recognized successful commands', value: 'tools' },
@@ -415,8 +418,9 @@ export async function cleanOptions(slim: boolean, signal?: AbortSignal, codex = 
       { name: 'Compact tool definitions (Claude)', description: 'Clear recorded definitions; keep system prompts and tool calls', value: 'toolDefinitions' },
       { name: 'Compact skill listings (Claude)', description: 'Clear descriptions and reset discovery of current skills', value: 'skillListings' },
     ] : []),
+    ...(codex ? [{ name: 'Remove old compaction snapshots (Codex)', description: 'Keep the latest complete snapshot; lose older context checkpoints', value: 'oldSnapshots' }] : []),
   ] }, context(signal));
-  return fields.length ? { removeImages: fields.includes('images'), compactTools: fields.includes('tools'), removeReasoning: fields.includes('reasoning'), removeRequestArchives: fields.includes('requests'), compactHooks: fields.includes('hooks'), compactToolDefinitions: fields.includes('toolDefinitions'), compactSkillListings: fields.includes('skillListings') } : null;
+  return fields.length ? { removeImages: fields.includes('images'), compactTools: fields.includes('tools'), removeReasoning: fields.includes('reasoning'), removeRequestArchives: fields.includes('requests'), compactHooks: fields.includes('hooks'), compactToolDefinitions: fields.includes('toolDefinitions'), compactSkillListings: fields.includes('skillListings'), removeOldSnapshots: fields.includes('oldSnapshots') } : null;
 }
 const providers = [{ name: 'All providers', description: 'Claude Code and Codex', value: 'all' }, { name: 'Claude Code', value: 'claude' }, { name: 'Codex', value: 'codex' }] as const;
 async function chooseProvider(signal?: AbortSignal): Promise<Provider | 'all' | null> {
