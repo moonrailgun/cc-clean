@@ -1,7 +1,8 @@
 import { parseArgs } from 'node:util';
 import { isAbsolute } from 'node:path';
+import { readFileSync } from 'node:fs';
 
-export const version = '1.0.0';
+export const version: string = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const providers = ['all', 'claude', 'codex'];
 const views = ['directories', 'projects', 'sessions', 'usage', 'opportunities'];
 const common = ['provider', 'json', 'no-interactive', 'help', 'version'];

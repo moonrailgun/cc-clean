@@ -21,12 +21,13 @@ async function run(args: string[], env: NodeJS.ProcessEnv) {
 }
 test('JSON discovery and version work without creating state', async t => {
   const env = await fixture(t);
+  const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
   for (const args of [['--help', '--json'], ['--json'], ['--version', '--json']]) {
     const result = await run(args, env), data = JSON.parse(result.stdout);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stderr, '');
     assert.equal(data.schemaVersion, 1); assert.equal(data.status, 'completed');
-    assert.equal(data.version, '1.0.0');
+    assert.equal(data.version, packageVersion);
     if (!args.includes('--version')) assert.ok(data.commands.some((item: {command: string}) => item.command === 'analyze delete'));
   }
   await assert.rejects(access(join(env.HOME, '.config', 'cc-clean')));
