@@ -13,13 +13,15 @@ import { deleteCodexSession } from './codex-delete.ts';
 import { validateReceipt } from './state.ts';
 import { readCodexIndex, type IndexThread } from './providers/codex.ts';
 import { readCleanupLog, recordCleanup } from './history.ts';
-import { slimHistory, assertLegacyCodexMeta, MAX_HISTORY_BYTES, type SlimOptions, type SlimCounts } from './slim.ts';
+import { slimHistory, MAX_HISTORY_BYTES, type SlimOptions, type SlimCounts, type SlimSavingsBytes } from './slim.ts';
+import { verifyCodexRewriteLayout, previewProjection, prepareProjection, verifyProjectionBefore, type ProjectionReceipt } from './providers/codex-history.ts';
+export { verifyCodexRewriteLayout } from './providers/codex-history.ts';
 const exec=promisify(execFile);
 const hash=(data:Buffer)=>createHash('sha256').update(data).digest('hex');
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface Action {
   id:string;kind:'delete-files'|'compress-png'|'codex-delete'|'slim-history';targetId:string;files:FileEntry[];
-  slimOptions?:SlimOptions;slimCounts?:SlimCounts;
+  slimOptions?:SlimOptions;slimCounts?:SlimCounts;slimSavingsBytes?:SlimSavingsBytes;codexProjection?:ProjectionReceipt[];
   sessionIds?:string[];status:'planned'|'completed'|'skipped'|'failed';reason?:string;
   beforeBytes:number;afterBytes:number;recoveryState:'prepared'|'applied'|'finalized';
   estimatedSavingsBytes?:number|null;
@@ -67,40 +69,6 @@ function makeAction(kind:Action['kind'],id:string,files:FileEntry[],sessionIds?:
   return {id:randomUUID(),kind,targetId:id,files,sessionIds,status:'planned',beforeBytes:bytes,afterBytes:bytes,estimatedSavingsBytes:replacement(kind)?null:bytes,recoveryState:'prepared'};
 }
 
-// Legacy rollouts can be referenced by another thread's byte offsets. Inspect
-// every header, not just selected files, and refuse materialized/shared layouts.
-export async function verifyCodexRewriteLayout(inv:Inventory,signal?:AbortSignal) {
-  if(!inv.complete||process.env.CODEX_SQLITE_HOME)throw new Error('Codex rewrite requires a complete scan and default SQLite location');
-  const protectedPath=(path:string)=>/^(?:(?:sessions|archived_sessions)(?:\/|$)|config\.toml$|thread_history_.*\.sqlite)/.test(path);
-  if(inv.links.some(l=>protectedPath(relative(inv.root,l.path)))||inv.files.some(f=>/^thread_history_.*\.sqlite/.test(f.relative)||/^(?:sessions|archived_sessions)\/.*\.jsonl\.zst$/.test(f.relative)))
-    throw new Error('Linked, compressed or materialized Codex history cannot be rewritten');
-  const config=inv.files.find(f=>f.relative==='config.toml');
-  if(config) {
-    if(config.size>64*1024)throw new Error('Codex config exceeds the rewrite inspection limit');
-    const text=(await readVerified(inv.root,config)).toString('utf8');
-    // Fail closed on custom/escaped TOML keys instead of guessing SQLite location.
-    if(/sqlite|\\|^\s*["']/im.test(text))throw new Error('Custom or unrecognized Codex SQLite configuration cannot be rewritten');
-  }
-  for(const f of inv.files.filter(f=>f.category==='sessions')) {
-    signal?.throwIfAborted();
-    await verifyFile(inv.root,f);
-    const handle=await open(f.path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-    try {
-      if(!same(f,await handle.stat()))throw new Error('Codex history changed before header inspection');
-      const buffer=Buffer.alloc(Math.min(f.size,1024*1024));
-      let length=0,newline=-1;
-      while(length<buffer.length&&newline<0) {
-        const {bytesRead}=await handle.read(buffer,length,buffer.length-length,length);
-        if(!bytesRead)break;
-        length+=bytesRead;newline=buffer.subarray(0,length).indexOf(10);
-      }
-      if(newline<0&&length<f.size)throw new Error('Codex history header exceeds the inspection limit');
-      assertLegacyCodexMeta(JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(buffer.subarray(0,newline<0?length:newline))));
-      if(!same(f,await handle.stat()))throw new Error('Codex history changed during header inspection');
-    } finally {await handle.close();}
-    await verifyFile(inv.root,f);
-  }
-}
 function verifyCodexScope(action:Action,threads:IndexThread[],inventory:Inventory,sessions?:Session[]) {
   // Native deletion also removes compressed siblings; these have not been analyzed.
   if(inventory.files.some(f=>/^(?:sessions|archived_sessions)\/.*\.jsonl\.zst$/.test(f.relative)))throw new Error('Compressed sessions are unsupported; native deletion scope cannot be verified');
@@ -182,11 +150,13 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
   if(options.slim?.removeImages||options.slim?.compactTools) {
+    let layoutValid=true,blocked=new Map<string,string>();
     if(inv.provider==='codex') {
-      try {await verifyCodexRewriteLayout(inv);}catch(error){plan.warnings.push((error as Error).message);return plan;}
+      try {blocked=await verifyCodexRewriteLayout(inv);}catch(error){plan.warnings.push((error as Error).message);layoutValid=false;}
     }
-    for(const f of inv.files) {
+    if(layoutValid)for(const f of inv.files) {
       if(f.category!=='sessions'||selected&&!selected.has(f.path))continue;
+      if(blocked.has(f.path)){plan.warnings.push(`${f.relative}: ${blocked.get(f.path)}`);continue;}
       if(!eligible(f)||f.size>MAX_HISTORY_BYTES){plan.warnings.push(`${f.relative}: history is linked, referenced or exceeds 64 MiB; retained`);continue;}
       plan.actions.push({...makeAction('slim-history',f.relative,[f]),slimOptions:{...options.slim}});
     }
@@ -230,9 +200,12 @@ export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:
     } else if(action.kind==='slim-history') {
       try {
         const input=await readVerified(plan.root,action.files[0]);
-        const {output,counts}=slimHistory(input,plan.provider,action.slimOptions!);
-        action.slimCounts=counts;action.estimatedSavingsBytes=output?input.length-output.length:0;
-        if(output){action.beforeHash=hash(input);action.afterHash=hash(output);}
+        const {output,counts,savingsBytes}=slimHistory(input,plan.provider,action.slimOptions!);
+        action.slimCounts=counts;action.slimSavingsBytes=savingsBytes;action.estimatedSavingsBytes=output?input.length-output.length:0;
+        if(output){
+          if(plan.provider==='codex')action.codexProjection=await previewProjection(plan.root,input,output,action.slimOptions!);
+          action.beforeHash=hash(input);action.afterHash=hash(output);
+        }
       } catch(error) {
         action.estimatedSavingsBytes=0;
         plan.warnings.push(`${action.targetId}: history retained: ${(error as Error).message}`);
@@ -289,6 +262,10 @@ async function cleanupWork(dir:string,a:Action) {
     await unlink(path);
   }
 }
+async function syncDirectory(path:string) {
+  const dir=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);
+  try {await dir.sync();}finally{await dir.close();}
+}
 async function currentHash(root:string,path:string):Promise<string> {
   if(!within(root,path)||await realpath(root)!==root||await realpath(dirname(path))!==dirname(path))throw new Error('Recovery path changed');
   return hash(await readOrdinaryFile(path,MAX_PNG_BYTES));
@@ -297,6 +274,8 @@ function updateTotal(r:Receipt) {r.confirmedReductionBytes=r.actions.reduce((n,a
 interface ExecuteOptions {stateDir:string;dryRun?:boolean;signal?:AbortSignal;checkActivity?:ActivityCheck;onProgress?:(message:string)=>void}
 export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Receipt> {
   const r:Receipt=structuredClone({...plan,status:'completed',rootBeforeBytes:null,rootAfterBytes:null,confirmedReductionBytes:0,attributionComplete:true});
+  validateReceipt(r);
+  if(r.actions.some(a=>a.status!=='planned'||a.recoveryState!=='prepared'))throw new Error('Execution requires a fresh operation plan');
   if(options.dryRun){r.status='dry-run';return r;}
   const {stateDir}=options;const check=options.checkActivity??defaultActivity;
   if(plan.root===stateDir||within(plan.root,stateDir)||within(stateDir,plan.root))throw new Error('Application and source directories overlap');
@@ -314,13 +293,15 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
     if(!r.actions.length){r.status=plan.scanComplete?'completed':'failed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
     const busy=await check(r.provider,r.root);
     if(busy){r.actions.forEach(a=>{a.status='skipped';a.reason=busy;a.recoveryState='finalized';});r.warnings.push(busy);r.status=r.source==='analyze'?'partial':'completed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
-    if(r.provider==='codex'&&r.actions.some(a=>a.kind==='slim-history'))await verifyCodexRewriteLayout(before,options.signal);
+    const blocked=r.provider==='codex'&&r.actions.some(a=>a.kind==='slim-history')?await verifyCodexRewriteLayout(before,options.signal):new Map<string,string>();
     r.status='needs-review';await save();
     for(const a of r.actions) {
       if(options.signal?.aborted){r.status='interrupted';break;}
       options.onProgress?.(`${a.kind}: ${a.targetId}`);
       const dir=workPath(stateDir,r,a);
+      let projection:Awaited<ReturnType<typeof prepareProjection>>|undefined;
       try {
+        if(a.kind==='slim-history'&&blocked.has(a.files[0].path))throw new Error(blocked.get(a.files[0].path));
         const activity=await check(r.provider,r.root,a.files.map(f=>f.path));if(activity)throw new Error(activity);
         await verifyRoot(r);
         if(a.files.some(f=>referenced(before,f.path)))throw new Error('References or scan state changed');
@@ -351,17 +332,24 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
           if(!output){a.status='skipped';a.reason='Transformation did not reduce file size';a.recoveryState='finalized';await save();continue;}
           if(slim) {
             if(a.beforeHash!==hash(input)||a.afterHash!==hash(output))throw new Error('History differs from its preview; original retained');
-            a.slimCounts=slim.counts;
+            a.slimCounts=slim.counts;a.slimSavingsBytes=slim.savingsBytes;
           }
           a.beforeHash=hash(input);a.afterHash=hash(output);a.afterBytes=output.length;
           const out=await open(join(dir,'output'),'wx',f.mode&0o777);
           try {await out.writeFile(output);await out.chmod(f.mode&0o777);await out.utimes(new Date(f.mtimeMs),new Date(f.mtimeMs));await out.sync();}finally{await out.close();}
           await save();await verifyFile(r.root,f);
+          if(a.kind==='slim-history'&&r.provider==='codex') {
+            if(!a.codexProjection)throw new Error('History index preview is missing; preview again');
+            projection=await prepareProjection(r.root,a.codexProjection,input,output,a.slimOptions!);
+          }
           // A hardlink preserves the original inode until the atomic replacement is journaled.
           await link(f.path,join(dir,'0.original'));
+          await syncDirectory(dir);
           await verifyBackup(dir,a,0);
           const linked=await lstat(f.path);if(linked.ino!==f.ino||linked.dev!==f.dev||linked.nlink!==2||linked.size!==f.size||linked.mtimeMs!==f.mtimeMs)throw new Error('File changed before replacement');
           await rename(join(dir,'output'),f.path);
+          await syncDirectory(dirname(f.path));
+          await projection?.commit();projection=undefined;
         } else {
           a.afterBytes=0;await save();
           for(let i=0;i<a.files.length;i++){await verifyFile(r.root,a.files[i]);await rename(a.files[i].path,join(dir,`${i}.original`));await verifyBackup(dir,a,i);}
@@ -369,6 +357,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
         a.recoveryState='applied';a.status='completed';updateTotal(r);await save();
         await cleanupWork(dir,a);a.recoveryState='finalized';await save();
       } catch(e) {
+        projection?.rollback();
         a.reason=(e as Error).message;
         if(a.recoveryState==='applied'){r.attributionComplete=false;r.status='needs-review';await save();break;}
         if(a.kind==='codex-delete'&&a.nativeStarted){r.attributionComplete=false;a.status='failed';r.status='needs-review';await save();break;}
@@ -387,6 +376,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
 async function rollbackPrepared(r:Plan,a:Action,dir:string):Promise<boolean> {
   try {
     await verifyParents(r,a);
+    if(r.provider==='codex'&&a.kind==='slim-history')await verifyProjectionBefore(r.root,a.codexProjection!);
     if(!await existingDir(dir)){for(const f of a.files)await verifyFile(r.root,f);return true;}
     for(let i=0;i<a.files.length;i++) {
       const f=a.files[i],backup=join(dir,`${i}.original`);
@@ -431,6 +421,17 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
           if(a.recoveryState==='applied') {
             if(a.kind==='delete-files'&&(await Promise.all(a.files.map(f=>exists(f.path)))).some(Boolean)){pending=true;continue;}
             if(replacement(a.kind)&&(!a.afterHash||(await currentHash(r.root,a.files[0].path))!==a.afterHash)){pending=true;continue;}
+            if(provider==='codex'&&a.kind==='slim-history') {
+              const backup=join(dir,'0.original');let input:Buffer|null=null;
+              if(await exists(backup)) {
+                await verifyBackup(dir,a,0);input=await readOrdinaryFile(backup,MAX_HISTORY_BYTES);
+                if(hash(input)!==a.beforeHash)throw new Error('Original history backup changed');
+              }
+              const output=await readOrdinaryFile(a.files[0].path,MAX_HISTORY_BYTES);
+              if(hash(output)!==a.afterHash)throw new Error('Rewritten history changed');
+              const projection=await prepareProjection(r.root,a.codexProjection!,input,output,a.slimOptions!,true);
+              await projection.commit();
+            }
             a.status='completed';updateTotal(r);await atomicJson(path,r);await cleanupWork(dir,a);a.recoveryState='finalized';
           } else if(await rollbackPrepared(r,a,dir)){a.status='skipped';a.reason='Previous operation was interrupted; original files restored';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';} else pending=true;
         }catch{pending=true;}

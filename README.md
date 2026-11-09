@@ -100,7 +100,7 @@ A timeout or killed process may leave no complete JSON response. For mutations, 
 All JSON responses carry `schemaVersion` and `status`. Successful statistics responses use version `2`; other responses use version `1`:
 
 - Analysis: `reports`, each containing directories, categories, projects, sessions, usage, opportunities, warnings and completeness flags.
-- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. `slim-history` actions also include `slimOptions: { removeImages, compactTools }` and `slimCounts: { images, toolOutputs }`. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
+- Cleanup: `receipts` with actions, skips, before/after bytes and confirmed reductions. Each action can include `estimatedSavingsBytes` (`null` when unknown); this estimate is separate from measured savings and may be absent in older receipts. `slim-history` actions also include `slimOptions: { removeImages, compactTools }` and `slimCounts: { images, toolOutputs }`, with `slimSavingsBytes` attributing estimated reductions to each operation. Codex rewrites include `codexProjection` for coordinated index updates. Optional `explicitTarget` records the one user-selected file path or session ID for the age exception below; automatic and multiple selections omit it.
 - Statistics: `providers`, `savedBytes` and `cleanedRecords`. Each provider includes these totals, JSONL `operations`, a `pending` review count and `pendingOperations` recovery receipts. `--provider` limits both the returned providers and totals.
 - Errors: `error: { code, message }`, with `USAGE_ERROR`, `OPERATION_FAILED` or `INTERRUPTED`.
 
@@ -174,7 +174,9 @@ node src/cli.ts clean --provider claude --remove-images
 node src/cli.ts clean --provider codex --file /absolute/.codex/sessions/example.jsonl --compact-tools --yes --json
 ```
 
-Supported inputs are Claude Code **2.1.319** transcripts and Codex **0.167.0** plain legacy rollouts, up to **64 MiB per file**. Claude version fields must all match. Codex requires a complete scan and checks **every current and archived session header**, including unselected files: materialized history databases, compressed rollouts, shared/paginated/forked/imported/attached histories, custom SQLite locations and uncertain configuration block rewriting. Mixed-version roots may therefore be skipped entirely.
+Supported inputs are Claude Code **2.1.319** transcripts and independent plain legacy or paginated Codex rollouts, up to **64 MiB per file**. Claude version fields must all match. Codex compatibility follows record structure and identity, with version fields preserved. Every current and archived header, including compressed files, is checked for inbound references. Shared, forked, imported, attached, compressed or hardlinked targets are retained; unrelated compressed or hardlinked files do not block independent targets.
+
+Codex rewrites remap recognized SQLite byte offsets and cached items within the coordinated replacement and recovery flow. Pending rewrites require `codexProjection` receipts, including an explicit empty array when no databases exist. Unknown offset schemas, unsupported dependencies, external SQLite locations and uncertain configuration prevent rewriting. Generic file deletion/compression cannot bypass history coordination.
 
 Image removal handles Claude message and nested tool-result image blocks, Codex top-level response-message `input_image` data URLs, and known Codex user-message UI image arrays. Remote URLs, local image paths, standalone generated image files, arbitrary Base64 text, reasoning/signatures and unknown image shapes stay intact. Codex compacted replacement histories are not rewritten.
 
@@ -216,7 +218,7 @@ Precedence: configuration file → `CLAUDE_CONFIG_DIR` / `CODEX_HOME` → defaul
 | PNG compression | Eligible static PNGs in Codex `generated_images/`; recompress IDAT losslessly, preserving inflated scanlines and supported metadata; replace only when smaller |
 | Claude session deletion | Complete **2.1.319** transcripts and verifiably owned subagent/tool-result files; retain memory, configuration, file-history and history.jsonl |
 | Codex session deletion | Installed **0.167.0**, through official `codex delete`; verify full spawn descendant scope; reject incomplete indexes, attached relationships and compressed rollouts |
-| History slimming | Opt-in removal of recognized inline images and RTK shell-output compaction for Claude **2.1.319** and Codex **0.167.0** plain legacy history; irreversible, with native resume unverified |
+| History slimming | Opt-in removal of recognized inline images and RTK shell-output compaction for Claude **2.1.319** and independent plain legacy/paginated Codex history with coordinated SQLite updates; irreversible, with native resume unverified |
 | Platforms | Mutations on macOS after checks; analysis, previews and statistics on other platforms |
 
 Claude has no verified automatic temporary-file or standalone-image rule yet, so its quick clean may report zero candidates. A directory called `.tmp` or `cache` is not automatically disposable: installed plugins may still reference its resources through links.

@@ -1,12 +1,43 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
-import { isAbsolute, resolve } from 'node:path';
+import { lstat, realpath } from 'node:fs/promises';
+import { isAbsolute, join, resolve } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
+import { parse } from 'smol-toml';
 import type { Inventory } from '../types.ts';
+import { readOrdinaryFile } from '../state.ts';
 
 export interface IndexThread { id: string; path?: string; project?: string; parentId?: string; attachedParentId?: string; createdAt?: string; updatedAt?: string; archived: boolean; }
+
+export async function verifyCodexSqliteLocation(inventory: Inventory): Promise<void> {
+  const path = join(inventory.root, 'config.toml');
+  const config = inventory.files.find(file => file.relative === 'config.toml');
+  let configuredHome: unknown;
+  try {
+    const before = await lstat(path).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    if (inventory.links.some(link => link.path === path) || Boolean(before) !== Boolean(config)) throw new Error('config changed');
+    if (config && before) {
+      const matches = (info: typeof before) => info.isFile() && !info.isSymbolicLink() && info.nlink === 1 &&
+        info.dev === config.dev && info.ino === config.ino && info.size === config.size &&
+        info.mtimeMs === config.mtimeMs && info.ctimeMs === config.ctimeMs;
+      if (!matches(before)) throw new Error('config changed');
+      const data = await readOrdinaryFile(path, 64 * 1024);
+      configuredHome = parse(new TextDecoder('utf-8', {fatal: true}).decode(data), {maxDepth: 100}).sqlite_home;
+      if (!matches(await lstat(path))) throw new Error('config changed');
+      if (configuredHome !== undefined && (typeof configuredHome !== 'string' || !configuredHome.trim())) throw new Error('invalid sqlite_home');
+    }
+  } catch {
+    // TOML parser errors include source values; never expose configuration contents.
+    throw new Error('Codex SQLite location could not be confirmed: config is invalid, changed, linked, unreadable or exceeds 64 KiB');
+  }
+  const envHome = process.env.CODEX_SQLITE_HOME?.trim();
+  if (configuredHome === undefined && envHome && !isAbsolute(envHome))
+    throw new Error('Relative CODEX_SQLITE_HOME depends on the native working directory; SQLite coverage cannot be confirmed');
+  const sqliteHome = typeof configuredHome === 'string' ? configuredHome : envHome;
+  if (sqliteHome && resolve(inventory.root, sqliteHome) !== inventory.root)
+    throw new Error('External Codex SQLite location is outside the scanned root; index coverage is incomplete');
+}
+
 function time(value: unknown): string | undefined {
   const numeric = typeof value === 'bigint' ? Number(value) : value;
   const ms = typeof numeric === 'number' ? numeric * (numeric < 1e12 ? 1000 : 1) : typeof numeric === 'string' ? Date.parse(numeric) : NaN;
@@ -16,31 +47,10 @@ function time(value: unknown): string | undefined {
 export async function readCodexIndex(inventory: Inventory, signal?: AbortSignal): Promise<{ threads: IndexThread[]; warnings: string[]; complete: boolean; fingerprint: string | null }> {
   const result = { threads: [] as IndexThread[], warnings: [] as string[], complete: true, fingerprint: null as string | null };
   if (signal?.aborted) return { ...result, complete: false, warnings: ['Codex index read interrupted'] };
-  let sqliteHome = process.env.CODEX_SQLITE_HOME;
-  const config = inventory.files.find(file => file.relative === 'config.toml');
-  if (config) {
-    let handle;
-    try {
-      if (config.size > 64 * 1024) throw new Error('config exceeds bounded inspection limit');
-      handle = await open(config.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const info = await handle.stat();
-      if (info.dev !== config.dev || info.ino !== config.ino || info.size !== config.size) throw new Error('config changed');
-      for (const line of (await handle.readFile('utf8')).split('\n')) {
-        if (/^\s*\[/.test(line)) break;
-        if (/^\s*sqlite_home\s*=/.test(line)) {
-          const match = line.match(/^\s*sqlite_home\s*=\s*["']([^"']+)["']\s*(?:#.*)?$/);
-          if (!match) throw new Error('unrecognized sqlite_home config');
-          sqliteHome = match[1];
-        }
-      }
-    } catch {
-      result.complete = false;
-      result.warnings.push('Codex SQLite location could not be confirmed from config');
-    } finally { await handle?.close().catch(() => {}); }
-  }
-  if (sqliteHome && resolve(inventory.root, sqliteHome) !== inventory.root) {
+  try { await verifyCodexSqliteLocation(inventory); }
+  catch (error) {
     result.complete = false;
-    result.warnings.push('External Codex SQLite location is unsupported; index coverage is incomplete');
+    result.warnings.push((error as Error).message);
   }
   const candidates = inventory.files.filter(file => /^state_\d+\.sqlite$/.test(file.relative)).sort((a, b) => Number(b.relative.match(/\d+/)?.[0]) - Number(a.relative.match(/\d+/)?.[0]));
   const file = candidates[0];

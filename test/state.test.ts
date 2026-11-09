@@ -64,11 +64,18 @@ test('history receipts validate lossy options and count files without recording 
   action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 2, toolOutputs: 0};
   r.confirmedReductionBytes = 9; r.rootAfterBytes = 91;
   assert.equal(validateReceipt(r), r);
+  action.estimatedSavingsBytes = 9; action.slimSavingsBytes = {images: 9, toolOutputs: 0};
+  assert.equal(validateReceipt(r), r);
   for (const invalid of [
     {slimOptions: undefined}, {slimOptions: {removeImages: false, compactTools: false}},
     {slimCounts: undefined}, {slimCounts: {images: -1, toolOutputs: 0}}, {slimCounts: {images: 1, toolOutputs: 1}},
     {sessionIds: [randomUUID()]}, {beforeHash: undefined}, {afterBytes: 20},
     {files: [{...action.files[0], category: 'images'}]},
+    ...[null, {}, {images: 9}, {images: -1, toolOutputs: 10}, {images: 8.5, toolOutputs: 0.5},
+      {images: '9', toolOutputs: 0}, {images: 8, toolOutputs: 0}, {images: 8, toolOutputs: 1}]
+      .map(slimSavingsBytes => ({slimSavingsBytes})),
+    {slimCounts: {images: 0, toolOutputs: 0}}, {estimatedSavingsBytes: null},
+    {kind: 'delete-files', afterBytes: 0},
   ]) {
     const copy = structuredClone(r); Object.assign(copy.actions[0], invalid);
     assert.throws(() => validateReceipt(copy), /receipt/);
@@ -388,4 +395,54 @@ test('Claude receipts permit bounded agent IDs while Codex requires UUIDs', () =
   }
   r.provider = 'codex'; r.actions[0].sessionIds = ['agent-a123'];
   assert.throws(() => validateReceipt(r), /receipt/);
+});
+
+test('pending Codex history rewrites require an explicit SQLite synchronization receipt', () => {
+  const r = receipt('/inert'), a = r.actions[0];
+  a.kind = 'slim-history'; a.files[0].category = 'sessions';
+  a.slimOptions = {removeImages: true, compactTools: false}; a.slimCounts = {images: 1, toolOutputs: 0};
+  a.beforeHash = 'a'.repeat(64); a.afterHash = 'b'.repeat(64);
+  assert.equal(validateReceipt(r), r, 'finalized historical receipts remain readable');
+  for (const recoveryState of ['prepared', 'applied'] as const) {
+    a.recoveryState = recoveryState; a.status = 'planned'; r.confirmedReductionBytes = 0;
+    delete a.codexProjection;
+    assert.throws(() => validateReceipt(r), /receipt/);
+    a.codexProjection = [];
+    assert.equal(validateReceipt(r), r, 'empty array explicitly records no projection databases');
+  }
+});
+
+test('pending Codex session files cannot bypass coordination through generic mutations', () => {
+  for (const kind of ['delete-files', 'compress-png'] as const) {
+    for (const [relative, category] of [['sessions/rollout.jsonl', 'temporary'], ['archived_sessions/rollout.jsonl.zst', 'temporary'], ['history.jsonl', 'sessions']]) {
+      const r = receipt('/inert'), a = r.actions[0], f = a.files[0];
+      a.kind = kind; a.status = 'planned'; a.recoveryState = 'prepared'; r.confirmedReductionBytes = 0;
+      f.relative = relative; f.path = join(r.root, relative); f.category = category;
+      assert.throws(() => validateReceipt(r), /receipt/);
+    }
+  }
+});
+
+test('history index receipts bind safe database identities, hashes and one rollout', () => {
+  const r = receipt('/synthetic'), action = r.actions[0];
+  action.kind = 'slim-history'; action.files[0].category = 'sessions';
+  action.beforeHash = 'a'.repeat(64); action.afterHash = 'b'.repeat(64);
+  action.slimOptions = {removeImages: true, compactTools: false}; action.slimCounts = {images: 1, toolOutputs: 0};
+  const entry = {name: 'thread_history_1.sqlite', dev: 1, ino: 2, threadId: 'rollout',
+    schemaHash: 'c'.repeat(64), beforeHash: 'd'.repeat(64), afterHash: 'e'.repeat(64)};
+  for (const entries of [[], [entry], [entry, {...entry, name: 'thread_history_2.sqlite'}]]) {
+    action.codexProjection = entries;
+    assert.equal(validateReceipt(r), r);
+  }
+  for (const entries of [
+    null, {}, [entry, entry], [{...entry, name: '../thread_history_1.sqlite'}],
+    [{...entry, ino: -1}], [{...entry, dev: '1'}], [{...entry, threadId: ''}],
+    [{...entry, schemaHash: 'invalid'}], [{...entry, beforeHash: undefined}], [{...entry, afterHash: ''}],
+    [entry, {...entry, name: 'thread_history_2.sqlite', threadId: 'other'}],
+  ]) {
+    const invalid = structuredClone(r); Object.assign(invalid.actions[0], {codexProjection: entries});
+    assert.throws(() => validateReceipt(invalid), /receipt/);
+  }
+  r.provider = 'claude'; assert.throws(() => validateReceipt(r), /receipt/);
+  r.provider = 'codex'; action.kind = 'delete-files'; assert.throws(() => validateReceipt(r), /receipt/);
 });

@@ -173,6 +173,31 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
         (action.slimOptions.removeImages || action.slimCounts.images === 0) && (action.slimOptions.compactTools || action.slimCounts.toolOutputs === 0));
       requireReceipt(action.files.every(file => file.category === 'sessions'));
     }
+    if (action.slimSavingsBytes !== undefined) {
+      const savings = action.slimSavingsBytes;
+      requireReceipt(action.kind === 'slim-history' && object(action.slimCounts) &&
+        bytes(action.slimCounts.images) && bytes(action.slimCounts.toolOutputs) &&
+        object(savings) && bytes(savings.images) && bytes(savings.toolOutputs) &&
+        savings.images + savings.toolOutputs === action.estimatedSavingsBytes &&
+        (action.slimCounts.images > 0 || savings.images === 0) && (action.slimCounts.toolOutputs > 0 || savings.toolOutputs === 0));
+    }
+    if (data.provider === 'codex' && action.recoveryState !== 'finalized') {
+      if (action.files.some(file => file.category === 'sessions' || /^(?:sessions|archived_sessions)\//.test(file.relative)))
+        requireReceipt(action.kind === 'slim-history' || action.kind === 'codex-delete');
+      if (action.kind === 'slim-history') requireReceipt(Array.isArray(action.codexProjection));
+    }
+    if (action.codexProjection !== undefined) {
+      requireReceipt(data.provider === 'codex' && action.kind === 'slim-history' && Array.isArray(action.codexProjection));
+      const names = new Set<string>(), threads = new Set<string>();
+      for (const entry of action.codexProjection) {
+        requireReceipt(object(entry) && text(entry.name) && /^thread_history_\d+\.sqlite$/.test(entry.name) && !names.has(entry.name));
+        names.add(entry.name);
+        requireReceipt(bytes(entry.dev) && bytes(entry.ino) && text(entry.threadId) && entry.threadId.length > 0);
+        threads.add(entry.threadId);
+        for (const key of ['schemaHash', 'beforeHash', 'afterHash']) requireReceipt(text(entry[key]) && /^[0-9a-f]{64}$/.test(entry[key]));
+      }
+      requireReceipt(threads.size <= 1);
+    }
     if (action.kind === 'codex-delete') requireReceipt(data.provider === 'codex' && uuid.test(action.targetId) &&
       Array.isArray(action.sessionIds) && action.sessionIds.includes(action.targetId));
     if (action.status === 'completed') {

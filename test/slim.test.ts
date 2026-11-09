@@ -24,9 +24,36 @@ const compacted = (buffer: Buffer, provider: 'claude' | 'codex', options = both)
   const result = slimHistory(buffer, provider, options);
   assert.ok(result.output);
   assert.ok(result.output.length < buffer.length);
-  assert.equal(slimHistory(result.output, provider, options).output, null, 'second pass must be a no-op');
+  assert.equal(result.savingsBytes.images + result.savingsBytes.toolOutputs, buffer.length - result.output.length);
+  if (!options.removeImages) assert.equal(result.savingsBytes.images, 0);
+  if (!options.compactTools) assert.equal(result.savingsBytes.toolOutputs, 0);
+  const again = slimHistory(result.output, provider, options);
+  assert.equal(again.output, null, 'second pass must be a no-op');
+  assert.deepEqual(again.savingsBytes, {images: 0, toolOutputs: 0});
   return result;
 };
+
+test('mixed history savings match image-only and output-only byte reductions, including escaped Codex envelopes', () => {
+  const output = matches.replaceAll('matching source line', '路径含有 "引号" 和 \\ 分隔符');
+  const inputs = {
+    claude: jsonl(
+      claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}]),
+      claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: output}]),
+    ),
+    codex: jsonl(meta,
+      codex({type: 'function_call', call_id: 'a', name: 'exec_command', arguments: JSON.stringify({cmd: 'rg -n foo'})}),
+      codex({type: 'function_call_output', call_id: 'a', output: JSON.stringify({output, metadata: {exit_code: 0}})}),
+      codex({type: 'message', content: [{type: 'input_image', image_url: `data:image/png;base64,${data}`}]}),
+    ),
+  };
+  for (const provider of ['claude', 'codex'] as const) {
+    const input = inputs[provider], result = compacted(input, provider);
+    assert.deepEqual(result.savingsBytes, {
+      images: input.length - compacted(input, provider, images).output!.length,
+      toolOutputs: input.length - compacted(input, provider, tools).output!.length,
+    });
+  }
+});
 
 test('Claude image replacement preserves untouched bytes, signatures, numeric literals and CRLF', () => {
   const raw = `{ "type":"user", "version":"2.1.319", "sessionId":"synthetic", "number":9007199254740993123, "signature":"\\u0061\\\\\\\"", "message":{"content":[{"type":"text","text":"图片 \\u4e2d"},${JSON.stringify(image)}]}}\r\n`;
@@ -35,6 +62,20 @@ test('Claude image replacement preserves untouched bytes, signatures, numeric li
   assert.equal(result.output!.toString(), raw.replace(JSON.stringify(image), JSON.stringify({type: 'text', text: '[image removed]'})));
   assert.deepEqual(input, before);
   assert.deepEqual(result.counts, {images: 1, toolOutputs: 0});
+});
+
+test('Codex legacy slimming follows record shape rather than the CLI version', () => {
+  for (const cli_version of ['0.154.0', '0.163.0', '0.165.0', '0.166.0', '0.167.0', '0.168.0', 'custom-build', undefined]) {
+    const header = {...meta, payload: {...meta.payload, cli_version}};
+    const call = codex({type: 'function_call', call_id: 'a', name: 'exec_command', arguments: JSON.stringify({cmd: 'rg -n foo'})});
+    const output = codex({type: 'function_call_output', call_id: 'a', output: JSON.stringify({output: matches, metadata: {exit_code: 0}})});
+    const message = codex({type: 'message', role: 'user', content: [{type: 'input_image', image_url: `data:image/png;base64,${data}`} ]});
+    const input = jsonl(header, call, output, message), before = Buffer.from(input);
+    const result = compacted(input, 'codex');
+    assert.deepEqual(result.counts, {images: 1, toolOutputs: 1});
+    assert.ok(result.output!.toString().startsWith(jsonl(header, call).toString()));
+    assert.deepEqual(input, before);
+  }
 });
 
 test('Claude nested tool images are removed while unknown Base64 and reasoning remain intact', () => {
@@ -142,8 +183,8 @@ test('malformed or unsupported history is rejected as a whole without changing i
   }
   assert.throws(() => slimHistory(jsonl(claude('user', [image]), claude('user', [], {sessionId: 'other'})), 'claude', both), /Mixed/);
   assert.throws(() => slimHistory(jsonl(meta, {...meta}), 'codex', both), /Multiple/);
-  for (const payload of [{history_mode: 'paginated'}, {history_base: {end_byte_offset: 1}}, {forked_from_id: 'other'}, {attached_thread: true},
-    {forked_from_ordinal_exclusive: 0}, {subagent_history_start_ordinal: 1}, {cli_version: 'unknown'}]) {
+  for (const payload of [{history_mode: 'unknown'}, {history_base: {end_byte_offset: 1}}, {forked_from_id: 'other'}, {attached_thread: true},
+    {forked_from_ordinal_exclusive: 0}, {subagent_history_start_ordinal: 1}, {id: ''}, {id: null}]) {
     assert.throws(() => slimHistory(jsonl({...meta, payload: {...meta.payload, ...payload}}), 'codex', both));
   }
 });
@@ -158,11 +199,8 @@ test('duplicate calls and oversized nesting are rejected; empty options make no 
   assert.equal(compacted(noNewline, 'claude', images).output!.at(-1), 125);
 });
 
-test('Codex root layout rejects materialization, compressed files and linked history before reading', async () => {
+test('Codex root layout rejects linked history and incomplete inventories before reading', async () => {
   const inv: Inventory = {provider: 'codex', root: '/synthetic', exists: true, complete: true, files: [], links: [], totalBytes: 0, allocatedBytes: 0, errors: []};
-  for (const relative of ['thread_history_1.sqlite', 'thread_history_1.sqlite-wal', 'sessions/a.jsonl.zst']) {
-    await assert.rejects(verifyCodexRewriteLayout({...inv, files: [{relative} as any]}), /Codex|SQLite/);
-  }
   await assert.rejects(verifyCodexRewriteLayout({...inv, links: [{path: '/synthetic/sessions', target: '/outside'}]}), /Codex|SQLite/);
   await assert.rejects(verifyCodexRewriteLayout({...inv, complete: false}), /complete/);
 });
@@ -175,17 +213,68 @@ test('Codex layout checks all synthetic headers and config without changing file
   t.after(() => { if (inherited === undefined) delete process.env.CODEX_SQLITE_HOME; else process.env.CODEX_SQLITE_HOME = inherited; });
   await mkdir(join(root, 'sessions')); await mkdir(join(root, 'archived_sessions'));
   const current = join(root, 'sessions', 'current.jsonl'), other = join(root, 'archived_sessions', 'other.jsonl');
-  await writeFile(current, jsonl(meta)); await writeFile(other, jsonl(meta));
+  await writeFile(current, jsonl(meta)); await writeFile(other, jsonl({...meta, payload: {...meta.payload, cli_version: '0.154.0'}}));
   await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
   assert.deepEqual(await readFile(current), jsonl(meta));
   await writeFile(other, jsonl({...meta, payload: {...meta.payload, history_base: {end_byte_offset: 42}}}));
   await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), /shared/);
   await writeFile(other, jsonl(meta));
   await writeFile(join(root, 'config.toml'), 'sqlite_home = "/elsewhere"\n');
-  await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), /configuration/);
+  await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), /External.*SQLite/);
   await writeFile(join(root, 'config.toml'), 'model = "example"\n');
   await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
   const stale = await scanRoot(root, 'codex');
   await writeFile(current, jsonl(meta, codex({type: 'message', content: []})));
   await assert.rejects(verifyCodexRewriteLayout(stale), /changed/);
+});
+
+test('Codex layout parses TOML keys and strings without unrelated config false positives', async t => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cc-clean-config-layout-')));
+  t.after(() => rm(root, {recursive: true, force: true}));
+  const inherited = process.env.CODEX_SQLITE_HOME;
+  delete process.env.CODEX_SQLITE_HOME;
+  t.after(() => { if (inherited === undefined) delete process.env.CODEX_SQLITE_HOME; else process.env.CODEX_SQLITE_HOME = inherited; });
+  const path = join(root, 'config.toml');
+  for (const config of [
+    String.raw`"model" = "custom" # sqlite is mentioned in a comment`,
+    String.raw`instructions = """
+Use sqlite and \n in examples.
+sqlite_home = \"not a config key\"
+"""`,
+    String.raw`'sqlite_home' = '.'`,
+    String.raw`"sqlite\u005fhome" = '.'`,
+    `[projects."/sqlite/project"]\nnotes = 'sqlite_home = /elsewhere'`,
+    `[profiles.example]\nsqlite_home = '/elsewhere'`,
+  ]) {
+    await writeFile(path, config);
+    const before = await readFile(path);
+    await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
+    assert.deepEqual(await readFile(path), before);
+  }
+  for (const key of ['sqlite_home', '"sqlite_home"', String.raw`"sqlite\u005fhome"`]) {
+    await writeFile(path, `${key} = '/elsewhere'`);
+    await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), /External.*SQLite/);
+  }
+  for (const config of ['sqlite_home = ["/elsewhere"]', 'sqlite_home = ""', 'model = "synthetic-private-value']) {
+    await writeFile(path, config);
+    await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), error => {
+      assert.match(String(error), /SQLite.*config/);
+      assert.doesNotMatch(String(error), /synthetic-private-value/);
+      return true;
+    });
+  }
+  await writeFile(path, 'model = "custom"');
+  process.env.CODEX_SQLITE_HOME = `  ${root}  `;
+  await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
+  process.env.CODEX_SQLITE_HOME = '  ';
+  await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
+  process.env.CODEX_SQLITE_HOME = '.';
+  await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), /working directory/);
+  process.env.CODEX_SQLITE_HOME = '/elsewhere';
+  await assert.rejects(verifyCodexRewriteLayout(await scanRoot(root, 'codex')), /External.*SQLite/);
+  await writeFile(path, 'sqlite_home = "."');
+  await verifyCodexRewriteLayout(await scanRoot(root, 'codex')); // Config takes precedence over the environment.
+  const stale = await scanRoot(root, 'codex');
+  await writeFile(path, 'sqlite_home = "/elsewhere"');
+  await assert.rejects(verifyCodexRewriteLayout(stale), /changed|config/);
 });

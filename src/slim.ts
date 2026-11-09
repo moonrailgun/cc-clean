@@ -4,6 +4,7 @@ import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
 export interface SlimOptions { removeImages: boolean; compactTools: boolean }
 export interface SlimCounts { images: number; toolOutputs: number }
+export interface SlimSavingsBytes { images: number; toolOutputs: number }
 type Row = Record<string, any>;
 const object = (v: unknown): v is Row => v !== null && typeof v === 'object' && !Array.isArray(v);
 const marker = '[cc-clean: RTK output compacted; omitted content is unavailable]';
@@ -48,13 +49,16 @@ function parseLine(text: string) {
   }
   whitespace(); visit(row, 0);
   const edits: {start: number; end: number; value: string}[] = [];
+  const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   return {
-    row,
-    replace(parent: object, key: string | number, value: unknown): boolean {
+    row, savingsBytes,
+    replace(parent: object, key: string | number, value: unknown, category: keyof SlimSavingsBytes): boolean {
       const span = spans.get(parent)?.get(key);
       if (!span) throw new Error('Unrecognized history field location');
       const serialized = JSON.stringify(value);
-      if (Buffer.byteLength(serialized) >= Buffer.byteLength(text.slice(...span))) return false;
+      const saved = Buffer.byteLength(text.slice(...span)) - Buffer.byteLength(serialized);
+      if (saved <= 0) return false;
+      savingsBytes[category] += saved;
       edits.push({start: span[0], end: span[1], value: serialized}); return true;
     },
     render() {
@@ -103,29 +107,62 @@ function compactCodexOutput(filter: RtkFilter | undefined, output: string): stri
       const parsed = parseLine(output), row = parsed.row;
       if (row.metadata?.exit_code !== 0 || row.metadata?.session_id != null) return;
       const result = compact(filter, row.output);
-      if (result && parsed.replace(row, 'output', result)) return parsed.render();
+      if (result && parsed.replace(row, 'output', result, 'toolOutputs')) return parsed.render();
     } catch { /* Unknown envelopes remain intact. */ }
   }
 }
 
-export function assertLegacyCodexMeta(row: Row) {
-  const meta = row.payload;
-  if (row.type !== 'session_meta' || !object(meta) || typeof meta.id !== 'string' || meta.cli_version !== '0.167.0')
-    throw new Error('Only Codex 0.167.0 plain legacy histories are supported');
-  if (row.ordinal !== undefined || meta.history_mode !== undefined && meta.history_mode !== 'legacy' ||
-      meta.history_base != null || meta.subagent_history_start_ordinal != null || meta.forked_from_id || meta.forked_from ||
-      meta.attached_thread || meta.forked_from_ordinal_exclusive != null || meta.imported)
-    throw new Error('Paginated, shared or imported Codex history cannot be rewritten');
+// Canonical events and the SQLite UI cache use different casing for the same items.
+function rewriteCodexItem(parsed: ReturnType<typeof parseLine>, item: unknown, options: SlimOptions, counts: SlimCounts) {
+  if (!object(item)) return;
+  if (options.removeImages && ['UserMessage', 'userMessage'].includes(item.type) && Array.isArray(item.content)) {
+    for (let i = 0; i < item.content.length; i++) {
+      const block = item.content[i];
+      if (block?.type === 'image' && inlineImage(block.url) &&
+          parsed.replace(item.content, i, {type: 'text', text: '[image removed]', text_elements: []}, 'images')) counts.images++;
+    }
+  }
+  if (options.compactTools && ['CommandExecution', 'commandExecution'].includes(item.type) && item.status === 'completed') {
+    const canonical = item.type === 'CommandExecution';
+    if (item[canonical ? 'exit_code' : 'exitCode'] !== 0) return;
+    let command = item.command;
+    if (canonical) {
+      // Only an exact shell invocation has a known command string; never execute it.
+      if (!Array.isArray(command) || command.length !== 3 || !['/bin/zsh', '/bin/bash', '/bin/sh', 'zsh', 'bash', 'sh'].includes(command[0]) ||
+          !['-c', '-lc'].includes(command[1])) return;
+      command = command[2];
+    }
+    const key = canonical ? 'aggregated_output' : 'aggregatedOutput';
+    const result = compact(commandFilter(command), item[key]);
+    if (result && parsed.replace(item, key, result, 'toolOutputs')) counts.toolOutputs++;
+  }
 }
 
-export function slimHistory(input: Buffer, provider: Provider, options: SlimOptions): {output: Buffer | null; counts: SlimCounts} {
+export function slimCodexItem(text: string, options: SlimOptions): string {
+  const parsed = parseLine(text);
+  rewriteCodexItem(parsed, parsed.row, options, {images: 0, toolOutputs: 0});
+  return parsed.render();
+}
+
+export function assertCodexMeta(row: Row) {
+  const meta = row.payload;
+  if (row.type !== 'session_meta' || !object(meta) || typeof meta.id !== 'string' || !meta.id)
+    throw new Error('Codex history requires a recognized session header and identity');
+  if (meta.history_mode !== undefined && !['legacy', 'paginated'].includes(meta.history_mode) ||
+      meta.history_base != null || meta.subagent_history_start_ordinal != null || meta.forked_from_id || meta.forked_from ||
+      meta.attached_thread || meta.forked_from_ordinal_exclusive != null || meta.imported)
+    throw new Error('Shared or imported Codex history requires coordinated dependent-history updates; file retained');
+}
+
+export function slimHistory(input: Buffer, provider: Provider, options: SlimOptions): {output: Buffer | null; counts: SlimCounts; savingsBytes: SlimSavingsBytes} {
   if (input.length > MAX_HISTORY_BYTES) throw new Error('History exceeds the 64 MiB rewrite limit');
   let text: string;
   try { text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(input); }
   catch { throw new Error('History is not valid UTF-8'); }
   const lines = text.split('\n'), counts: SlimCounts = {images: 0, toolOutputs: 0};
+  const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   const calls = new Map<string, RtkFilter | undefined>();
-  let session: string | undefined, versionSeen = false, records = 0;
+  let session: string | undefined, versionSeen = false, records = 0, ordinal = -1;
   function remember(id: unknown, command: unknown) {
     if (typeof id !== 'string') return;
     if (calls.has(id)) throw new Error('Duplicate tool call identity; original retained');
@@ -141,12 +178,12 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
         if (!object(block)) continue;
         const image = codex ? block.type === 'input_image' && inlineImage(block.image_url) :
           block.type === 'image' && block.source?.type === 'base64' && typeof block.source.media_type === 'string' && block.source.media_type.startsWith('image/') && typeof block.source.data === 'string';
-        if (options.removeImages && image && parsed.replace(content, i, {type: codex ? 'input_text' : 'text', text: '[image removed]'})) counts.images++;
+        if (options.removeImages && image && parsed.replace(content, i, {type: codex ? 'input_text' : 'text', text: '[image removed]'}, 'images')) counts.images++;
       }
     };
     const replaceToolText = (parent: Row | any[], key: string | number, filter: RtkFilter | undefined) => {
       const result = compact(filter, (parent as any)[key]);
-      if (result && parsed.replace(parent, key, result)) counts.toolOutputs++;
+      if (result && parsed.replace(parent, key, result, 'toolOutputs')) counts.toolOutputs++;
     };
     if (provider === 'claude') {
       if (row.version !== undefined) {
@@ -174,10 +211,16 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
         }
       }
     } else {
-      if (records === 0) { assertLegacyCodexMeta(row); session = row.payload.id; versionSeen = true; }
+      if (records === 0) { assertCodexMeta(row); session = row.payload.id; }
       else if (row.type === 'session_meta') throw new Error('Multiple Codex history headers');
-      if (row.ordinal !== undefined || object(row.payload) && row.payload.history_base != null) throw new Error('History byte offsets or shared records are unsupported');
+      if (row.ordinal !== undefined) {
+        if (!Number.isSafeInteger(row.ordinal) || row.ordinal < 0 || row.ordinal <= ordinal) throw new Error('Invalid or non-increasing history ordinal');
+        ordinal = row.ordinal;
+      }
+      if (object(row.payload) && row.payload.history_base != null) throw new Error('Shared history requires dependent-history updates');
       const payload = row.payload;
+      if (row.type === 'event_msg' && ['item_started', 'item_completed'].includes(payload?.type))
+        rewriteCodexItem(parsed, payload.item, options, counts);
       if (options.removeImages && row.type === 'event_msg' && payload?.type === 'user_message' && Array.isArray(payload.images)) {
         const urls: unknown[] = payload.images, details = payload.image_details, order = payload.image_order;
         const removed = urls.map(inlineImage), count = removed.filter(Boolean).length;
@@ -189,18 +232,17 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           order.filter(kind => kind === 'inline').length === urls.length &&
           order.filter(kind => kind === 'file').length === (payload.file_ids?.length ?? 0));
         if (count && urls.every(url => typeof url === 'string') && knownDetails && knownOrder &&
-            parsed.replace(payload, 'images', urls.filter((_, i) => !removed[i]))) {
+            parsed.replace(payload, 'images', urls.filter((_, i) => !removed[i]), 'images')) {
           if (Array.isArray(details) && details.some((_, i) => removed[i]))
-            parsed.replace(payload, 'image_details', details.filter((_, i) => !removed[i]));
+            parsed.replace(payload, 'image_details', details.filter((_, i) => !removed[i]), 'images');
           if (Array.isArray(order) && order.length) {
             let index = 0;
-            parsed.replace(payload, 'image_order', order.filter(kind => kind === 'file' || !removed[index++]));
+            parsed.replace(payload, 'image_order', order.filter(kind => kind === 'file' || !removed[index++]), 'images');
           }
           counts.images += count;
         }
       }
-      // shortcut: only top-level legacy response items are rewritten; extend this
-      // after verifying native replay of compacted replacement histories.
+      // shortcut: compacted replacement histories stay intact until their replay format is supported.
       if (row.type === 'response_item' && object(payload)) {
         if (payload.type === 'message') replaceImages(payload.content, true);
         if (options.compactTools && payload.type === 'function_call') {
@@ -213,12 +255,14 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           // Preserve the native execution envelope and exit status verbatim. Live
           // process chunks, unknown envelopes and failures cannot be filtered.
           const result = compactCodexOutput(calls.get(payload.call_id), payload.output);
-          if (result && parsed.replace(payload, 'output', result)) counts.toolOutputs++;
+          if (result && parsed.replace(payload, 'output', result, 'toolOutputs')) counts.toolOutputs++;
         }
       }
     }
     lines[n] = parsed.render(); records++;
+    savingsBytes.images += parsed.savingsBytes.images;
+    savingsBytes.toolOutputs += parsed.savingsBytes.toolOutputs;
   }
-  if (!records || !session || !versionSeen) throw new Error('History format or session identity could not be established');
-  return {output: counts.images || counts.toolOutputs ? Buffer.from(lines.join('\n')) : null, counts};
+  if (!records || !session || provider === 'claude' && !versionSeen) throw new Error('History format or session identity could not be established');
+  return {output: counts.images || counts.toolOutputs ? Buffer.from(lines.join('\n')) : null, counts, savingsBytes};
 }
