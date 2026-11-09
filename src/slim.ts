@@ -176,7 +176,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   if (options.removeReasoning) { counts.reasoning = 0; savingsBytes.reasoning = 0; }
   const calls = new Map<string, RtkFilter | undefined>();
-  let session: string | undefined, versionSeen = false, records = 0, ordinal = -1;
+  let session: string | undefined, records = 0, ordinal = -1;
   function remember(id: unknown, command: unknown) {
     if (typeof id !== 'string') return;
     if (calls.has(id)) throw new Error('Duplicate tool call identity; original retained');
@@ -200,10 +200,6 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
       if (result && parsed.replace(parent, key, result, 'toolOutputs')) counts.toolOutputs++;
     };
     if (provider === 'claude') {
-      if (row.version !== undefined) {
-        if (row.version !== '2.1.319') throw new Error('Only Claude Code 2.1.319 histories are supported');
-        versionSeen = true;
-      }
       if (row.forkedFrom || row.forkedFromSessionId || row.isImported) throw new Error('Imported or forked Claude history is unsupported');
       if (typeof row.sessionId === 'string') {
         if (session && session !== row.sessionId) throw new Error('Mixed history session identities');
@@ -282,6 +278,6 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     savingsBytes.toolOutputs += parsed.savingsBytes.toolOutputs;
     if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
   }
-  if (!records || !session || provider === 'claude' && !versionSeen) throw new Error('History format or session identity could not be established');
+  if (!records || !session) throw new Error('History format or session identity could not be established');
   return {output: counts.images || counts.toolOutputs || counts.reasoning ? Buffer.from(lines.join('\n')) : null, counts, savingsBytes};
 }

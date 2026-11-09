@@ -257,3 +257,29 @@ export async function verifyProjectionBefore(root: string, receipts: ProjectionR
     } finally { db.close(); }
   }
 }
+
+export async function verifyCodexDeletionHistories(inv: Inventory, ids: Set<string>, paths: Set<string>) {
+  if (!inv.complete || inv.links.some(l => /^(?:sessions|archived_sessions)(?:\/|$)/.test(relative(inv.root, l.path))))
+    throw new Error('Native history ownership inspection is incomplete');
+  const rolloutIds = new Set(ids), rows: {file: FileEntry; meta: Record<string, any>}[] = [];
+  for (const file of inv.files.filter(f => historyPath.test(f.relative))) {
+    const {payload: meta} = await readCodexHeader(file);
+    const owner = meta.session_id ?? meta.id;
+    if (typeof owner !== 'string' || !owner) throw new Error('Native history has an unrecognized owner');
+    const sibling = paths.has(file.path.replace(/\.zst$/, ''));
+    const named = [...ids].some(id => file.relative.endsWith(`${id}.jsonl`) || file.relative.endsWith(`${id}.jsonl.zst`));
+    if (ids.has(owner) || sibling || named) {
+      if (!paths.has(file.path) || file.nlink !== 1) throw new Error('Native deletion includes an unpreviewed or linked rollout; selected session retained');
+      rolloutIds.add(meta.id);
+    }
+    rows.push({file, meta});
+  }
+  for (const {file, meta} of rows) {
+    if (paths.has(file.path)) continue;
+    for (const ref of [meta.history_base?.thread_id, meta.forked_from_id, meta.forked_from]) {
+      if (ref != null && typeof ref !== 'string') throw new Error('Unrecognized native history reference');
+      if (rolloutIds.has(ref)) throw new Error('Selected session is referenced by another rollout');
+    }
+    if (meta.history_base != null && typeof meta.history_base?.thread_id !== 'string') throw new Error('Unrecognized native history reference');
+  }
+}

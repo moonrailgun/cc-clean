@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { zstdCompressSync } from 'node:zlib';
 import { slimHistory, slimCodexItem } from '../src/slim.ts';
-import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout } from '../src/providers/codex-history.ts';
+import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout, verifyCodexDeletionHistories } from '../src/providers/codex-history.ts';
 import { scanRoot } from '../src/scan.ts';
 
 const options = {removeImages: true, compactTools: true};
@@ -232,4 +232,33 @@ test('reasoning-only and combined slimming synchronize offsets and caches in mem
       assert.deepEqual(projectionSnapshot(db, 'other'), other);
     } finally { db.close(); }
   }
+});
+import { assertCodexDeleteCapabilities } from '../src/codex-delete.ts';
+
+test('native ownership checks allow unrelated copies but reject unpreviewed owned rollouts and references', async t => {
+  const {root, put} = await layout(t);
+  const target = await put('sessions/target.jsonl', {id: 'immutable', session_id: 'selected'});
+  const unrelated = await put('archived_sessions/unrelated.jsonl.zst', {id: 'unrelated'});
+  await link(unrelated, join(root, 'linked-copy'));
+  const ids = new Set(['selected']), paths = new Set([target]);
+  await verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths);
+  for (const meta of [
+    {id: 'another-immutable', session_id: 'selected'},
+    {id: 'dependent', history_base: {thread_id: 'immutable', end_byte_offset: 99}},
+  ]) {
+    const path = await put('archived_sessions/other.jsonl.zst', meta);
+    await assert.rejects(verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths), /unpreviewed|referenced/);
+    await rm(path);
+  }
+  await put('sessions/target.jsonl.zst', {id: 'immutable'});
+  await assert.rejects(verifyCodexDeletionHistories(await scanRoot(root, 'codex'), ids, paths), /unpreviewed/);
+});
+
+test('native capability validation depends on advertised behavior, not versions', () => {
+  const help = 'Usage: codex delete [OPTIONS] <SESSION>\n -c, --config <key=value>\n --force';
+  const features = 'local_thread_store_compression experimental false\nbackground_paginated_rollout_migration experimental false\n';
+  assert.doesNotThrow(() => assertCodexDeleteCapabilities(help, features));
+  for (const text of [help.replace('--force', ''), help.replace('<SESSION>', '[SESSION]'), help.replace('--config', '--other')])
+    assert.throws(() => assertCodexDeleteCapabilities(text, features), /capabilit/);
+  assert.throws(() => assertCodexDeleteCapabilities(help, features.replace('experimental false', 'experimental true')), /capabilit/);
 });

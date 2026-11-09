@@ -15,7 +15,7 @@ const ids = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-22
   '33333333-3333-4333-8333-333333333333', '44444444-4444-4444-8444-444444444444',
   '55555555-5555-4555-8555-555555555555'];
 
-test('native adapter validates IDs/version, isolates roots, and sanitizes failure', async t => {
+test('native adapter validates IDs/capabilities, isolates roots, and sanitizes failure', async t => {
   const temp = await realpath(await mkdtemp(join(tmpdir(), 'cc-clean-fake-codex-')));
   const root = join(temp, 'root $(no-shell); space');
   const bin = join(temp, 'bin');
@@ -30,6 +30,8 @@ fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({args,cwd:process.cwd(
 if(args[0]==='--version'){console.log(settings.version??'codex-cli 0.167.0');process.exit(0);}
 if(settings.fail){console.error('SECRET_TOKEN private conversation');process.exit(7);}
 if(settings.hang){require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},30000)'],{stdio:'inherit'});process.exit(0);}
+if(args.includes('--help')){console.log(settings.missingCapabilities?'Usage: codex': 'Usage: codex delete [OPTIONS] <SESSION>\\n--force\\n--config <KEY=VALUE>');process.exit(0);}
+if(args.includes('features')){console.log('local_thread_store_compression under development false\\nbackground_paginated_rollout_migration experimental false');process.exit(0);}
 `, { mode: 0o700 });
   const previous = { PATH: process.env.PATH, CODEX_HOME: process.env.CODEX_HOME, CODEX_SQLITE_HOME: process.env.CODEX_SQLITE_HOME };
   process.env.PATH = `${bin}:${process.env.PATH ?? ''}`;
@@ -43,8 +45,8 @@ if(settings.hang){require('node:child_process').spawn(process.execPath,['-e','se
       assert.equal(await getCodexVersion(), '0.167.0');
       await deleteCodexSession(root, ids[0]);
       const call = (await readCalls()).at(-1);
-      assert.deepEqual(call.args, ['delete', ids[0], '--force', '-c', `sqlite_home=${JSON.stringify(root)}`, '-c', `log_dir=${JSON.stringify(join(root, 'log'))}`,
-        '-c', 'features.local_thread_store_compression=false', '-c', 'features.background_paginated_rollout_migration=false']);
+      assert.deepEqual(call.args, ['--no-daemon', '-c', `sqlite_home=${JSON.stringify(root)}`, '-c', `log_dir=${JSON.stringify(join(root, 'log'))}`,
+        '-c', 'features.local_thread_store_compression=false', '-c', 'features.background_paginated_rollout_migration=false', 'delete', ids[0], '--force']);
       assert.equal(call.root, root); assert.equal(call.sqlite, root); assert.equal(call.cwd, root);
     });
     await t.test('rejects injected arguments, names, and paths before starting any process', async () => {
@@ -80,8 +82,9 @@ if(settings.hang){require('node:child_process').spawn(process.execPath,['-e','se
         'session_index.jsonl', 'session_index.jsonl.lock']) {
         const path = join(root, name); await mkdir(dirname(path), { recursive: true });
         await symlink(outside, path);
+        const count = (await readCalls()).length;
         await assert.rejects(deleteCodexSession(root, ids[0]), /links or special files/);
-        assert.deepEqual((await readCalls()).at(-1).args, ['--version']);
+        assert.equal((await readCalls()).length, count);
         await rm(path);
       }
       for (const name of ['state_5.sqlite-wal', 'log/hardlink', 'session_index.jsonl.lock']) {
@@ -99,12 +102,17 @@ if(settings.hang){require('node:child_process').spawn(process.execPath,['-e','se
       await mkdir(join(root, 'tmp', 'arg0-macos', 'codex-arg0synthetic'), { recursive: true });
       await symlink(outside, join(root, 'tmp', 'arg0-macos', 'codex-arg0synthetic', 'apply_patch'));
       await deleteCodexSession(root, ids[0]);
-      assert.equal((await readCalls()).at(-1).args[0], 'delete');
+      assert.deepEqual((await readCalls()).at(-1).args.slice(-3), ['delete', ids[0], '--force']);
     });
-    await t.test('does not delete with another version or malformed version output', async () => {
+    await t.test('accepts another version with required capabilities and rejects missing capabilities', async () => {
       await configure({ version: 'codex-cli 0.168.0' });
-      await assert.rejects(deleteCodexSession(root, ids[0]), /Unverified/);
-      assert.deepEqual((await readCalls()).at(-1).args, ['--version']);
+      assert.equal(await getCodexVersion(), '0.168.0');
+      await deleteCodexSession(root, ids[0]);
+      assert.deepEqual((await readCalls()).at(-1).args.slice(-3), ['delete', ids[0], '--force']);
+      const count = (await readCalls()).filter(call => call.args.at(-1) === '--force').length;
+      await configure({ missingCapabilities: true });
+      await assert.rejects(deleteCodexSession(root, ids[0]), /lacks required native deletion capabilities/);
+      assert.equal((await readCalls()).filter(call => call.args.at(-1) === '--force').length, count);
       await configure({ version: 'SECRET_TOKEN' });
       await assert.rejects(getCodexVersion(), error => error instanceof Error && error.message === 'Cannot determine Codex version');
     });
@@ -189,7 +197,7 @@ test('installed Codex 0.167.0 deletes an isolated parent cascade and preserves a
       await utimes(join(index === 4 ? archivedDirectory : directory, `rollout-2026-11-08T00-00-00-${id}.jsonl`), old, old);
     const inventory = await scanRoot(root, 'codex');
     const analysis = await analyze(inventory, { deep: true });
-    const plan = await createPlan(inventory, { version, sessions: analysis.sessions, sessionIds: [ids[0]] });
+    const plan = await createPlan(inventory, { version, sessions: analysis.sessions, sessionIds: [ids[0]], checkActivity: async () => null });
     const receipt = await executePlan(plan, { stateDir, checkActivity: async () => null });
     assert.equal(receipt.status, 'completed', JSON.stringify(receipt.actions.map(action => action.reason)));
     assert.equal(receipt.actions[0].status, 'completed');

@@ -11,12 +11,12 @@ import { scanSystemTemp, scopedTempKind, tempExcluded, verifySystemTempParents, 
 import { privateDir, atomicJson, jsonFiles, within, existingDir, readOrdinaryFile } from './state.ts';
 import { recompressPng, MAX_PNG_BYTES } from './png.ts';
 import { checkActivity as defaultActivity, type ActivityCheck } from './activity.ts';
-import { deleteCodexSession } from './codex-delete.ts';
+import { deleteCodexSession, verifyCodexDeleteCapabilities } from './codex-delete.ts';
 import { validateReceipt } from './state.ts';
 import { readCodexIndex, type IndexThread } from './providers/codex.ts';
 import { readCleanupLog, recordCleanup } from './history.ts';
 import { slimHistory, MAX_HISTORY_BYTES, type SlimOptions, type SlimCounts, type SlimSavingsBytes } from './slim.ts';
-import { verifyCodexRewriteLayout, previewProjection, prepareProjection, verifyProjectionBefore, type ProjectionReceipt } from './providers/codex-history.ts';
+import { verifyCodexRewriteLayout, verifyCodexDeletionHistories, previewProjection, prepareProjection, verifyProjectionBefore, type ProjectionReceipt } from './providers/codex-history.ts';
 export { verifyCodexRewriteLayout } from './providers/codex-history.ts';
 const exec=promisify(execFile);
 const hash=(data:Buffer)=>createHash('sha256').update(data).digest('hex');
@@ -79,9 +79,7 @@ function makeAction(kind:Action['kind'],id:string,files:FileEntry[],sessionIds?:
   return {id:randomUUID(),kind,targetId:id,files,sessionIds,status:'planned',beforeBytes:bytes,afterBytes:bytes,estimatedSavingsBytes:replacement(kind)?null:bytes,recoveryState:'prepared'};
 }
 
-function verifyCodexScope(action:Action,threads:IndexThread[],inventory:Inventory,sessions?:Session[]) {
-  // Native deletion also removes compressed siblings; these have not been analyzed.
-  if(inventory.files.some(f=>/^(?:sessions|archived_sessions)\/.*\.jsonl\.zst$/.test(f.relative)))throw new Error('Compressed sessions are unsupported; native deletion scope cannot be verified');
+async function verifyCodexScope(action:Action,threads:IndexThread[],inventory:Inventory,sessions?:Session[]) {
   const byId=new Map(threads.map(t=>[t.id,t]));
   const closure=new Set([action.targetId]);let changed=true;
   while(changed){changed=false;for(const thread of threads)if(thread.parentId&&closure.has(thread.parentId)&&!closure.has(thread.id)){closure.add(thread.id);changed=true;}}
@@ -99,11 +97,12 @@ function verifyCodexScope(action:Action,threads:IndexThread[],inventory:Inventor
     }
   }
   if(action.files.length!==paths.size||action.files.some(f=>!paths.has(f.path)))throw new Error('Native deletion scope differs from the preview');
+  await verifyCodexDeletionHistories(inventory,closure,paths);
 }
-// Observed startup writes and tagged 0.167.0 deletion paths only. Rollouts are
+// Known native startup database families and deletion paths. Rollouts are
 // deliberately excluded: migration/compression are disabled by the adapter.
 function nativeMaintenancePath(path:string) {
-  return /^(?:state_5|logs_2|goals_1|memories_1|queue_1|thread_history_1|agent_message_board_1)\.sqlite(?:-(?:wal|shm|journal))?$/.test(path)
+  return /^(?:state|logs|goals|memories|queue|thread_history|agent_message_board)_\d+\.sqlite(?:-(?:wal|shm|journal))?$/.test(path)
     || /^(?:installation_id|session_index\.jsonl(?:\.lock)?)$/.test(path)
     || /^(?:skills\/\.system|tmp\/arg0-(?:macos|linux)|log|thread-writer-locks)(?:\/|$)/.test(path)
     || /^\.tmp\/(?:plugins\.sync\.lock|git-[^/]+(?:\/.*)?)$/.test(path);
@@ -146,10 +145,8 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
     if(groups.some(s=>!s.complete||!s.files.length||s.files.some(f=>!eligible(f))))throw new Error('Session structure, ownership or references are incomplete; deletion blocked');
     const owned=new Set<string>();for(const s of groups) for(const f of s.files){if(owned.has(f.path)||sessions.some(other=>!selected.has(other.id)&&other.files.some(x=>x.path===f.path)))throw new Error('Session files have shared ownership');owned.add(f.path);}
     if(inv.provider==='claude') {
-      if(groups.some(s=>s.version!=='2.1.319'))throw new Error('Unverified Claude session format version (supported: 2.1.319)');
       plan.actions.push(makeAction('delete-files',[...selected].join(', '),groups.flatMap(s=>s.files),[...selected]));
     } else {
-      if(version!=='0.167.0')throw new Error('Unverified Codex version (supported: 0.167.0)');
       for(const s of groups.filter(s=>!s.parentId||!selected.has(s.parentId))) {
         const ids=new Set([s.id]);let more=true;while(more){more=false;for(const c of groups)if(c.parentId&&ids.has(c.parentId)&&!ids.has(c.id)){ids.add(c.id);more=true;}}
         plan.actions.push(makeAction('codex-delete',s.id,groups.filter(c=>ids.has(c.id)).flatMap(c=>c.files),[...ids]));
@@ -157,7 +154,8 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
       if(new Set(plan.actions.flatMap(a=>a.sessionIds!)).size!==selected.size)throw new Error('Session relationships contain a cycle; deletion blocked');
       const index=await readCodexIndex(inv);
       if(!index.complete||!index.fingerprint||groups.some(s=>!index.threads.some(t=>t.id===s.id&&t.path&&s.files.some(f=>f.path===t.path))))throw new Error('Native session index is incomplete; deletion blocked');
-      for(const action of plan.actions)verifyCodexScope(action,index.threads,inv,groups);
+      for(const action of plan.actions)await verifyCodexScope(action,index.threads,inv,groups);
+      await verifyCodexDeleteCapabilities(inv.root);
       plan.codexIndexFingerprint=index.fingerprint;
     }
     return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
@@ -177,7 +175,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
     }
     if(!options.includeFileCleanup)return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
   }
-  const stateValid=inv.provider==='codex'&&version==='0.167.0'&&await validState(inv.root);
+  const stateValid=inv.provider==='codex'&&await validState(inv.root);
   for(const f of inv.files) {
     if(selected&&!selected.has(f.path))continue;
     if(!eligible(f))continue;
@@ -355,7 +353,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
         if(a.kind==='codex-delete') {
           const pre=await scanRoot(r.root,r.provider);if(!pre.complete)throw new Error('Scan before native deletion is incomplete');
           const index=await readCodexIndex(pre);if(!index.complete||!expectedIndexFingerprint||index.fingerprint!==expectedIndexFingerprint)throw new Error('Session index or deletion scope changed; preview again');
-          verifyCodexScope(a,index.threads,pre);
+          await verifyCodexScope(a,index.threads,pre);
           a.beforeBytes=pre.totalBytes;a.nativeStarted=true;await save();
           try {await deleteCodexSession(r.root,a.targetId);}catch {r.attributionComplete=false;throw new Error('Native deletion could not be confirmed; inspect the pending operation');}
           const post=await scanRoot(r.root,r.provider);

@@ -174,7 +174,7 @@ test('RTK ports cap groups and preserve failures, warnings, controls and unknown
 test('malformed or unsupported history is rejected as a whole without changing input', () => {
   const good = jsonl(claude('user', [image]));
   for (const input of [Buffer.concat([good, Buffer.from('{bad')]), Buffer.from(good.toString().replace('"version":', '"version":"2.1.319","version":')),
-    Buffer.from(good.toString().replace('2.1.319', 'unknown')), Buffer.from(good.toString().replace('"sessionId":"synthetic",', '')),
+    Buffer.from(good.toString().replace('"sessionId":"synthetic",', '')),
     Buffer.from(good.toString().replace('"type":"user"', '"type":"user","isImported":true')),
     Buffer.from([0xff]), Buffer.concat([Buffer.from([0xef,0xbb,0xbf]), good]), Buffer.alloc(MAX_HISTORY_BYTES + 1)]) {
     const before = Buffer.from(input);
@@ -309,4 +309,26 @@ test('reasoning removal preserves compaction, nested history, unknown ciphertext
     ...[null, '', 123, {data: 'opaque'}].map(encrypted_content => codex({...encrypted, encrypted_content})));
   assert.equal(slimHistory(input, 'codex', options).output, null);
   assert.equal(slimHistory(jsonl(claude('assistant', [{type: 'thinking', thinking: 'Keep', encrypted_content: 'opaque', signature: 'signed'}])), 'claude', options).output, null);
+});
+
+test('Claude slimming follows record shape across old, new and mixed versions', () => {
+  const versions = ['2.1.246', '2.1.277', '2.1.300', '2.1.319', '2.1.320', '3.0.0', 'custom-build', undefined];
+  for (const version of versions) {
+    const call = claude('assistant', [{type: 'tool_use', id: 'a', name: 'Bash', input: {command: 'rg -n foo'}}], {version, uuid: 'call'});
+    for (const resultVersion of [version, '2.1.319']) {
+      const result = claude('user', [image, {type: 'tool_result', tool_use_id: 'a', is_error: false, content: matches}], {version: resultVersion, uuid: 'result', parentUuid: 'call'});
+      const input = jsonl(call, result), before = Buffer.from(input);
+      const originals = input.toString().trim().split('\n').map(line => JSON.parse(line));
+      const rewritten = compacted(input, 'claude');
+      assert.deepEqual(rewritten.counts, {images: 1, toolOutputs: 1});
+      const rows = rewritten.output!.toString().trim().split('\n').map(line => JSON.parse(line));
+      assert.deepEqual(rows[0], originals[0]);
+      assert.deepEqual(rows[1], {...originals[1], message: {content: [
+        {type: 'text', text: '[image removed]'},
+        {type: 'tool_result', tool_use_id: 'a', is_error: false, content: rows[1].message.content[1].content},
+      ]}});
+      assert.match(rows[1].message.content[1].content, /RTK output compacted/);
+      assert.deepEqual(input, before);
+    }
+  }
 });

@@ -2,7 +2,6 @@ import { execFile, spawn } from 'node:child_process';
 import { lstat, opendir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 
-const supportedVersion = '0.167.0';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const timeoutMs = 15_000;
 
@@ -46,7 +45,7 @@ async function verifyNativeWritePaths(root: string): Promise<void> {
     // Native arg0 startup creates these executable aliases, then removes stale
     // alias directories without following the links. Directory/lock links fail.
     if (info.isSymbolicLink() && /^tmp\/arg0-(?:macos|linux)\/codex-arg0[^/]+\/(?:apply_patch|applypatch|codex-linux-sandbox)$/.test(relative(root, path))) return;
-    if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()) || (info.isFile() && info.nlink !== 1)) {
+    if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory()) || (info.isFile() && info.nlink !== 1 && !/^(?:sessions|archived_sessions)\/.*\.jsonl(?:\.zst)?$/.test(relative(root, path)))) {
       throw new Error('Codex native write paths contain links or special files');
     }
     if (recurse && info.isDirectory()) {
@@ -102,13 +101,12 @@ function runCodex(args: string[], root?: string): Promise<string> {
 
 export async function getCodexVersion(): Promise<string> {
   const output = await runCodex(['--version']);
-  const match = /^codex-cli (\d+\.\d+\.\d+)$/.exec(output.trim());
+  const match = /^codex-cli (\S+)$/.exec(output.trim());
   if (!match) throw new Error('Cannot determine Codex version');
   return match[1];
 }
 
-export async function deleteCodexSession(root: string, id: string): Promise<void> {
-  if (!uuid.test(id)) throw new Error('Codex deletion requires a full UUID');
+async function verifyNativeRoot(root: string) {
   // Native startup can connect an executor selected by the inherited environment.
   // Reject that mode instead of changing the caller's remote or managed policy.
   if (Object.keys(process.env).some(key => key === 'CODEX_EXEC_SERVER_URL'
@@ -120,19 +118,48 @@ export async function deleteCodexSession(root: string, id: string): Promise<void
   }
   const before = await lstat(root);
   if (!before.isDirectory() || before.isSymbolicLink()) throw new Error('Codex source is not a regular directory');
-  if (await getCodexVersion() !== supportedVersion) throw new Error('Unverified Codex version (supported: 0.167.0)');
   await rejectManagedConfiguration();
   await verifyNativeWritePaths(root);
   const after = await lstat(root);
   if (!after.isDirectory() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino) {
     throw new Error('Codex source directory changed');
   }
-  await runCodex([
-    'delete', id, '--force',
-    // These overrides also exclude implicit daemon reuse in Codex 0.167.0.
+  return {dev: after.dev, ino: after.ino};
+}
+
+function nativeArgs(root: string): string[] {
+  return [
+    '--no-daemon',
     '-c', `sqlite_home=${JSON.stringify(root)}`,
     '-c', `log_dir=${JSON.stringify(join(root, 'log'))}`,
     '-c', 'features.local_thread_store_compression=false',
     '-c', 'features.background_paginated_rollout_migration=false',
-  ], root);
+  ];
+}
+
+export function assertCodexDeleteCapabilities(help: string, features: string): void {
+  if (!/Usage:.*\bdelete\b.*<SESSION>/.test(help) || !/--force\b/.test(help) || !/--config\b/.test(help))
+    throw new Error('Installed Codex lacks required native deletion capabilities (session UUID, force or config overrides)');
+  for (const name of ['local_thread_store_compression', 'background_paginated_rollout_migration']) {
+    const states = features.split('\n').filter(line => line.trim().split(/\s+/)[0] === name);
+    if (states.length !== 1 || !/\sfalse\s*$/.test(states[0]))
+      throw new Error(`Installed Codex lacks required deletion capabilities: cannot verify ${name} is disabled`);
+  }
+}
+
+export async function verifyCodexDeleteCapabilities(root: string): Promise<void> {
+  const before = await verifyNativeRoot(root);
+  const help = await runCodex([...nativeArgs(root), 'delete', '--help'], root);
+  const between = await verifyNativeRoot(root);
+  if (before.dev !== between.dev || before.ino !== between.ino) throw new Error('Codex source directory changed');
+  const features = await runCodex([...nativeArgs(root), 'features', 'list'], root);
+  assertCodexDeleteCapabilities(help, features);
+  const after = await verifyNativeRoot(root);
+  if (before.dev !== after.dev || before.ino !== after.ino) throw new Error('Codex source directory changed');
+}
+
+export async function deleteCodexSession(root: string, id: string): Promise<void> {
+  if (!uuid.test(id)) throw new Error('Codex deletion requires a full UUID');
+  await verifyCodexDeleteCapabilities(root);
+  await runCodex([...nativeArgs(root), 'delete', id, '--force'], root);
 }

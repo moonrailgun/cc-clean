@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, utimes, symlink, link, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -73,7 +73,7 @@ test('both entry points account actual deletion once, partitioned by provider',a
 });
 
 import { rename, lstat, realpath, unlink } from 'node:fs/promises';
-import { crc32, deflateSync, inflateSync } from 'node:zlib';
+import { crc32, deflateSync, inflateSync, zstdCompressSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import type { Receipt, Plan } from '../src/clean.ts';
 import { atomicJson } from '../src/state.ts';
@@ -187,34 +187,43 @@ test('transaction directory symlink cannot redirect recovery',async()=>{
 import { DatabaseSync } from 'node:sqlite';
 import { analyze } from '../src/analyze.ts';
 const sessionIds=['12345678-1234-1234-1234-123456789001','12345678-1234-1234-1234-123456789002','12345678-1234-1234-1234-123456789003'];
-async function nativePlanFixture() {
+async function nativePlanFixture(t: TestContext) {
   const f=await fixture();await mkdir(join(f.root,'sessions'));
+  const bin=join(f.base,'capability-bin');await mkdir(bin);
+  await writeFile(join(bin,'codex'),`#!${process.execPath}
+const args=process.argv.slice(2);
+if(args.includes('--help')){console.log('Usage: codex delete [OPTIONS] <SESSION>\\n--force\\n--config <KEY=VALUE>');process.exit(0);}
+if(args.includes('features')){console.log('local_thread_store_compression under development false\\nbackground_paginated_rollout_migration experimental false');process.exit(0);}
+process.exit(1);
+`,{mode:0o700});
+  const previous=process.env.PATH;process.env.PATH=bin+':'+(previous??'');
+  t.after(()=>{if(previous===undefined)delete process.env.PATH;else process.env.PATH=previous;});
   const db=new DatabaseSync(join(f.root,'state_5.sqlite'));
   db.exec('CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, archived INTEGER); CREATE TABLE thread_spawn_edges(parent_thread_id TEXT, child_thread_id TEXT)');
   for(const id of sessionIds){const path=join(f.root,'sessions',id+'.jsonl');await writeFile(path,JSON.stringify({type:'session_meta',payload:{id,cwd:'/project',cli_version:'0.167.0'}})+'\n');await utimes(path,new Date(f.now-73*3600000),new Date(f.now-73*3600000));db.prepare('INSERT INTO threads VALUES(?,?,?,0)').run(id,path,'/project');}
   db.close();const inventory=await scanRoot(f.root,'codex'),analysis=await analyze(inventory,{deep:true});
   return {...f,inventory,analysis};
 }
-test('native deletion rejects changed index relationships before invoking Codex',async()=>{
-  const f=await nativePlanFixture(),p=await createPlan(f.inventory,{version:'0.167.0',source:'analyze',sessions:f.analysis.sessions,sessionIds:[sessionIds[0]]});
+test('native deletion rejects changed index relationships before invoking Codex',async t=>{
+  const f=await nativePlanFixture(t),p=await createPlan(f.inventory,{version:'0.167.0',source:'analyze',sessions:f.analysis.sessions,sessionIds:[sessionIds[0]]});
   const db=new DatabaseSync(join(f.root,'state_5.sqlite'));db.prepare('INSERT INTO thread_spawn_edges VALUES(?,?)').run(sessionIds[0],sessionIds[1]);db.close();
   const r=await executePlan(p,{stateDir:f.stateDir,checkActivity:inactive});
   assert.equal(r.confirmedReductionBytes,0);assert.equal(r.actions[0].nativeStarted,undefined);assert.match(r.actions[0].reason!,/deletion scope changed/);
   for(const id of sessionIds)await access(join(f.root,'sessions',id+'.jsonl'));
 });
-test('planning rejects a new spawn edge added after analysis instead of binding the stale scope',async()=>{
-  const f=await nativePlanFixture();
+test('planning rejects a new spawn edge added after analysis instead of binding the stale scope',async t=>{
+  const f=await nativePlanFixture(t);
   const db=new DatabaseSync(join(f.root,'state_5.sqlite'));db.prepare('INSERT INTO thread_spawn_edges VALUES(?,?)').run(sessionIds[0],sessionIds[1]);db.close();
   await assert.rejects(createPlan(f.inventory,{version:'0.167.0',sessions:f.analysis.sessions,sessionIds:[sessionIds[0]]}),/deletion scope changed/);
   for(const id of sessionIds)await access(join(f.root,'sessions',id+'.jsonl'));
 });
-test('planning rejects a changed parent even when all descendants remain selected',async()=>{
-  const f=await nativePlanFixture();
+test('planning rejects a changed parent even when all descendants remain selected',async t=>{
+  const f=await nativePlanFixture(t);
   const db=new DatabaseSync(join(f.root,'state_5.sqlite'));db.prepare('INSERT INTO thread_spawn_edges VALUES(?,?)').run(sessionIds[0],sessionIds[1]);db.close();
   await assert.rejects(createPlan(f.inventory,{version:'0.167.0',sessions:f.analysis.sessions,sessionIds:sessionIds.slice(0,2)}),/deletion scope changed/);
 });
-test('native deletion rechecks the exact action closure immediately before launch',async()=>{
-  const f=await nativePlanFixture();
+test('native deletion rechecks the exact action closure immediately before launch',async t=>{
+  const f=await nativePlanFixture(t);
   const db=new DatabaseSync(join(f.root,'state_5.sqlite'));db.prepare('INSERT INTO thread_spawn_edges VALUES(?,?)').run(sessionIds[0],sessionIds[1]);db.close();
   const analysis=await analyze(f.inventory,{deep:true});
   const plan=await createPlan(f.inventory,{version:'0.167.0',sessions:analysis.sessions,sessionIds:[sessionIds[0]]});
@@ -223,13 +232,13 @@ test('native deletion rechecks the exact action closure immediately before launc
   assert.equal(receipt.actions[0].nativeStarted,undefined);assert.match(receipt.actions[0].reason!,/deletion scope changed/);
   assert.equal(receipt.confirmedReductionBytes,0);
 });
-test('an unpreviewed compressed rollout prevents planning and execution',async()=>{
-  const f=await nativePlanFixture(),options={version:'0.167.0',sessions:f.analysis.sessions,sessionIds:[sessionIds[0]]};
+test('an unpreviewed compressed rollout prevents planning and execution',async t=>{
+  const f=await nativePlanFixture(t),options={version:'0.167.0',sessions:f.analysis.sessions,sessionIds:[sessionIds[0]]};
   const plan=await createPlan(f.inventory,options);
-  await writeFile(join(f.root,'sessions',sessionIds[0]+'.jsonl.zst'),'unvalidated compressed fixture');
-  await assert.rejects(createPlan(await scanRoot(f.root,'codex'),options),/Compressed sessions/);
+  await writeFile(join(f.root,'sessions',sessionIds[0]+'.jsonl.zst'),zstdCompressSync(Buffer.from(JSON.stringify({type:'session_meta',payload:{id:sessionIds[0]}})+'\n')));
+  await assert.rejects(createPlan(await scanRoot(f.root,'codex'),options),/unpreviewed/);
   const receipt=await executePlan(plan,{stateDir:f.stateDir,checkActivity:inactive});
-  assert.equal(receipt.actions[0].nativeStarted,undefined);assert.match(receipt.actions[0].reason!,/Compressed sessions/);
+  assert.equal(receipt.actions[0].nativeStarted,undefined);assert.match(receipt.actions[0].reason!,/unpreviewed/);
 });
 test('native postchecks reject unrelated index and file changes, allowing measured startup maintenance only',async t=>{
   const scenarios=[
@@ -240,15 +249,19 @@ test('native postchecks reject unrelated index and file changes, allowing measur
     {name:'new unrelated file',code:`fs.writeFileSync(root+'/unexpected.txt','new');`},
     {name:'known native maintenance',code:`fs.mkdirSync(root+'/log',{recursive:true});fs.writeFileSync(root+'/log/codex.log','startup');`,allowed:true},
   ];
-  for(const scenario of scenarios)await t.test(scenario.name,async()=>{
-    const f=await nativePlanFixture();await writeFile(join(f.root,'protected.txt'),'unchanged');
+  for(const scenario of scenarios)await t.test(scenario.name,async t=>{
+    const f=await nativePlanFixture(t);await writeFile(join(f.root,'protected.txt'),'unchanged');
     const survivor=await readFile(join(f.root,'sessions',sessionIds[1]+'.jsonl'),'utf8');
     const plan=await createPlan(f.inventory,{version:'0.167.0',sessions:f.analysis.sessions,sessionIds:[sessionIds[0]]});
     const bin=join(f.base,'bin');await mkdir(bin);
     await writeFile(join(bin,'codex'),`#!${process.execPath}
 const fs=require('node:fs');const {DatabaseSync}=require('node:sqlite');
 if(process.argv[2]==='--version'){console.log('codex-cli 0.167.0');process.exit(0);}
-const root=process.env.CODEX_HOME;const id=process.argv[3];
+const args=process.argv.slice(2);
+if(args.includes('--help')){console.log('Usage: codex delete [OPTIONS] <SESSION>\\n--force\\n--config <KEY=VALUE>');process.exit(0);}
+if(args.includes('features')){console.log('local_thread_store_compression under development false\\nbackground_paginated_rollout_migration experimental false');process.exit(0);}
+if(!args.includes('delete'))process.exit(1);
+const root=process.env.CODEX_HOME;const id=args[args.indexOf('delete')+1];
 const db=new DatabaseSync(root+'/state_5.sqlite');
 fs.unlinkSync(root+'/sessions/'+id+'.jsonl');db.prepare('DELETE FROM threads WHERE id=?').run(id);
 ${scenario.code}
@@ -264,16 +277,16 @@ db.close();
     } finally {if(previous===undefined)delete process.env.PATH;else process.env.PATH=previous;}
   });
 });
-test('a cycle cannot be hidden by another valid selected native root',async()=>{
-  const f=await nativePlanFixture();f.analysis.sessions.find(s=>s.id===sessionIds[1])!.parentId=sessionIds[2];f.analysis.sessions.find(s=>s.id===sessionIds[2])!.parentId=sessionIds[1];
+test('a cycle cannot be hidden by another valid selected native root',async t=>{
+  const f=await nativePlanFixture(t);f.analysis.sessions.find(s=>s.id===sessionIds[1])!.parentId=sessionIds[2];f.analysis.sessions.find(s=>s.id===sessionIds[2])!.parentId=sessionIds[1];
   await assert.rejects(createPlan(f.inventory,{version:'0.167.0',sessions:f.analysis.sessions,sessionIds}),/cycle/);
 });
-test('Claude deletion groups subagent files and preserves project memory and history',async()=>{
+test('Claude deletion groups structurally valid mixed-version files and preserves project memory and history',async()=>{
   const f=await fixture(),id=sessionIds[0],root=join(f.base,'claude'),project=join(root,'projects','p');
   await mkdir(join(project,id,'subagents'),{recursive:true});await mkdir(join(project,id,'tool-results'));await mkdir(join(project,'memory'));
   const record={type:'user',sessionId:id,cwd:'/project',version:'2.1.319',uuid:'u1',message:{role:'user',content:'synthetic'}};
-  await writeFile(join(project,id+'.jsonl'),JSON.stringify(record)+'\n');
-  await writeFile(join(project,id,'subagents','agent-child.jsonl'),JSON.stringify({...record,agentId:'child',isSidechain:true})+'\n');
+  await writeFile(join(project,id+'.jsonl'),JSON.stringify({...record,version:'2.1.300'})+'\n'+JSON.stringify({...record,uuid:'u2',version:'custom-build'})+'\n');
+  await writeFile(join(project,id,'subagents','agent-child.jsonl'),JSON.stringify({...record,version:undefined,agentId:'child',isSidechain:true})+'\n');
   await writeFile(join(project,id,'tool-results','output.txt'),'owned output');await writeFile(join(project,'memory','MEMORY.md'),'retained memory');await writeFile(join(root,'history.jsonl'),'retained history');
   for(const path of [join(project,id+'.jsonl'),join(project,id,'subagents','agent-child.jsonl'),join(project,id,'tool-results','output.txt')])await utimes(path,new Date(f.now-73*3600000),new Date(f.now-73*3600000));
   const inv=await scanRoot(root,'claude'),analysis=await analyze(inv,{deep:true});

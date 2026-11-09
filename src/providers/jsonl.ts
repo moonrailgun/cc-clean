@@ -5,7 +5,7 @@ import { basename, isAbsolute } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import type { FileEntry, Provider, Usage } from '../types.ts';
 
-export const PARSER_VERSION = 4;
+export const PARSER_VERSION = 5;
 const MAX_LINE = 8 * 1024 * 1024;
 const METADATA_BYTES = 1024 * 1024;
 const MAX_IDENTITIES = 100_000;
@@ -115,7 +115,6 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
         result.id = string(row.agentId) ?? result.id; identified = true;
       }
       addProject(row.cwd);
-      if (string(row.version) && result.version && row.version !== result.version) incomplete('Mixed session format versions require unverified compatibility');
       result.version = string(row.version) ?? result.version;
       result.inherited ||= Boolean(row.forkedFrom || row.forkedFromSessionId || row.isImported);
       model = string(row.message?.model) ?? model;
@@ -123,7 +122,6 @@ export async function parseSession(file: FileEntry, provider: Provider, deep: bo
       if (row.type === 'session_meta') {
         if (identified && string(payload.id) && result.id !== payload.id) incomplete('Multiple session identities in one rollout');
         result.id = string(payload.id) ?? result.id; identified ||= Boolean(string(payload.id));
-        if (string(payload.cli_version) && result.version && payload.cli_version !== result.version) incomplete('Mixed session format versions require unverified compatibility');
         result.version = string(payload.cli_version) ?? result.version;
         result.parentId = string(payload.parent_thread_id) ?? string(payload.source?.subagent?.thread_spawn?.parent_thread_id) ?? result.parentId;
         result.inherited ||= Boolean(payload.forked_from_id || payload.forked_from || payload.imported);

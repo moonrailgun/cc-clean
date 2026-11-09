@@ -15,7 +15,7 @@ async function fixture(t: test.TestContext) {
   t.after(() => rm(base, { recursive: true, force: true }));
   return realpath(base);
 }
-async function file(root: string, path: string, content: string) {
+async function file(root: string, path: string, content: string | Buffer) {
   const dest = join(root, path);
   await mkdir(dirname(dest), { recursive: true });
   await writeFile(dest, content);
@@ -408,17 +408,6 @@ test('analysis cache never writes or evicts through a symlinked state ancestor',
   assert.equal((await readdir(cache)).length, 514);
 });
 
-test('mixed Claude format versions cannot be validated by only the last record', async t => {
-  const root = await fixture(t);
-  await file(root, 'projects/p/s1.jsonl', jsonl([
-    { type: 'user', sessionId: 's1', version: 'unknown-new-format', message: { content: 'first' } },
-    { type: 'user', sessionId: 's1', version: '2.1.319', message: { content: 'second' } },
-  ]));
-  const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
-  assert.equal(result.sessions[0].complete, false);
-  assert.match(result.sessions[0].warnings.join(' '), /versions/);
-});
-
 test('cyclic session graphs are incomplete instead of an empty deletion root set', async t => {
   const root = await fixture(t);
   const first = await file(root, 'sessions/first.jsonl', jsonl([{ type: 'session_meta', payload: { id: 'first', source: { subagent: { thread_spawn: { parent_thread_id: 'second' } } } } }]));
@@ -475,4 +464,35 @@ test('Codex spawn graph exceeding its bounded row limit cannot validate deletion
   assert.equal(result.complete, false);
   assert.equal(result.fingerprint, null);
   assert.match(result.warnings.join(' '), /edge limit/);
+});
+import { parseSession } from '../src/providers/jsonl.ts';
+
+test('mixed Claude versions do not make a structurally consistent session incomplete', async t => {
+  const root = await fixture(t);
+  for (const version of ['unknown-new-format', '2.1.300']) {
+    await file(root, 'projects/p/s1.jsonl', jsonl([
+      { type: 'user', sessionId: 's1', version, message: { content: 'first' } },
+      { type: 'user', sessionId: 's1', version: '2.1.319', message: { content: 'second' } },
+    ]));
+    const result = await analyze(await scanRoot(root, 'claude'), { deep: true });
+    assert.equal(result.sessions[0].complete, true);
+    assert.equal(result.scanComplete, true);
+    assert.equal(result.sessions[0].version, '2.1.319');
+  }
+});
+
+test('Codex metadata versions do not hide identity conflicts or block consistent records', async t => {
+  const root = await fixture(t);
+  for (const id of ['s1', 'different-session']) {
+    const content = jsonl([
+      { type: 'session_meta', payload: { id: 's1', cli_version: '0.154.0' } },
+      { type: 'session_meta', payload: { id, cli_version: 'custom-build' } },
+    ]);
+    const path = await file(root, 'sessions/s1.jsonl', content);
+    const result = await parseSession((await scanRoot(root, 'codex')).files[0], 'codex', true);
+    assert.equal(result.version, 'custom-build');
+    assert.equal(result.complete, id === 's1');
+    assert.deepEqual(result.warnings, id === 's1' ? [] : ['Multiple session identities in one rollout']);
+    assert.equal(await readFile(path, 'utf8'), content);
+  }
 });
