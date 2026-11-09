@@ -436,6 +436,10 @@ test('Unicode clipping and output sanitization preserve text and reject terminal
   assert.equal(fit('项目文件', 5), '项目…');
   assert.equal(fit('👨‍👩‍👧‍👦abc', 4), '👨‍👩‍👧‍👦a…');
   assert.equal(fit('hello', 0), '');
+  assert.equal(fit('long-folder/项目文件', 7, true), '…目文件');
+  assert.equal(fit('long-folder/👨‍👩‍👧‍👦abc', 6, true), '…👨‍👩‍👧‍👦abc');
+  assert.equal(fit('hello', 0, true), '');
+  assert.ok(measure(fit('99–102 / 102 items · Compress PNG (lossless)', 30)).width <= 30);
   assert.equal(safe('\x1b[31m项目\x1b[0m\n\u202eevil'), '项目  evil');
   assert.equal(paint('cyan', '\x1b[2Jfile', false), 'file');
   const row = menuRow({ name: '\x1b[2JUntrusted\nname', value: 1 }, 0, true, 79, { total: 0, max: 0, labelWidth: 15, color: true });

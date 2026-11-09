@@ -20,9 +20,20 @@ export function paint(color: keyof typeof colors, value: unknown, enabled = hasC
   const text = safe(value);
   return enabled ? `\x1b[${colors[color]}m${text}\x1b[0m` : text;
 }
-export function fit(value: unknown, width: number): string {
-  const text = safe(value), result = measure(text, { limit: Math.max(0, width), ellipsis: '…' });
-  return text.slice(0, result.index) + (result.ellipsed ? '…' : '');
+export function fit(value: unknown, width: number, fromEnd = false): string {
+  const text = safe(value), limit = Math.max(0, width);
+  if (measure(text).width <= limit) return text;
+  if (limit < 1) return '';
+  const segments = [...new Intl.Segmenter().segment(text)];
+  if (fromEnd) segments.reverse();
+  let fitted = '', used = 1;
+  // Clip whole graphemes; the width library's slice index can overrun after punctuation.
+  for (const { segment } of segments) {
+    used += measure(segment).width;
+    if (used > limit) break;
+    fitted = fromEnd ? segment + fitted : fitted + segment;
+  }
+  return fromEnd ? '…' + fitted : fitted + '…';
 }
 function pad(value: string, width: number): string {
   const text = fit(value, width);
