@@ -733,6 +733,45 @@ test('cleanup file tree stays compact, shows folder suffixes and opens multiline
   await term.key('q'); await answer;
 });
 
+test('More folds scan notes and returning to review still requires Enter to confirm', async t => {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
+    const original = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, get: () => value });
+    t.after(() => Object.defineProperty(process, name, original));
+  }
+  t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
+  const p = inertPlan();
+  p.warnings = ['sessions/changed.jsonl: Cannot read session: FILE_CHANGED'];
+  let settled = false;
+  const answer = confirmPlans([p], term.context.signal);
+  void answer.then(() => { settled = true; }, () => {});
+  await setImmediate();
+  const initial = stripVTControlCharacters(term.text());
+  assert.match(initial, /Total estimated savings/);
+  assert.match(initial, /2\. More/);
+  assert.doesNotMatch(initial, /FILE_CHANGED|View scan notes|View files|72-hour protection|logical bytes/);
+  await term.key('2');
+  assert.equal(settled, false);
+  await term.key('\r');
+  assert.equal(settled, false);
+  assert.match(stripVTControlCharacters(term.text()), /Scan notes.*1 notices/);
+  assert.match(stripVTControlCharacters(term.text()), /2\. Less/);
+  await term.key('4'); await term.key('\r');
+  assert.match(stripVTControlCharacters(term.text()), /sessions\/changed\.jsonl: Cannot read session: FILE_CHANGED/);
+  await term.key('q');
+  await term.key('2');
+  const from = term.text().length;
+  await term.key('\r');
+  const collapsed = stripVTControlCharacters(term.text().slice(from));
+  assert.match(collapsed, /2\. More/);
+  assert.doesNotMatch(collapsed, /FILE_CHANGED|View scan notes|View files|logical bytes/);
+  await term.key('1');
+  assert.equal(settled, false);
+  await term.key('\r');
+  assert.equal(await answer, true);
+});
+
 test('cleanup confirmation summarizes scope, offers file details, and only Enter can approve', async t => {
   const term = await terminal(t);
   for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
@@ -753,8 +792,11 @@ test('cleanup confirmation summarizes scope, offers file details, and only Enter
   assert.match(text, /2\.00 KiB\s+Total estimated savings/);
   assert.match(text, /768 B\s+Remove inline images · 3 images/);
   assert.match(text, /256 B\s+Compact shell output · 2 outputs/);
-  assert.match(text, /Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable/);
+  assert.match(text, /Irreversible: removed content cannot be recovered\. No undo/);
+  assert.match(text, /Resumed context may differ or cost more/);
+  assert.doesNotMatch(text, /Full file paths|logical bytes|last modified more than 72 hours/);
   await term.key('2'); await term.key('\r');
+  await term.key('3'); await term.key('\r');
   assert.equal(settled, false, 'file details must not approve cleanup');
   assert.match(stripVTControlCharacters(term.text()), /generated_images · 1 item/);
   await term.key('\x1b[C'); await term.key('\x1b[C'); await term.key('j'); await term.key('\r');
@@ -764,6 +806,7 @@ test('cleanup confirmation summarizes scope, offers file details, and only Enter
   await term.key('q');
   assert.equal(settled, false, 'closing file details must return to the file list');
   await term.key('q');
+  await term.key('2'); await term.key('\r');
   for (const key of ['1', '2', ' ', 'y', '\x1b[B']) {
     await term.key(key);
     assert.equal(settled, false, 'a non-Enter key must never approve cleanup');
@@ -1023,6 +1066,14 @@ test('cleanup categories combine providers and temporary roots without double-co
   assert.doesNotMatch(text, /\/inert\/|Delete files|source size/);
   assert.ok(lines.length < 37);
   assert.deepEqual(plans, original, 'summarizing preserves the individual plans and JSON details');
+  lines.length = 0;
+  printPlans(plans, false);
+  const compact = lines.join('\n');
+  const estimates = (output: string) => output.slice(output.indexOf('Estimated savings by operation'), output.indexOf('Total estimated savings'));
+  assert.equal(estimates(compact), estimates(text), 'folding preserves every category estimate and the unknown total');
+  assert.match(compact, /Irreversible: removed content cannot be recovered/);
+  assert.doesNotMatch(compact, /Scan notes|Kept unchanged|logical bytes|latest complete snapshot|historical requests/);
+  assert.deepEqual(plans, original, 'folding preserves the complete plan');
   lines.length = 0;
   printReceipts(plans.map(p => ({...p, status: 'dry-run', rootBeforeBytes: null, rootAfterBytes: null,
     confirmedReductionBytes: 0, attributionComplete: false})));

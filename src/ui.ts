@@ -84,15 +84,17 @@ export function printReport(data: Analysis, view = 'directories') {
 export function printPlan(p: Plan) {
   printPlans([p]);
 }
-export function printPlans(plans: Plan[]) {
+export function printPlans(plans: Plan[], details = true) {
   const actions = plans.flatMap(p => p.actions), warnings = plans.flatMap(p => p.warnings);
   const regular = plans.filter(p => !p.systemTemp).flatMap(p => p.actions);
   const temporary = plans.filter(p => p.systemTemp).flatMap(p => p.actions);
   const single = plans.length === 1 ? plans[0] : undefined;
   title(single ? `${providerName(single.provider)}${single.systemTemp ? ' · System temporary files' : ''} · ${actions.length} items` : `Cleanup summary · ${actions.length} items`,
-    single ? single.root : [...new Set(plans.map(p => providerName(p.provider)))].join(' + ') + (plans.some(p => p.systemTemp) ? ' · Includes system temporary files' : ''));
-  note('Bulk deletion and history slimming require files last modified more than 72 hours ago.');
-  for (const p of plans) if (p.explicitTarget && !p.systemTemp) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for a single-file operation or a session without descendants; duplicate pairs remain protected.`);
+    single ? (details ? single.root : undefined) : [...new Set(plans.map(p => providerName(p.provider)))].join(' + ') + (plans.some(p => p.systemTemp) ? ' · Includes system temporary files' : ''));
+  if (details) {
+    note('Bulk deletion and history slimming require files last modified more than 72 hours ago.');
+    for (const p of plans) if (p.explicitTarget && !p.systemTemp) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for a single-file operation or a session without descendants; duplicate pairs remain protected.`);
+  }
   if (!actions.length) {
     line('  No eligible cleanup items.');
   }
@@ -130,6 +132,11 @@ export function printPlans(plans: Plan[]) {
     line();
   }
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
+  if (!details) {
+    if (actions.some(a => a.kind !== 'compress-png')) note('Irreversible: removed content cannot be recovered. No undo.');
+    if (actions.some(a => a.kind === 'slim-history')) note('Resumed context may differ or cost more. See More for details.');
+    return;
+  }
   if (actions.some(a => a.kind === 'deduplicate-history')) note('Duplicate plaintext files will be removed; identical compressed histories are retained. Both files must be more than 72 hours old. No undo copy is kept.');
   if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
   if (actions.some(a => a.slimOptions?.removeOldSnapshots)) note('Irreversible: older compaction snapshots will be deleted; the latest complete snapshot is preserved. Context for forks or rollbacks to older positions may differ.');
@@ -388,19 +395,22 @@ async function planFiles(plans: Plan[], signal?: AbortSignal) {
 }
 export async function confirmPlans(plans: Plan[], signal?: AbortSignal) {
   const actions = plans.flatMap(p => p.actions);
+  let details = false;
   while (true) {
-    printPlans(plans);
+    printPlans(plans, details);
     if (!actions.length) return false;
     const next = await select({
-      message: 'Press Enter to apply the cleanup summary above',
-      subtitle: 'This tool cannot undo these changes. Q / Esc cancels.', clear: false, requireEnter: true, cancelLabel: 'Cancel',
+      message: 'Review cleanup',
+      clear: false, requireEnter: true, cancelLabel: 'Cancel',
       choices: [
         { name: 'Confirm cleanup', description: 'Apply all summarized operations', value: 'confirm' },
-        { name: 'View files', description: 'Full paths and per-file estimates', value: 'files' },
-        ...(plans.some(p => p.warnings.length) ? [{ name: 'View scan notes', description: 'Full paths and reasons', value: 'notes' }] : []),
+        { name: details ? 'Less' : 'More', description: 'Files, protection rules and scan notes', value: 'more' },
+        ...(details ? [{ name: 'View files', description: 'Full paths and per-file estimates', value: 'files' }] : []),
+        ...(details && plans.some(p => p.warnings.length) ? [{ name: 'View scan notes', description: 'Full paths and reasons', value: 'notes' }] : []),
       ],
     }, context(signal));
-    if (next === 'files') await planFiles(plans, signal);
+    if (next === 'more') details = !details;
+    else if (next === 'files') await planFiles(plans, signal);
     else if (next === 'notes') await planNotes(plans, signal);
     else return next === 'confirm';
     screen();
