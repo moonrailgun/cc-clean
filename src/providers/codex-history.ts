@@ -4,14 +4,40 @@ import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join, relative } from 'node:path';
 import { createZstdDecompress } from 'node:zlib';
+import { Readable } from 'node:stream';
 import type { FileEntry, Inventory } from '../types.ts';
-import { assertCodexMeta, slimCodexItem, type SlimOptions } from '../slim.ts';
+import { assertCodexMeta, slimCodexItem, MAX_HISTORY_BYTES, type SlimOptions } from '../slim.ts';
 import { existingDir } from '../state.ts';
 import { verifyCodexSqliteLocation } from './codex.ts';
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_, v) => typeof v === 'bigint' ? {integer: v.toString()} : v)).digest('hex');
 const historyPath = /^(?:sessions|archived_sessions)\/.*\.jsonl(?:\.zst)?$/;
 const databaseName = /^thread_history_\d+\.sqlite$/;
+
+// Node stops at the first zstd frame; consume every frame, including trailing data.
+export async function decodeDuplicateHistory(compressed: Buffer, limit: number, signal?: AbortSignal): Promise<Buffer> {
+  if (!compressed.length || compressed.length > MAX_HISTORY_BYTES || !Number.isSafeInteger(limit) || limit > MAX_HISTORY_BYTES || limit < 1)
+    throw new Error('Duplicate history exceeds the 64 MiB verification limit or is empty');
+  const chunks: Buffer[] = [];
+  let offset = 0, size = 0;
+  while (offset < compressed.length) {
+    signal?.throwIfAborted();
+    const decoder = createZstdDecompress(), source = Readable.from([compressed.subarray(offset)]);
+    source.on('error', error => decoder.destroy(error));
+    source.pipe(decoder);
+    try {
+      for await (const chunk of decoder) {
+        signal?.throwIfAborted();
+        size += chunk.length;
+        if (size > limit) throw new Error('Compressed history differs from the original or exceeds its size');
+        chunks.push(Buffer.from(chunk));
+      }
+      if (!decoder.bytesWritten) throw new Error('Compressed history contains an invalid frame');
+      offset += decoder.bytesWritten;
+    } finally { source.destroy(); decoder.destroy(); }
+  }
+  return Buffer.concat(chunks, size);
+}
 
 export async function readCodexHeader(file: FileEntry, signal?: AbortSignal): Promise<Record<string, any>> {
   if (await realpath(file.path) !== file.path) throw new Error('Codex history path changed');
@@ -48,7 +74,7 @@ export async function readCodexHeader(file: FileEntry, signal?: AbortSignal): Pr
 }
 
 // Read all headers to find inbound byte references, but retain only affected targets.
-export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSignal): Promise<Map<string, string>> {
+export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSignal, duplicates = false): Promise<Map<string, string>> {
   if (!inv.complete) throw new Error('Codex rewrite requires a complete scan');
   if (inv.links.some(l => /^(?:(?:sessions|archived_sessions)(?:\/|$)|config\.toml$|thread_history_.*\.sqlite)/.test(relative(inv.root, l.path))))
     throw new Error('Linked Codex history or configuration prevents complete reference inspection');
@@ -61,7 +87,7 @@ export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSig
     catch (error) { throw new Error(`${file.relative}: cannot inspect inbound history references: ${(error as Error).message}`); }
     const meta = row.payload;
     owners.set(meta.id, [...(owners.get(meta.id) ?? []), file.path]);
-    for (const id of [meta.id, meta.session_id]) {
+    for (const id of new Set([meta.id, meta.session_id])) {
       if (id != null && (typeof id !== 'string' || !id)) throw new Error(`${file.relative}: unrecognized history identity`);
       if (id) aliases.set(id, [...(aliases.get(id) ?? []), file.path]);
     }
@@ -74,11 +100,12 @@ export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSig
     try { assertCodexMeta(row); }
     catch (error) { blocked.set(file.path, (error as Error).message); }
     if (file.nlink !== 1) blocked.set(file.path, 'History has hard links; coordinated copies are required');
-    if (file.path.endsWith('.zst')) blocked.set(file.path, 'Compressed history is inspected for references but is not rewritten');
+    if (!duplicates && file.path.endsWith('.zst')) blocked.set(file.path, 'Compressed history is inspected for references but is not rewritten');
   }
   for (const id of references) for (const path of aliases.get(id) ?? [])
     blocked.set(path, 'History is referenced by another rollout; dependent updates are required');
-  for (const paths of owners.values()) {
+  for (const paths of (duplicates ? aliases : owners).values()) {
+    if (duplicates && paths.length === 2 && paths.some(path => path.endsWith('.jsonl') && paths.includes(path + '.zst'))) continue;
     if (paths.length > 1)
       for (const path of paths) blocked.set(path, 'History is referenced by another rollout or has multiple copies; dependent updates are required');
   }

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { zstdCompressSync } from 'node:zlib';
 import { slimHistory, slimCodexItem } from '../src/slim.ts';
-import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout, verifyCodexDeletionHistories } from '../src/providers/codex-history.ts';
+import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout, verifyCodexDeletionHistories, decodeDuplicateHistory } from '../src/providers/codex-history.ts';
 import { scanRoot } from '../src/scan.ts';
 
 const options = {removeImages: true, compactTools: true};
@@ -261,4 +261,87 @@ test('native capability validation depends on advertised behavior, not versions'
   for (const text of [help.replace('--force', ''), help.replace('<SESSION>', '[SESSION]'), help.replace('--config', '--other')])
     assert.throws(() => assertCodexDeleteCapabilities(text, features), /capabilit/);
   assert.throws(() => assertCodexDeleteCapabilities(help, features.replace('experimental false', 'experimental true')), /capabilit/);
+});
+
+
+test('duplicate comparison decodes every frame and preserves exact bytes across Unicode boundaries', async () => {
+  const split = input.indexOf(Buffer.from('保留')) + 1;
+  const compressed = Buffer.concat([zstdCompressSync(''), zstdCompressSync(input.subarray(0, split)),
+    zstdCompressSync(input.subarray(split)), zstdCompressSync('')]);
+  assert.deepEqual(await decodeDuplicateHistory(compressed, input.length), input);
+  const changed = Buffer.from(input); changed[changed.indexOf(Buffer.from('保留'))] ^= 1;
+  assert.equal((await decodeDuplicateHistory(zstdCompressSync(changed), input.length)).equals(input), false);
+  const shorter = input.subarray(0, input.length - 1);
+  assert.equal((await decodeDuplicateHistory(zstdCompressSync(shorter), input.length)).equals(input), false);
+  await assert.rejects(decodeDuplicateHistory(Buffer.concat([compressed, zstdCompressSync('extra')]), input.length), /differs|size/);
+});
+
+
+test('duplicate decoding rejects damaged streams, output overruns and cancellation', async () => {
+  const valid = zstdCompressSync(input);
+  for (const data of [Buffer.alloc(0), Buffer.from('invalid frame'), valid.subarray(0, valid.length - 2),
+    Buffer.concat([valid, Buffer.from('invalid trailing frame')]), Buffer.concat([valid, valid.subarray(0, valid.length - 2)])])
+    await assert.rejects(decodeDuplicateHistory(data, input.length * 2));
+  for (const limit of [0, -1, 0.5, NaN, Infinity, 64 * 1024 * 1024 + 1])
+    await assert.rejects(decodeDuplicateHistory(valid, limit), /limit|empty/);
+  await assert.rejects(decodeDuplicateHistory(valid, input.length - 1), /differs|size/);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(decodeDuplicateHistory(valid, input.length, controller.signal), {name: 'AbortError'});
+});
+
+
+test('identical history bytes leave SQLite offsets, ordinals and cache text unchanged', () => {
+  const db = fixture();
+  try {
+    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+    const after = rewriteProjection(before, byteOffsetMap(input, input), {removeImages: false, compactTools: false});
+    assert.deepEqual(after, structuredClone(before));
+    assert.equal(projectionHash(after), projectionHash(before));
+    applyProjection(db, before, after);
+    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
+    assert.deepEqual(projectionSnapshot(db, 'other'), other);
+  } finally { db.close(); }
+});
+
+
+test('duplicate layout allows only the same-basename pair and retains additional identity copies', async t => {
+  const {root, put} = await layout(t);
+  for (const meta of [{id: 'one'}, {id: 'one', session_id: 'stable'}, {id: 'one', session_id: 'one'}]) {
+    const plain = await put('sessions/one.jsonl', meta), zipped = await put('sessions/one.jsonl.zst', meta);
+    const inventory = await scanRoot(root, 'codex');
+    const allowed = await verifyCodexRewriteLayout(inventory, undefined, true);
+    assert.equal(allowed.has(plain), false); assert.equal(allowed.has(zipped), false);
+    const rewrite = await verifyCodexRewriteLayout(inventory);
+    assert.equal(rewrite.has(plain), true); assert.equal(rewrite.has(zipped), true);
+    for (const thirdMeta of [{id: 'one'}, {id: 'third', session_id: meta.session_id ?? meta.id}]) {
+      const third = await put('archived_sessions/third.jsonl.zst', thirdMeta);
+      const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+      for (const path of [plain, zipped, third]) assert.match(blocked.get(path)!, /copies|referenced/);
+      await rm(third);
+    }
+  }
+});
+
+
+test('duplicate layout retains shared, hardlinked and unknown-format pairs', async t => {
+  const {root, put} = await layout(t);
+  const plain = await put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
+  const zipped = await put('sessions/one.jsonl.zst', {id: 'one', session_id: 'stable'});
+  for (const id of ['one', 'stable']) {
+    const dependent = await put('archived_sessions/dependent.jsonl.zst', {id: 'dependent', history_base: {thread_id: id, end_byte_offset: 100}});
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+    for (const path of [plain, zipped]) assert.match(blocked.get(path)!, /referenced/);
+    await rm(dependent);
+  }
+  for (const path of [plain, zipped]) {
+    const alias = join(root, 'linked-copy'); await link(path, alias);
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+    assert.match(blocked.get(path)!, /hard links/);
+    await rm(alias);
+  }
+  for (const meta of [{id: 'one', history_mode: 'unknown'}, {id: 'one', imported: true}, {id: 'one', attached_thread: 'other'}]) {
+    await put('sessions/one.jsonl', meta); await put('sessions/one.jsonl.zst', meta);
+    const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'), undefined, true);
+    assert.equal(blocked.has(plain), true); assert.equal(blocked.has(zipped), true);
+  }
 });

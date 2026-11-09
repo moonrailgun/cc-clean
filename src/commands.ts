@@ -10,7 +10,7 @@ export const commandSchema = {
   stateDirectory: '~/.config/cc-clean/',
   ageProtection: { hours: 72, basis: 'File modification time; strictly older than 72 hours', scope: 'Bulk deletion and history slimming', exception: 'One explicitly selected file or one session without descendants; --yes and multi-selection do not bypass protection', losslessPng: 'Exempt' },
   commands: [
-    { command: 'clean', description: 'Clean verified temporary files and PNGs, or explicitly slim history', mutates: true, options: [...common, 'file', 'temp-only', 'remove-images', 'compact-tools', 'remove-reasoning', 'remove-request-archives', 'compact-hooks', 'compact-tool-definitions', 'compact-skill-listings', 'dry-run', 'yes'] },
+    { command: 'clean', description: 'Clean known temporary outputs, PNGs and identical Codex history copies (keep zstd), or explicitly slim history', mutates: true, options: [...common, 'file', 'temp-only', 'remove-images', 'compact-tools', 'remove-reasoning', 'remove-request-archives', 'compact-hooks', 'compact-tool-definitions', 'compact-skill-listings', 'dry-run', 'yes'] },
     { command: 'analyze', description: 'Report directory, project, session, usage and compression data', mutates: false, options: [...common, 'view', 'project'] },
     { command: 'analyze delete', description: 'Delete explicit sessions or eligible files', mutates: true, options: [...common, 'session', 'file', 'dry-run', 'yes'], requires: 'One provider and either session UUIDs or absolute file paths' },
     { command: 'stats', description: 'Report savings and operation history separately by provider', mutates: false, options: common },
@@ -21,7 +21,7 @@ export const commandSchema = {
     project: { type: 'string', description: 'Absolute project path; filters sessions with --view sessions' },
     session: { type: 'string', repeatable: true, description: 'Full session UUID to delete' },
     file: { type: 'string', repeatable: true, description: 'Absolute eligible file path; requires one provider' },
-    'temp-only': { type: 'boolean', description: 'Clean only verified temporary files, always strictly older than 72 hours; excludes PNG compression and history slimming' },
+    'temp-only': { type: 'boolean', description: 'Clean only verified temporary files, always strictly older than 72 hours; excludes PNG compression, history slimming and duplicate removal' },
     'remove-images': { type: 'boolean', description: 'Permanently replace inline history images with text (clean only)' },
     'compact-tools': { type: 'boolean', description: 'Permanently shorten recognized successful shell output using RTK filters (clean only)' },
     'remove-reasoning': { type: 'boolean', description: 'Permanently remove Codex encrypted reasoning state; summaries remain (clean only)' },
@@ -73,6 +73,13 @@ Options:
 Interactive cleanup:
   Scan and deep scan, then summarize operations and estimated savings. View files for full paths.
   Press Enter to confirm cleanup; Q / Esc cancels. --yes does not skip this step.
+
+Duplicate Codex histories:
+  Ordinary clean and Quick clean remove a same-basename .jsonl only when its .jsonl.zst
+  sibling decodes to exactly the same bytes. The compressed copy is kept unchanged.
+  Both files must be more than 72 hours old and inactive, including explicit file selections.
+  Unknown dependencies, links or damaged streams are retained. Each file is limited to 64 MiB.
+  Temporary-only and standalone history-slimming modes exclude duplicate removal.
 
 System temporary files:
   Quick clean and ordinary clean include known Claude/Codex files in /tmp, /var/tmp,

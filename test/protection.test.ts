@@ -20,7 +20,7 @@ function plan(actions: Action[], explicitTarget?: string): Plan {
 }
 
 test('every destructive kind uses a strict 72-hour modification cutoff', () => {
-  for (const kind of ['delete-files', 'codex-delete', 'slim-history'] as const) {
+  for (const kind of ['delete-files', 'codex-delete', 'slim-history', 'deduplicate-history'] as const) {
     assert.equal(ageProtectionReason(action(kind, cutoff - 1), undefined, now), null);
     for (const modified of [cutoff, cutoff + 1, now, now + 1, NaN, Infinity, -Infinity])
       assert.match(ageProtectionReason(action(kind, modified), undefined, now)!, /72-hour protection.*\/inert\/file/);
@@ -215,5 +215,25 @@ test('Claude archive, hook, tool-definition and skill-listing slimming share age
     await protectActiveContent(p, async () => 'Idle client is still open');
     assert.deepEqual(p.actions, []);
     assert.match(p.warnings.at(-1)!, /Activity protection/);
+  }
+});
+
+
+test('duplicate pairs require both files older than 72 hours even with an explicit original', async () => {
+  for (const member of [0, 1]) for (const mtime of [cutoff - 1, cutoff, now, now + 1, NaN]) {
+    const a = action('deduplicate-history', cutoff - 1, '/inert/sessions/one.jsonl');
+    a.files.push({...a.files[0], path: a.files[0].path + '.zst', ino: 2});
+    a.files[member].mtimeMs = mtime;
+    const p = plan([a], a.files[0].path);
+    protectRecentContent(p, now);
+    assert.equal(p.actions.length, mtime < cutoff ? 1 : 0);
+  }
+  for (const activity of [async () => 'Idle client is still open', async () => { throw new Error('Unknown activity'); }]) {
+    const a = action('deduplicate-history', cutoff - 1);
+    a.files.push({...a.files[0], path: a.files[0].path + '.zst', ino: 2});
+    const p = plan([a], a.files[0].path);
+    await protectActiveContent(p, activity);
+    assert.deepEqual(p.actions, []);
+    assert.match(p.warnings.join('\n'), /Activity protection/);
   }
 });

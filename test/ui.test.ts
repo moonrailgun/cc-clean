@@ -1025,3 +1025,27 @@ test('cleanup categories combine providers and temporary roots without double-co
     confirmedReductionBytes: 0, attributionComplete: false})));
   assert.ok(lines.join('\n').startsWith(text), 'text-only previews use the same combined summary');
 });
+
+
+test('duplicate cleanup shows plaintext savings once and identifies the retained compressed copy', t => {
+  const output: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => output.push(args.join(' ')));
+  const p = inertPlan(), a = p.actions[0], f = a.files[0];
+  Object.assign(f, {path: `${p.root}/sessions/one.jsonl`, relative: 'sessions/one.jsonl', category: 'sessions'});
+  Object.assign(a, {kind: 'deduplicate-history', targetId: f.relative, beforeBytes: 5120, afterBytes: 5120,
+    estimatedSavingsBytes: 4096, files: [f, {...f, path: f.path + '.zst', relative: f.relative + '.zst', size: 1024, ino: 1}]});
+  const original = structuredClone(p);
+  printPlan(p);
+  const text = stripVTControlCharacters(output.join('\n'));
+  assert.match(text, /4\.00 KiB\s+Remove duplicate originals \(keep zstd\) · 1 file/);
+  assert.match(text, /4\.00 KiB\s+Total estimated savings/);
+  assert.equal(text.match(/Remove duplicate originals/g)?.length, 1);
+  assert.match(text, /identical compressed histories are retained/);
+  assert.match(text, /No undo copy/);
+  assert.doesNotMatch(text, /one\.jsonl/);
+  const [provider] = cleanupFileNodes([p]), leaf = provider.children![0].children![0];
+  assert.equal(provider.bytes, 4096); assert.equal(leaf.bytes, 4096);
+  assert.match(leaf.detail!, /Remove duplicate original \(keep zstd\)/);
+  assert.ok(leaf.detail!.includes(`Remove: ${f.path}\nKeep: ${f.path}.zst`));
+  assert.deepEqual(p, original, 'rendering must not mutate the plan');
+});

@@ -549,3 +549,45 @@ test('Claude slimming receipts validate enabled operations, provider and exact c
     assert.throws(() => validateReceipt(invalid), /receipt/);
   }
 });
+
+
+test('duplicate receipts bind the retained copy and count only the removed original', async t => {
+  const {base, state} = await fixture(t), r = receipt(base), a = r.actions[0], f = a.files[0];
+  Object.assign(f, {path: join(r.root, 'sessions/one.jsonl'), relative: 'sessions/one.jsonl', category: 'sessions'});
+  Object.assign(a, {kind: 'deduplicate-history', targetId: f.relative, beforeBytes: 29, afterBytes: 10,
+    estimatedSavingsBytes: 19, beforeHash: 'a'.repeat(64), afterHash: 'b'.repeat(64), codexProjection: [],
+    files: [f, {...f, path: f.path + '.zst', relative: f.relative + '.zst', size: 10, ino: 2}]});
+  assert.equal(validateReceipt(r), r);
+  for (const recoveryState of ['prepared', 'applied', 'finalized'] as const) {
+    const copy = structuredClone(r); copy.actions[0].recoveryState = recoveryState;
+    if (recoveryState === 'prepared') {
+      copy.status = 'dry-run'; copy.actions[0].status = 'planned';
+      copy.actions[0].afterBytes = 29; copy.confirmedReductionBytes = 0;
+    }
+    assert.equal(validateReceipt(copy), copy);
+  }
+  const entry = {name: 'thread_history_1.sqlite', dev: 1, ino: 3, threadId: 'one',
+    schemaHash: 'c'.repeat(64), beforeHash: 'd'.repeat(64), afterHash: 'd'.repeat(64)};
+  a.codexProjection = [entry]; assert.equal(validateReceipt(r), r);
+  for (const changes of [
+    {beforeHash: undefined}, {afterHash: undefined}, {codexProjection: undefined},
+    {codexProjection: [{...entry, afterHash: 'e'.repeat(64)}]},
+    {files: [...a.files].reverse()}, {files: [f]},
+    {files: [f, {...a.files[1], path: join(r.root, 'sessions/other.jsonl.zst'), relative: 'sessions/other.jsonl.zst'}]},
+    {files: [{...f, category: 'temporary'}, a.files[1]]},
+    {files: [f, {...a.files[1], ino: f.ino}]}, {files: [{...f, nlink: 2}, a.files[1]]},
+    {sessionIds: [randomUUID()]}, {nativeStarted: false},
+    {slimOptions: {removeImages: true, compactTools: false}}, {slimCounts: {images: 0, toolOutputs: 0}},
+    {slimSavingsBytes: {images: 19, toolOutputs: 0}},
+    {beforeBytes: 30}, {afterBytes: 29}, {afterBytes: 0}, {estimatedSavingsBytes: 10},
+  ]) {
+    const copy = structuredClone(r); Object.assign(copy.actions[0], changes);
+    assert.throws(() => validateReceipt(copy), /receipt/);
+  }
+  assert.throws(() => validateReceipt({...r, provider: 'claude'}), /receipt/);
+  await recordCleanup(state, r);
+  const [log] = await readCleanupLog(state);
+  assert.equal(log.savedBytes, 19); assert.equal(log.cleanedRecords, 1);
+  assert.deepEqual(log.cleanupTypes, [{type: 'deduplicate-history', cleanedRecords: 1}]);
+  assert.equal((await readStats(state)).savedBytes, 19);
+});

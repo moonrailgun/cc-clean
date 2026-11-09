@@ -92,7 +92,7 @@ export function printPlans(plans: Plan[]) {
   title(single ? `${providerName(single.provider)}${single.systemTemp ? ' · System temporary files' : ''} · ${actions.length} items` : `Cleanup summary · ${actions.length} items`,
     single ? single.root : [...new Set(plans.map(p => providerName(p.provider)))].join(' + ') + (plans.some(p => p.systemTemp) ? ' · Includes system temporary files' : ''));
   note('Bulk deletion and history slimming require files last modified more than 72 hours ago.');
-  for (const p of plans) if (p.explicitTarget && !p.systemTemp) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for this file or a session without descendants.`);
+  for (const p of plans) if (p.explicitTarget && !p.systemTemp) note(`Explicit single target: ${p.explicitTarget}. Age limit waived only for a single-file operation or a session without descendants; duplicate pairs remain protected.`);
   if (!actions.length) {
     line('  No eligible cleanup items.');
   }
@@ -116,18 +116,20 @@ export function printPlans(plans: Plan[]) {
     const groups: [string, Plan['actions']][] = [
       ['History slimming (breakdown unavailable)', actions.filter(a => a.kind === 'slim-history' && !a.slimSavingsBytes)],
       ['Compress PNGs (lossless)', actions.filter(a => a.kind === 'compress-png')],
+      ['Remove duplicate originals (keep zstd)', actions.filter(a => a.kind === 'deduplicate-history')],
       ['Delete files', regular.filter(a => a.kind === 'delete-files' && !a.sessionIds?.length)],
       ...Object.entries(systemTempLabels).map(([kind, label]): [string, Plan['actions']] => [label, temporary.filter(a => a.files[0].category === kind)]),
       ['Delete sessions', actions.filter(a => a.kind === 'codex-delete' || a.sessionIds?.length)],
     ];
     for (const [label, actions] of groups) {
       if (actions.length) rows([{
-        label: `${label} · ${actions.reduce((sum, a) => sum + a.files.length, 0)} files`, value: estimatedSavings(actions),
+        label: `${label} · ${actions.reduce((sum, a) => sum + (a.kind === 'deduplicate-history' ? 1 : a.files.length), 0)} files`, value: estimatedSavings(actions),
       }]);
     }
     line();
   }
   rows([{ label: 'Total estimated savings', value: estimatedSavings(actions) }]);
+  if (actions.some(a => a.kind === 'deduplicate-history')) note('Duplicate plaintext files will be removed; identical compressed histories are retained. Both files must be more than 72 hours old. No undo copy is kept.');
   if (actions.some(a => a.kind === 'slim-history')) note('Irreversible: original images, omitted output and removed encrypted reasoning state will be unavailable. No undo.');
   if (actions.some(a => a.slimOptions?.removeRequestArchives)) note('API request archives will be deleted; exact historical requests cannot be reconstructed.');
   if (actions.some(a => a.slimOptions?.compactHooks)) note('Successful hook commands, output and injected context will be cleared. Resumed context may differ.');
@@ -356,6 +358,7 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
               detail: `${label}: ${a.slimCounts?.[key] ?? 'unknown'} · ${size(a.slimSavingsBytes?.[key] ?? null)}`,
             })) : [];
           const operation = a.kind === 'slim-history' ? 'Slim history' : a.kind === 'compress-png' ? 'Compress PNG (lossless)'
+            : a.kind === 'deduplicate-history' ? 'Remove duplicate original (keep zstd)'
             : a.kind === 'codex-delete' || a.sessionIds?.length ? 'Delete session' : 'Delete files';
           const file = basename(a.files[0]?.path ?? a.targetId);
           const shortFile = file.replace(/([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/ig, '$1…');
@@ -366,6 +369,7 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
               `${operation} · ${count(a.files.length, 'file')}`,
               `Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`,
               `Source size: ${size(a.beforeBytes)}`,
+              ...(a.kind === 'deduplicate-history' ? [`Remove: ${safe(a.files[0].path)}`, `Keep: ${safe(a.files[1].path)}`] : []),
               ...effects.map(e => e.detail), '', 'Full paths:', ...a.files.map(f => safe(f.path)),
               ...(a.sessionIds?.length ? ['', 'Related sessions:', ...a.sessionIds.map(safe)] : []),
             ].join('\n'),

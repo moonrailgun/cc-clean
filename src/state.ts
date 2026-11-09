@@ -148,7 +148,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
   for (const action of data.actions) {
     requireReceipt(object(action) && text(action.id) && uuid.test(action.id) && !ids.has(action.id));
     ids.add(action.id);
-    requireReceipt(['delete-files', 'compress-png', 'codex-delete', 'slim-history'].includes(action.kind as string) && text(action.targetId) && action.targetId.length > 0);
+    requireReceipt(['delete-files', 'compress-png', 'codex-delete', 'slim-history', 'deduplicate-history'].includes(action.kind as string) && text(action.targetId) && action.targetId.length > 0);
     requireReceipt(['planned', 'completed', 'skipped', 'failed'].includes(action.status as string) &&
       ['prepared', 'applied', 'finalized'].includes(action.recoveryState as string));
     requireReceipt(bytes(action.beforeBytes) && bytes(action.afterBytes) && (action.reason === undefined || text(action.reason)));
@@ -179,6 +179,18 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
       requireReceipt(action.files.length === 1 && action.afterBytes <= action.beforeBytes);
       if (action.status === 'completed') requireReceipt(action.beforeHash && action.afterHash);
     }
+    if (action.kind === 'deduplicate-history') {
+      requireReceipt(data.provider === 'codex' && !tempScope && action.files.length === 2 &&
+        action.sessionIds === undefined && action.nativeStarted === undefined && action.slimOptions === undefined && action.slimCounts === undefined &&
+        action.files.every(file => file.category === 'sessions' && file.size > 0 && file.size <= 64 * 1024 * 1024) &&
+        /^(?:sessions|archived_sessions)\/.+\.jsonl$/.test(action.files[0].relative) &&
+        action.files[1].path === action.files[0].path + '.zst' &&
+        (action.files[0].dev !== action.files[1].dev || action.files[0].ino !== action.files[1].ino) &&
+        action.beforeHash && action.afterHash && Array.isArray(action.codexProjection) &&
+        action.estimatedSavingsBytes === action.files[0].size &&
+        (action.afterBytes === action.beforeBytes || action.afterBytes === action.files[1].size));
+      if (action.status === 'completed' || action.recoveryState === 'applied') requireReceipt(action.afterBytes === action.files[1].size);
+    }
     if (action.kind === 'slim-history') {
       const options = action.slimOptions;
       requireReceipt(object(options));
@@ -208,11 +220,11 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
     }
     if (data.provider === 'codex' && action.recoveryState !== 'finalized' && !tempScope) {
       if (action.files.some(file => file.category === 'sessions' || /^(?:sessions|archived_sessions)\//.test(file.relative)))
-        requireReceipt(action.kind === 'slim-history' || action.kind === 'codex-delete');
+        requireReceipt(action.kind === 'slim-history' || action.kind === 'codex-delete' || action.kind === 'deduplicate-history');
       if (action.kind === 'slim-history') requireReceipt(Array.isArray(action.codexProjection));
     }
     if (action.codexProjection !== undefined) {
-      requireReceipt(data.provider === 'codex' && (action.kind === 'slim-history') && Array.isArray(action.codexProjection));
+      requireReceipt(data.provider === 'codex' && (action.kind === 'slim-history' || action.kind === 'deduplicate-history') && Array.isArray(action.codexProjection));
       const names = new Set<string>(), threads = new Set<string>();
       for (const entry of action.codexProjection) {
         requireReceipt(object(entry) && text(entry.name) && /^thread_history_\d+\.sqlite$/.test(entry.name) && !names.has(entry.name));
@@ -220,6 +232,7 @@ export function validateReceipt(data: unknown, provider?: Provider): Receipt {
         requireReceipt(bytes(entry.dev) && bytes(entry.ino) && text(entry.threadId) && entry.threadId.length > 0);
         threads.add(entry.threadId);
         for (const key of ['schemaHash', 'beforeHash', 'afterHash']) requireReceipt(text(entry[key]) && /^[0-9a-f]{64}$/.test(entry[key]));
+        if (action.kind === 'deduplicate-history') requireReceipt(entry.beforeHash === entry.afterHash);
       }
       requireReceipt(threads.size <= 1);
     }

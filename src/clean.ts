@@ -16,13 +16,14 @@ import { validateReceipt } from './state.ts';
 import { readCodexIndex, type IndexThread } from './providers/codex.ts';
 import { readCleanupLog, recordCleanup } from './history.ts';
 import { slimHistory, MAX_HISTORY_BYTES, type SlimOptions, type SlimCounts, type SlimSavingsBytes } from './slim.ts';
-import { verifyCodexRewriteLayout, verifyCodexDeletionHistories, previewProjection, prepareProjection, verifyProjectionBefore, type ProjectionReceipt } from './providers/codex-history.ts';
+import { decodeDuplicateHistory, verifyCodexRewriteLayout, verifyCodexDeletionHistories, previewProjection, prepareProjection, verifyProjectionBefore, type ProjectionReceipt } from './providers/codex-history.ts';
 export { verifyCodexRewriteLayout } from './providers/codex-history.ts';
 const exec=promisify(execFile);
 const hash=(data:Buffer)=>createHash('sha256').update(data).digest('hex');
+const unchangedHistory: SlimOptions = {removeImages:false,compactTools:false};
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface Action {
-  id:string;kind:'delete-files'|'compress-png'|'codex-delete'|'slim-history';targetId:string;files:FileEntry[];
+  id:string;kind:'delete-files'|'compress-png'|'codex-delete'|'slim-history'|'deduplicate-history';targetId:string;files:FileEntry[];
   slimOptions?:SlimOptions;slimCounts?:SlimCounts;slimSavingsBytes?:SlimSavingsBytes;codexProjection?:ProjectionReceipt[];
   sessionIds?:string[];status:'planned'|'completed'|'skipped'|'failed';reason?:string;
   beforeBytes:number;afterBytes:number;recoveryState:'prepared'|'applied'|'finalized';
@@ -176,6 +177,21 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
     if(!options.includeFileCleanup)return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
   }
   const stateValid=inv.provider==='codex'&&await validState(inv.root);
+  if(inv.provider==='codex'&&!options.tempOnly) {
+    const byPath=new Map(inv.files.map(f=>[f.path,f]));
+    const pairs=inv.files.filter(f=>f.category==='sessions'&&f.path.endsWith('.jsonl')&&byPath.has(f.path+'.zst')&&(!selected||selected.has(f.path)));
+    if(pairs.length)try {
+      const blocked=await verifyCodexRewriteLayout(inv,undefined,true);
+      for(const plain of pairs) {
+        const files=[plain,byPath.get(plain.path+'.zst')!];
+        const reason=files.map(f=>blocked.get(f.path)).find(Boolean);
+        if(reason||files.some(f=>!eligible(f)||f.size>MAX_HISTORY_BYTES)) {
+          plan.warnings.push(`${plain.relative}: duplicate retained: ${reason??'linked, referenced or exceeds 64 MiB'}`);continue;
+        }
+        plan.actions.push({...makeAction('deduplicate-history',plain.relative,files),estimatedSavingsBytes:null});
+      }
+    } catch(error) {plan.warnings.push(`Duplicate histories retained: ${(error as Error).message}`);}
+  }
   for(const f of inv.files) {
     if(selected&&!selected.has(f.path))continue;
     if(!eligible(f))continue;
@@ -199,6 +215,12 @@ async function verifyFile(root:string,f:FileEntry,plan?:Plan) {
 async function readVerified(root:string,f:FileEntry) {
   await verifyFile(root,f);const data=await readOrdinaryFile(f.path,MAX_PNG_BYTES);await verifyFile(root,f);return data;
 }
+async function readDuplicate(root:string,a:Action,signal?:AbortSignal,preview=false) {
+  const compressed=await readVerified(root,a.files[1]);
+  const decoded=await decodeDuplicateHistory(compressed,a.files[0].size,signal);
+  if(!preview&&(hash(compressed)!==a.afterHash||hash(decoded)!==a.beforeHash))throw new Error('Duplicate history differs from its preview; retained');
+  return {compressed,decoded};
+}
 export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:(progress:ScanProgress)=>void) {
   signal?.throwIfAborted();
   await protectActiveContent(plan);
@@ -212,6 +234,18 @@ export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:
       } catch(error) {
         action.estimatedSavingsBytes=null;
         plan.warnings.push(`${action.targetId}: savings estimate unavailable: ${(error as Error).message}`);
+      }
+    } else if(action.kind==='deduplicate-history') {
+      try {
+        const input=await readVerified(plan.root,action.files[0]);
+        const {compressed,decoded}=await readDuplicate(plan.root,action,signal,true);
+        if(!input.equals(decoded))throw new Error('Plain and compressed histories are not byte-for-byte identical');
+        action.codexProjection=await previewProjection(plan.root,input,input,unchangedHistory);
+        action.beforeHash=hash(input);action.afterHash=hash(compressed);
+        action.estimatedSavingsBytes=input.length;
+      } catch(error) {
+        action.estimatedSavingsBytes=0;
+        plan.warnings.push(`${action.targetId}: duplicate retained: ${(error as Error).message}`);
       }
     } else if(action.kind==='slim-history') {
       try {
@@ -229,7 +263,7 @@ export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:
     }
     signal?.throwIfAborted();
   }
-  plan.actions=plan.actions.filter(a=>a.kind!=='slim-history'||!!a.estimatedSavingsBytes);
+  plan.actions=plan.actions.filter(a=>!['slim-history','deduplicate-history'].includes(a.kind)||!!a.estimatedSavingsBytes);
   onProgress?.({phase:'estimating',completed:plan.actions.length,total:plan.actions.length});
 }
 async function verifyRoot(r:Plan) {
@@ -265,6 +299,7 @@ async function acquireLock(stateDir:string):Promise<()=>Promise<void>> {
 function receiptPath(stateDir:string,r:Plan) {return join(stateDir,'providers',r.provider,'operations',`${r.operationId}.json`);}
 function workPath(stateDir:string,r:Plan,a:Action) {return join(stateDir,'providers',r.provider,'work',r.operationId,a.id);}
 async function verifyBackup(dir:string,a:Action,index:number) {
+  if(a.kind==='deduplicate-history'&&index!==0)throw new Error('Compressed history must never be moved into transaction storage');
   if(!await existingDir(dir))throw new Error('Transaction directory is missing');
   const f=a.files[index],s=await lstat(join(dir,`${index}.original`));
   if(!s.isFile()||s.isSymbolicLink()||s.dev!==f.dev||s.ino!==f.ino||s.size!==f.size||s.mtimeMs!==f.mtimeMs||f.uid!==undefined&&(s.uid!==f.uid||s.mode!==f.mode)||s.nlink> (replacement(a.kind)?2:1))throw new Error('Original transaction file identity changed; retained for review');
@@ -279,6 +314,13 @@ async function cleanupWork(dir:string,a:Action) {
     if(!s.isFile()||s.isSymbolicLink())throw new Error('Invalid work file');
     await unlink(path);
   }
+}
+async function verifyRetainedDuplicate(r:Plan,a:Action,check:ActivityCheck) {
+  if(a.kind!=='deduplicate-history')return;
+  if(await exists(a.files[0].path))throw new Error('Plain history reappeared; duplicate cleanup needs review');
+  const age=ageProtectionReason(a);if(age)throw new Error(age);
+  const activity=await actionActivity(r,a,check);if(activity)throw new Error(activity);
+  await verifyFile(r.root,a.files[1]);
 }
 async function syncDirectory(path:string) {
   const dir=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);
@@ -336,6 +378,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
     if(!before.complete){r.status='failed';r.warnings.push('Pre-execution scan is incomplete');r.actions.forEach(a=>{a.status='skipped';a.reason='Scan is incomplete';a.recoveryState='finalized';});return await finish();}
     if(!r.actions.length){r.status=plan.scanComplete?'completed':'failed';r.rootAfterBytes=r.rootBeforeBytes;return await finish();}
     const blocked=r.provider==='codex'&&r.actions.some(a=>a.kind==='slim-history')?await verifyCodexRewriteLayout(before,options.signal):new Map<string,string>();
+    const duplicateBlocked=r.actions.some(a=>a.kind==='deduplicate-history')?await verifyCodexRewriteLayout(before,options.signal,true):new Map<string,string>();
     r.status='needs-review';await save();
     for(const a of r.actions) {
       if(options.signal?.aborted){r.status='interrupted';break;}
@@ -346,6 +389,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
       let projection:Awaited<ReturnType<typeof prepareProjection>>|undefined;
       try {
         if(a.kind==='slim-history'&&blocked.has(a.files[0].path))throw new Error(blocked.get(a.files[0].path));
+        if(a.kind==='deduplicate-history')for(const f of a.files)if(duplicateBlocked.has(f.path))throw new Error(duplicateBlocked.get(f.path));
         await verifyRoot(r);
         if(a.files.some(f=>referenced(before,f.path)))throw new Error('References or scan state changed');
         for(const f of a.files)await verifyFile(r.root,f,r);
@@ -366,7 +410,22 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
         await privateDir(dir);
         const workStat=await lstat(dir);if(a.files.some(f=>f.dev!==workStat.dev))throw new Error('Work and source directories must be on the same filesystem');
         const space=await statfs(dir);if(space.bavail*space.bsize<a.beforeBytes*2+1024*1024)throw new Error('Insufficient working space');
-        if(replacement(a.kind)) {
+        if(a.kind==='deduplicate-history') {
+          const f=a.files[0],input=await readVerified(r.root,f);
+          const {decoded}=await readDuplicate(r.root,a,options.signal);
+          if(!input.equals(decoded))throw new Error('Plain and compressed histories differ; both retained');
+          if(process.platform==='darwin'){const {stdout}=await exec('/usr/bin/xattr',[f.path],{timeout:5000});if(stdout.trim())throw new Error('File has extended attributes; original retained');}
+          projection=await prepareProjection(r.root,a.codexProjection!,input,input,unchangedHistory);
+          a.afterBytes=a.files[1].size;await save();
+          for(const file of a.files)await verifyFile(r.root,file);
+          const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
+          const age=ageProtectionReason(a);if(age)throw new Error(age);
+          await rename(f.path,join(dir,'0.original'));
+          await syncDirectory(dirname(f.path));await syncDirectory(dir);
+          await verifyBackup(dir,a,0);
+          await readDuplicate(r.root,a,options.signal);
+          await projection.commit();projection=undefined;
+        } else if(replacement(a.kind)) {
           const f=a.files[0];
           if(process.platform==='darwin'){const {stdout}=await exec('/usr/bin/xattr',[f.path],{timeout:5000});if(stdout.trim())throw new Error('File has extended attributes; original retained');}
           const input=await readVerified(r.root,f);
@@ -402,6 +461,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
           }
         }
         a.recoveryState='applied';a.status='completed';updateTotal(r);await save();
+        await verifyRetainedDuplicate(r,a,check);
         const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
         await cleanupWork(dir,a);a.recoveryState='finalized';await save();
       } catch(e) {
@@ -424,7 +484,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
 async function rollbackPrepared(r:Plan,a:Action,dir:string,check:ActivityCheck):Promise<boolean> {
   try {
     await verifyParents(r,a);
-    if(r.provider==='codex'&&a.kind==='slim-history')await verifyProjectionBefore(r.root,a.codexProjection!);
+    if(r.provider==='codex'&&(a.kind==='slim-history'||a.kind==='deduplicate-history'))await verifyProjectionBefore(r.root,a.codexProjection!);
     if(!await existingDir(dir)){for(const f of a.files)await verifyFile(r.root,f,r);return true;}
     if(await actionActivity(r,a,check,dir))return false;
     for(let i=0;i<a.files.length;i++) {
@@ -469,6 +529,20 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
             if(a.afterHash&&s&&(await currentHash(r.root,f.path))===a.afterHash){a.status='completed';a.recoveryState='applied';}
           }
           if(a.recoveryState==='applied') {
+            if(a.kind==='deduplicate-history') {
+              if(await exists(a.files[0].path))throw new Error('Plain history reappeared; duplicate cleanup needs review');
+              const age=ageProtectionReason(a);if(age)throw new Error(age);
+              const inventory=await scanRoot(r.root,'codex'),blocked=await verifyCodexRewriteLayout(inventory,undefined,true);
+              if(blocked.has(a.files[1].path)||referenced(inventory,a.files[1].path))throw new Error('Compressed history dependencies changed');
+              const {decoded}=await readDuplicate(r.root,a);
+              const backup=join(dir,'0.original');
+              if(await exists(backup)) {
+                await verifyBackup(dir,a,0);
+                if(!(await readOrdinaryFile(backup,MAX_HISTORY_BYTES)).equals(decoded))throw new Error('Duplicate backup differs from compressed history');
+              }
+              const projection=await prepareProjection(r.root,a.codexProjection!,decoded,decoded,unchangedHistory,true);
+              await projection.commit();
+            }
             if(a.kind==='delete-files'&&(await Promise.all(a.files.map(f=>exists(f.path)))).some(Boolean)){pending=true;continue;}
             if(replacement(a.kind)&&(!a.afterHash||(await currentHash(r.root,a.files[0].path))!==a.afterHash)){pending=true;continue;}
             if(provider==='codex'&&a.kind==='slim-history') {
@@ -483,6 +557,7 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
               await projection.commit();
             }
             a.status='completed';updateTotal(r);await atomicJson(path,r);
+            await verifyRetainedDuplicate(r,a,check);
             const activity=await actionActivity(r,a,check,dir);if(activity)throw new Error(activity);
             await cleanupWork(dir,a);a.recoveryState='finalized';
           } else if(await rollbackPrepared(r,a,dir,check)){a.status='skipped';a.reason='Previous operation was interrupted; original files restored';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';} else pending=true;
