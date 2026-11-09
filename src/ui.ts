@@ -2,7 +2,7 @@ import { basename, dirname, relative } from 'node:path';
 import type { Analysis, Provider, Session, Usage } from './types.ts';
 import type { Config } from './config.ts';
 import type { Plan, Receipt } from './clean.ts';
-import { report, plan, cleanupPlans, includesSystemTemp, execute } from './app.ts';
+import { report, plan, cleanupPlans, includesSystemTemp, execute, CLAUDE_FILE_CLEANUP_NOTICE } from './app.ts';
 import { systemTempLabels } from './system-temp.ts';
 import { readStats } from './stats.ts';
 import type { CleanupLog } from './history.ts';
@@ -97,6 +97,10 @@ export function printPlans(plans: Plan[], details = true) {
   }
   if (!actions.length) {
     line('  No eligible cleanup items.');
+    if (details && warnings.includes(CLAUDE_FILE_CLEANUP_NOTICE)) {
+      line(`  ${CLAUDE_FILE_CLEANUP_NOTICE}`);
+      line('  0 items means no matching operations, not that your history contains nothing to reduce.');
+    }
   }
   if (actions.length) {
     section('Estimated savings by operation');
@@ -147,7 +151,7 @@ export function printPlans(plans: Plan[], details = true) {
   if (temporary.length) note('Irreversible: session-created outputs, full temporary task/hook outputs, cwd records and listed installers will be deleted. No undo.');
   if (actions.length) note('Full file paths and per-file estimates: View files in the review menu, or use --json.');
   const groups = new Map<string, number>();
-  for (const warning of warnings) {
+  for (const warning of warnings.filter(w => actions.length || w !== CLAUDE_FILE_CLEANUP_NOTICE)) {
     const reason = warning.startsWith('72-hour protection:') ? '72-hour protection: modified within the last 3 days, or file time is invalid; kept unchanged.'
       : warning.replace(/^.*?\.jsonl: /, '');
     groups.set(reason, (groups.get(reason) ?? 0) + 1);
@@ -393,15 +397,18 @@ async function planFiles(plans: Plan[], signal?: AbortSignal) {
   await tree({ message: 'Cleanup files · Estimated savings', subtitle: 'Read-only · Expand a folder, then Enter on a file for full details.',
     nodes: cleanupFileNodes(plans) }, context(signal));
 }
-export async function emptyPlansMenu(plans: Plan[], signal?: AbortSignal): Promise<null> {
+export async function emptyPlansMenu(plans: Plan[], signal?: AbortSignal): Promise<'slim' | null> {
   let details = false;
   while (!signal?.aborted) {
     screen(); printPlans(plans, details);
     const next = await select({ message: 'No cleanup items', clear: false, requireEnter: true, choices: [
       { name: 'Back', value: 'back' },
+      ...(plans.some(p => p.warnings.includes(CLAUDE_FILE_CLEANUP_NOTICE))
+        ? [{ name: 'Slim history', description: 'Choose image removal or output compaction, then review savings', value: 'slim' }] : []),
       { name: details ? 'Less' : 'More', description: 'Protection rules and scan notes', value: 'more' },
       ...(details && plans.some(p => p.warnings.length) ? [{ name: 'View scan notes', description: 'Full paths and reasons', value: 'notes' }] : []),
     ] }, context(signal));
+    if (next === 'slim') return 'slim';
     if (next === 'more') { details = !details; continue; }
     if (next !== 'notes') return null;
     await planNotes(plans, signal);
@@ -457,7 +464,10 @@ async function searchable<T>(message: string, items: Choice<T>[], signal?: Abort
 }
 async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal) {
   screen();
-  if (!plans.some(p => p.actions.length)) { await emptyPlansMenu(plans, signal); return; }
+  if (!plans.some(p => p.actions.length)) {
+    if (await emptyPlansMenu(plans, signal) === 'slim') await cleanProviders(config, [...new Set(plans.map(p => p.provider))], 'slim', signal);
+    return;
+  }
   if (await confirmPlans(plans, signal)) { printReceipts((await execute(config, plans, false, signal, line)).receipts); await pause(signal); }
 }
 async function cleanProviders(config: Config, selected: Provider[], mode: 'quick' | 'slim' | 'temp', signal?: AbortSignal) {
@@ -622,7 +632,7 @@ export async function menu(config: Config, signal?: AbortSignal) {
         }
       } else {
         const mode = action === 'clean' ? await select<'quick' | 'files' | 'slim' | 'temp'>({ message: 'Clean', choices: [
-          { name: 'Quick clean', description: 'Deep scan, review savings, then confirm cleanup', value: 'quick' },
+          { name: 'Quick clean', description: 'Slim history + file cleanup (irreversible)', value: 'quick' },
           { name: 'Select files', description: 'Choose what to clean', value: 'files' },
           { name: 'Slim history', description: 'Remove images, compact output or remove Codex encrypted reasoning (irreversible)', value: 'slim' },
           { name: 'Clean temporary files', description: 'Verified temporary outputs older than 72 hours (irreversible)', value: 'temp' },

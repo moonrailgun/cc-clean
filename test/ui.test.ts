@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
 import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, cleanOptions, confirmPlans, emptyPlansMenu, usageMenu } from '../src/ui.ts';
+import { CLAUDE_FILE_CLEANUP_NOTICE } from '../src/app.ts';
 import type { Plan } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
@@ -563,6 +564,7 @@ test('merged analysis reuses snapshots and shares persistent caches with session
   void main.catch(() => {});
   const clean = await press('1', /Select files/);
   assert.match(clean, /Quick clean/);
+  assert.match(clean, /Slim history \+ file cleanup \(irreversible\)/);
   assert.doesNotMatch(clean, /Scanning|Preview only|Confirmed reduction/);
   await press('q', /cc-clean/);
   const stats = await press('3', /No cleanup history yet/);
@@ -772,7 +774,7 @@ test('More folds scan notes and returning to review still requires Enter to conf
   assert.equal(await answer, true);
 });
 
-test('empty plan navigation folds retained reasons under More without approving cleanup', async t => {
+test('empty plan navigation offers opt-in slimming and full notes without approving cleanup', async t => {
   const term = await terminal(t);
   for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output]] as const) {
     const original = Object.getOwnPropertyDescriptor(process, name)!;
@@ -780,28 +782,19 @@ test('empty plan navigation folds retained reasons under More without approving 
     t.after(() => Object.defineProperty(process, name, original));
   }
   t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
-  const p = { ...inertPlan(), provider: 'claude' as const, actions: [], warnings: ['sessions/a.jsonl: Retained'] };
+  const p = { ...inertPlan(), provider: 'claude' as const, actions: [], warnings: [CLAUDE_FILE_CLEANUP_NOTICE, 'sessions/a.jsonl: Retained'] };
   let answer = emptyPlansMenu([p], term.context.signal);
-  await setImmediate();
-  const initial = stripVTControlCharacters(term.text());
-  assert.match(initial, /No eligible cleanup items/);
-  assert.match(initial, /2\. More/);
-  assert.doesNotMatch(initial, /Retained|View scan notes|last modified more than 72 hours|Confirm cleanup/);
   await term.key('\r'); assert.equal(await answer, null, 'Back is the default');
   answer = emptyPlansMenu([p], term.context.signal);
-  await term.key('2'); await term.key('\r');
-  assert.match(stripVTControlCharacters(term.text()), /2\. Less/);
-  assert.match(stripVTControlCharacters(term.text()), /last modified more than 72 hours/);
   await term.key('3'); await term.key('\r');
+  await term.key('4'); await term.key('\r');
   assert.match(stripVTControlCharacters(term.text()), /sessions\/a\.jsonl: Retained/);
   await term.key('q');
-  await term.key('2');
-  const from = term.text().length;
-  await term.key('\r');
-  const collapsed = stripVTControlCharacters(term.text().slice(from));
-  assert.match(collapsed, /2\. More/);
-  assert.doesNotMatch(collapsed, /Retained|View scan notes|last modified more than 72 hours/);
-  await term.key('q'); assert.equal(await answer, null);
+  await term.key('3'); await term.key('\r');
+  let settled = false;
+  void answer.then(() => { settled = true; }, () => {});
+  await term.key('2'); assert.equal(settled, false);
+  await term.key('\r'); assert.equal(await answer, 'slim');
 });
 
 test('cleanup confirmation summarizes scope, offers file details, and only Enter can approve', async t => {
@@ -1154,4 +1147,29 @@ test('cleanup notes and menu descriptions use readable terminal foreground in co
   const description = menuRow({name: 'View scan notes', description: 'Full paths and reasons', value: 'notes'}, 0, false, 100, {total: 0, max: 0, labelWidth: 20, color: true});
   assert.match(description, /Full paths and reasons/);
   assert.doesNotMatch(description, /\x1b\[(?:90|2)m/);
+});
+
+test('empty Claude file plans explain available rules and summarize repeated notes without flooding paths', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const p = { ...inertPlan(), provider: 'claude' as const, actions: [], warnings: [
+    CLAUDE_FILE_CLEANUP_NOTICE,
+    ...Array.from({ length: 40 }, (_, i) => `projects/p/session-${i}.jsonl: Mixed session format versions require unverified compatibility`),
+    ...Array.from({ length: 2 }, (_, i) => `72-hour protection: projects/p/recent-${i}.jsonl; Entire operation retained.`),
+    ...Array.from({ length: 7 }, (_, i) => `Additional reason ${i}`),
+  ] };
+  const original = [...p.warnings];
+  printPlan(p);
+  const text = lines.join('\n');
+  assert.match(text, /Quick clean also checks known system temporary files/);
+  assert.match(text, /Slim history/);
+  assert.match(text, /40 × Mixed session format versions/);
+  assert.match(text, /2 × 72-hour protection: modified within the last 3 days, or file time is invalid; kept unchanged/);
+  assert.match(text, /Scan notes.*50 notices/);
+  assert.match(text, /One file can have several notices/);
+  assert.match(text, /Plus 4 more note types/);
+  assert.match(text, /--json/);
+  assert.doesNotMatch(text, /projects\/p\/session-/);
+  assert.ok(lines.length < 25);
+  assert.deepEqual(p.warnings, original, 'full warnings remain available in JSON and details');
 });

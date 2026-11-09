@@ -9,6 +9,8 @@ import { within } from './state.ts';
 import { dirname } from 'node:path';
 import { discoverSessionTemps } from './session-temp.ts';
 
+export const CLAUDE_FILE_CLEANUP_NOTICE = 'Claude Code standalone-image deletion is not supported. Quick clean also checks known system temporary files; use Quick clean or Slim history to remove inline images or compact shell output.';
+
 type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; tempOnly?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean; removeOldSnapshots?: boolean };
 export const includesSystemTemp = (options: CleanupOptions) => !options.manual && !options.files?.length && !options.sessions?.length &&
   (!!options.includeFileCleanup || !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives && !options.compactHooks && !options.compactToolDefinitions && !options.compactSkillListings && !options.removeOldSnapshots);
@@ -32,7 +34,7 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
   });
   result.warnings = [...new Set([...result.warnings, ...analysis.warnings])];
   if (!analysis.scanComplete) result.warnings.push('Deep scan is incomplete; only independently validated files are eligible');
-  if (provider === 'claude' && !options.sessions?.length && !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives && !options.compactHooks && !options.compactToolDefinitions && !options.compactSkillListings && !options.removeOldSnapshots) result.warnings.push('Claude has no verified automatic temporary-file or standalone PNG rules; use Slim history for opt-in field removal');
+  if (provider === 'claude' && !options.sessions?.length && !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives && !options.compactHooks && !options.compactToolDefinitions && !options.compactSkillListings && !options.removeOldSnapshots) result.warnings.push(CLAUDE_FILE_CLEANUP_NOTICE);
   if (provider === 'claude' && options.sessions?.length) {
     const retained = new Map(inventory.files.filter(f => f.category === 'config' || f.relative === 'history.jsonl' || f.relative.startsWith('file-history/')).map(f => [physicalKey(f), f.size]));
     result.warnings.push(`Retaining project memory, configuration, file-history and history.jsonl (provider total: ${[...retained.values()].reduce((sum, bytes) => sum + bytes, 0)} B). Other sessions and resources with unknown ownership are also retained. This does not erase all history.`);
