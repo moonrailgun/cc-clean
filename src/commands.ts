@@ -105,7 +105,7 @@ Agent usage:
   Use process argument arrays (execFile/spawn), not interpolated shell strings.
 
 Exit codes: 0 completed/preview/skipped, 1 failed/partial, 2 usage error, 130 interrupted.
-State: ~/.config/cc-clean/. Sizes are logical bytes. CLI history slimming requires explicit flags; no undo.
+State: ~/.config/cc-clean/. Sizes are logical bytes. History slimming is opt-in; no undo.
 `;
 
 export class UsageError extends Error {}

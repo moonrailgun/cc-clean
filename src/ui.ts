@@ -154,7 +154,7 @@ export function printPlans(plans: Plan[], details = true) {
   if (actions.some(a => a.slimOptions?.compactHooks)) note('Successful hook commands, output and injected context will be cleared. Resumed context may differ.');
   if (actions.some(a => a.slimOptions?.compactToolDefinitions || a.slimOptions?.compactSkillListings))
     note('Historical tool definitions and skill listings selected for compaction will be unavailable. Resume may use current definitions and cost more.');
-  if (temporary.length) note('Irreversible: session-created outputs, full temporary task/hook outputs, cwd records and listed installers will be deleted. No undo.');
+  if (temporary.length) note('Irreversible: full temporary task/hook outputs, session-created outputs, cwd records and listed installers will be deleted. No undo.');
   if (actions.length) note('Full file paths and per-file estimates: View files in the review menu, or use --json.');
   const groups = new Map<string, number>();
   for (const warning of warnings.filter(w => actions.length || w !== CLAUDE_FILE_CLEANUP_NOTICE)) {
