@@ -4,7 +4,7 @@ Run these commands from the repository root with Node.js 24.15.0 or newer in the
 
 ## Prepare and inspect
 
-Review `git status --short` and the changes intended for this release. npm packages the current working files, including uncommitted changes in the package's file list. Project code uses [MIT](../LICENSE); keep the RTK license and attribution in `third_party/rtk/` in every package.
+Review `git status --short` and the changes intended for this release. Commit reviewed changes before running release-it; it requires a clean working directory. npm packages the current working files, including uncommitted changes in the package's file list. Project code uses [MIT](../LICENSE); keep the RTK license and attribution in `third_party/rtk/` in every package.
 
 ```sh
 npm ci
@@ -35,9 +35,9 @@ npm run release
 
 Verify that `whoami` identifies the intended npm account. Complete npm's authentication and two-factor prompts yourself; do not place credentials or tokens in this repository. `publishConfig` selects public access and the official registry.
 
-`npm run release` uses release-it to select the next version interactively, update `package.json` and `package-lock.json`, then confirm npm publication. It invokes `npm publish` with `--registry=https://registry.npmjs.org/`; the existing `prepublishOnly` checks and `prepack` build run before upload. Git commits, tags and pushes are disabled and remain separate manual steps.
+`npm run release` uses release-it to select the next version interactively, update `package.json` and `package-lock.json`, then confirm npm publication. It invokes `npm publish` with `--registry=https://registry.npmjs.org/`; the existing `prepublishOnly` checks and `prepack` build run before upload. release-it also commits the version changes, creates a Git tag, and pushes the commit and tag to the upstream remote, with confirmation for each Git step in interactive mode.
 
-To publish the current version without incrementing it (for example, the initial `1.0.0` release), use `npm publish --registry=https://registry.npmjs.org/` directly. Publishing a `.tgz` directly does not run the project's `prepublishOnly` checks.
+To publish the current version without incrementing it (for example, the initial `1.0.0` release), use `npm publish --registry=https://registry.npmjs.org/` directly. Direct npm publication does not commit, tag, or push Git changes. Publishing a `.tgz` directly does not run the project's `prepublishOnly` checks.
 
 If publishing fails or is declined after the version bump, inspect both version files before retrying. To retry the already-bumped version, use the direct `npm publish` command above rather than incrementing it again.
 
