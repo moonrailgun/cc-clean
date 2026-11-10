@@ -5,14 +5,41 @@
   "author": "moonrailgun",
   "license": "MIT",
   "homepage": "https://github.com/moonrailgun/cc-clean#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/moonrailgun/cc-clean.git" },
-  "bugs": { "url": "https://github.com/moonrailgun/cc-clean/issues" },
-  "keywords": ["claude-code", "codex", "cli", "cleanup", "disk-space"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moonrailgun/cc-clean.git"
+  },
+  "bugs": {
+    "url": "https://github.com/moonrailgun/cc-clean/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "cli",
+    "cleanup",
+    "disk-space"
+  ],
   "type": "module",
-  "bin": { "cc-clean": "dist/cli.js" },
-  "files": ["dist", "README.md", "LICENSE", "AGENTS.md", "docs/native-compatibility.md", "docs/usage.md", "docs/publishing.md", "third_party/rtk"],
-  "engines": { "node": ">=24.0.0" },
-  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "bin": {
+    "cc-clean": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "AGENTS.md",
+    "docs/native-compatibility.md",
+    "docs/usage.md",
+    "docs/publishing.md",
+    "third_party/rtk"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "dev": "node --disable-warning=ExperimentalWarning src/cli.ts",
     "build": "tsc && chmod +x dist/cli.js",
@@ -25,8 +52,20 @@
     "prepublishOnly": "npm run typecheck && npm run test:read-only"
   },
   "release-it": {
-    "npm": { "publishArgs": ["--registry=https://registry.npmjs.org/"] }
+    "npm": {
+      "publishArgs": [
+        "--registry=https://registry.npmjs.org/"
+      ]
+    }
   },
-  "dependencies": { "@inquirer/core": "^12.0.6", "fast-string-truncated-width": "^3.0.3", "smol-toml": "^1.9.1" },
-  "devDependencies": { "@types/node": "^24.0.0", "release-it": "^21.1.2", "typescript": "^5.9.0" }
+  "dependencies": {
+    "@inquirer/core": "^12.0.6",
+    "fast-string-truncated-width": "^3.0.3",
+    "smol-toml": "^1.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "release-it": "^21.1.2",
+    "typescript": "^5.9.0"
+  }
 }
