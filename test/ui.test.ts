@@ -8,12 +8,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import measure from 'fast-string-truncated-width';
 import { select, checkbox, withProgress, fit, paint, safe, storageRow, menuRow, table, tree, pager } from '../src/terminal.ts';
-import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, confirmPlans, emptyPlansMenu, cleanOptions, usageMenu } from '../src/ui.ts';
+import { analysisMenu, menu, printReport, detailNodes, cleanupFileNodes, printPlan, printPlans, printReceipts, printCleanupLog, confirmPlans, emptyPlansMenu, cleanOptions, usageMenu, cleanupResults, executeCleanup, runSelection, selectedPlanLoader } from '../src/ui.ts';
 import { CLAUDE_FILE_CLEANUP_NOTICE } from '../src/app.ts';
-import type { Plan } from '../src/clean.ts';
+import type { Plan, Receipt } from '../src/clean.ts';
 import type { Analysis, Usage } from '../src/types.ts';
 
-// Only navigate read-only screens; never select cleanup actions or previews.
+// Cleanup interactions below replace every planner, executor and recovery call with in-memory stubs.
 async function terminal(t: test.TestContext) {
   const input = new PassThrough(), output = new PassThrough(), controller = new AbortController();
   // Like stdout, keep the destination open when a prompt's output stream ends.
@@ -635,6 +635,349 @@ function inertPlan(): Plan {
       beforeBytes: 4096, afterBytes: 4096, estimatedSavingsBytes: 1024, status: 'planned', recoveryState: 'prepared' }],
   };
 }
+
+function interruptedReceipt(): Receipt {
+  const p = inertPlan(), base = p.actions[0];
+  const action = (i: number, status: Receipt['actions'][number]['status'], recoveryState: Receipt['actions'][number]['recoveryState'], reason?: string) => ({
+    ...base, id: `action-${i}`, targetId: `sessions/private-${i}.jsonl`, status, recoveryState, reason,
+  });
+  const busy = 'Cannot reliably associate every Claude client or service with its idle open session; provider retained';
+  return { ...p, provider: 'claude', root: '/inert/claude', status: 'needs-review',
+    rootBeforeBytes: 100000, rootAfterBytes: 90000, confirmedReductionBytes: 0, attributionComplete: false,
+    warnings: [busy, busy, ...Array.from({ length: 200 }, (_, i) => `sessions/private-${i}.jsonl: unknown format`)],
+    actions: [
+      ...Array.from({ length: 15 }, (_, i) => action(i, 'completed', 'finalized')),
+      action(15, 'completed', 'applied', busy),
+      action(16, 'skipped', 'finalized', busy), action(17, 'skipped', 'finalized', busy),
+      ...Array.from({ length: 465 }, (_, i) => action(i + 18, 'skipped', 'finalized', 'Operation stopped')),
+    ],
+  };
+}
+
+test('interrupted results distinguish unfinished work and group reasons without dumping paths', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  printReceipts([interruptedReceipt()]);
+  const output = stripVTControlCharacters(lines.join('\n'));
+  for (const [label, count] of [['Completed', 15], ['Pending finalization', 1], ['Not started', 465], ['Skipped', 2]])
+    assert.match(output, new RegExp(`${label}: ${count} items`));
+  assert.match(output, /Cannot reliably associate/);
+  assert.match(output, /Activity reasons above are from the last check/);
+  assert.match(output, /checks individual sessions again/);
+  assert.doesNotMatch(output, /Close the affected clients/);
+  assert.match(output, /View details/);
+  assert.doesNotMatch(output, /private-\d+|completed: 16|skipped: 467/);
+  assert.ok(lines.length < 35, `Expected compact output, got ${lines.length} lines`);
+});
+
+test('shared results distinguish unstarted entries from interrupted and unknown file changes', t => {
+  const lines: string[] = [], p = inertPlan(), base = { ...p.actions[0], kind: 'deduplicate-history' as const };
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  const shared = { homes: [], groups: [base.files], compressedLinks: [] };
+  printReceipts([{ ...interruptedReceipt(), ...p, actions: [
+    { ...base, codexShared: shared },
+    { ...base, codexShared: { ...shared, started: false } },
+    { ...base, codexShared: { ...shared, started: true } },
+    { ...base, codexShared: { ...shared, started: true }, status: 'completed', recoveryState: 'finalized' },
+    { ...base, codexShared: shared, status: 'skipped', recoveryState: 'finalized' },
+    base, // Without a start marker, prepared alone cannot prove that no mutation occurred.
+  ] }]);
+  const output = stripVTControlCharacters(lines.join('\n'));
+  for (const [label, count] of [['Completed', 1], ['Pending finalization', 2], ['Not started', 2], ['Skipped', 1]])
+    assert.match(output, new RegExp(`${label}: ${count} items`));
+  assert.match(output, /Continue rechecks safety/);
+});
+
+async function cleanupTerminal(t: test.TestContext) {
+  const term = await terminal(t);
+  for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output], ['stderr', term.context.output]] as const) {
+    const original = Object.getOwnPropertyDescriptor(process, name)!;
+    Object.defineProperty(process, name, { configurable: true, value });
+    t.after(() => Object.defineProperty(process, name, original));
+  }
+  t.mock.method(console, 'log', (...args: unknown[]) => term.context.output.write(args.join(' ') + '\n'));
+  return { ...term, waitFor: async (pattern: RegExp, from = 0) => {
+    for (let i = 0; i < 100; i++) {
+      const output = stripVTControlCharacters(term.text().slice(from));
+      if (pattern.test(output)) return output;
+      await setTimeout(5);
+    }
+    assert.fail(`Missing ${pattern}`);
+  } };
+}
+const cleanupConfig = { roots: { claude: '/inert/claude', codex: '/inert/codex' }, stateDir: '/inert/state' };
+function cleanupStats(receipts: Receipt[] = []) {
+  const provider = (name: string) => ({ savedBytes: 0, cleanedRecords: 0, pending: receipts.length,
+    operations: [], pendingOperations: receipts.filter(r => r.provider === name) });
+  return { schemaVersion: 2 as const, providers: { claude: provider('claude'), codex: provider('codex') }, savedBytes: 0, cleanedRecords: 0 };
+}
+function finalizedReceipt(r: Receipt): Receipt {
+  return { ...r, status: 'interrupted', rootAfterBytes: null, attributionComplete: false,
+    actions: r.actions.map(a => ({ ...a, recoveryState: 'finalized' })) };
+}
+
+test('recovery details show shared Codex aliases, coordinated homes and compressed links', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t), p = inertPlan(), base = p.actions[0];
+  Object.defineProperty(term.context.output, 'rows', { value: 40 });
+  const primary = { ...base.files[0], path: '/inert/codex/sessions/a.jsonl', relative: 'sessions/a.jsonl', category: 'sessions', nlink: 2 };
+  const alias = { ...primary, path: '/inert/orca-codex/sessions/a.jsonl' };
+  const compressed = { ...primary, path: `${primary.path}.zst`, relative: `${primary.relative}.zst`, ino: 1, nlink: 1 };
+  const r: Receipt = { ...interruptedReceipt(), ...p, actions: [{ ...base,
+    kind: 'deduplicate-history', targetId: primary.relative, status: 'completed', recoveryState: 'applied',
+    files: [primary, compressed], codexProjection: [], codexShared: {
+      homes: [{ root: p.root, dev: 0, ino: 2, codexProjection: [] }, { root: '/inert/orca-codex', dev: 0, ino: 3, codexProjection: [] }],
+      groups: [[primary, alias], [compressed]], compressedLinks: ['/inert/orca-codex/sessions/a.jsonl.zst'],
+    },
+  }] };
+  const original = structuredClone(r);
+  const running = cleanupResults(cleanupConfig, [r], true, term.context.signal, async () => { assert.fail('details must not recover'); });
+  await term.waitFor(/Cleanup results/);
+  const from = term.text().length;
+  await term.key('2'); await term.key('\r');
+  const output = await term.waitFor(/Cleanup details/, from);
+  await term.key('q'); await term.key('q'); await running;
+  for (const path of ['/inert/codex/sessions/a.jsonl', '/inert/orca-codex/sessions/a.jsonl',
+    '/inert/codex/sessions/a.jsonl.zst', '/inert/orca-codex/sessions/a.jsonl.zst'])
+    assert.ok(output.includes(path), `Missing shared path: ${path}`);
+  assert.match(output, /Coordinated Codex homes:\s+\/inert\/codex\s+\/inert\/orca-codex/);
+  assert.match(output, /Create compressed hard links before removing originals:/);
+  assert.deepEqual(r, original, 'viewing details must not mutate the receipt');
+});
+
+test('Continue needs Enter confirmation, keeps blocked recovery visible and only retries after finalization', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t), original = interruptedReceipt();
+  let calls = 0;
+  const running = cleanupResults(cleanupConfig, [original], true, term.context.signal, async (stateDir, check, ids) => {
+    assert.equal(stateDir, cleanupConfig.stateDir); assert.equal(check, undefined);
+    assert.deepEqual(ids, [original.operationId], 'recovery is limited to the displayed operation');
+    return [++calls === 1 ? original : finalizedReceipt(original)];
+  });
+  await term.waitFor(/Cleanup results/);
+  assert.doesNotMatch(stripVTControlCharacters(term.text()), /\d\. Retry/);
+  await term.key('1'); assert.equal(calls, 0);
+  await term.key('\r'); await term.waitFor(/Confirm recovery/);
+  await term.key('1'); assert.equal(calls, 0);
+  await term.key('q'); assert.equal(calls, 0, 'cancelling confirmation does not recover');
+  await term.key('\r'); await term.key('\r');
+  assert.equal(calls, 1);
+  let from = term.text().length;
+  await term.key('\r'); await term.key('\r');
+  const recovered = await term.waitFor(/1\. Retry/, from);
+  assert.equal(calls, 2);
+  assert.doesNotMatch(recovered, /\d\. Continue/);
+  assert.match(recovered, /Savings need review; no unfinished file changes remain/);
+  await term.key('2'); await term.key('\r');
+  await term.waitFor(/Cleanup details/);
+  assert.match(stripVTControlCharacters(term.text()), /sessions\/private-0\.jsonl/);
+  await term.key('q'); await term.key('1'); await term.key('\r');
+  assert.deepEqual(await running, [finalizedReceipt(original)]);
+});
+
+test('Continue finalizes an interrupted receipt even when all file changes are finalized', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t);
+  const r: Receipt = { ...finalizedReceipt(interruptedReceipt()), status: 'needs-review', executionStartedAt: inertPlan().startedAt };
+  const recovered: Receipt = { ...r, status: 'interrupted', finishedAt: r.executionStartedAt };
+  let calls = 0;
+  const running = cleanupResults(cleanupConfig, [r], true, term.context.signal, async (_stateDir, _check, ids) => {
+    calls++; assert.deepEqual(ids, [r.operationId]); return [recovered];
+  });
+  const initial = await term.waitFor(/1\. Continue/);
+  assert.doesNotMatch(initial, /\d\. Retry/);
+  await term.key('\r'); await term.waitFor(/Confirm recovery/);
+  assert.equal(calls, 0);
+  const from = term.text().length;
+  await term.key('\r');
+  const output = await term.waitFor(/1\. Retry/, from);
+  assert.equal(calls, 1); assert.doesNotMatch(output, /\d\. Continue/);
+  await term.key('\r'); assert.deepEqual(await running, [recovered]);
+});
+
+test('a finished savings-only review allows Retry without file recovery', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t);
+  const r: Receipt = { ...finalizedReceipt(interruptedReceipt()), executionStartedAt: inertPlan().startedAt, finishedAt: inertPlan().startedAt };
+  const running = cleanupResults(cleanupConfig, [r], true, term.context.signal, async () => { assert.fail('no file recovery needed'); });
+  const output = await term.waitFor(/1\. Retry/);
+  assert.doesNotMatch(output, /\d\. Continue/);
+  assert.match(output, /Savings need review; no unfinished file changes remain/);
+  await term.key('\r'); assert.deepEqual(await running, [r]);
+});
+
+test('Retry rebuilds the original selection and requires confirmation for the fresh plan', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t), first = { ...inertPlan(), explicitTarget: '/inert/selected.png' };
+  const fresh = { ...first, operationId: 'fresh', actions: first.actions.map(a => ({ ...a, beforeBytes: 2048 })) };
+  let scans = 0;
+  const executed: Plan[][] = [];
+  const running = runSelection(cleanupConfig, [first], term.context.signal, async () => { scans++; return [fresh]; }, {
+    readStats: async () => cleanupStats(),
+    recoverOperations: async () => { assert.fail('no recovery expected'); },
+    execute: async (_config, plans, dryRun, _signal, progress) => {
+      assert.equal(dryRun, false); executed.push(plans); progress?.('private path must not be printed');
+      return { schemaVersion: 1, receipts: plans.map(p => ({ ...p, status: 'interrupted', rootBeforeBytes: 4096, rootAfterBytes: 4096,
+        confirmedReductionBytes: 0, attributionComplete: true,
+        actions: p.actions.map(a => ({ ...a, status: 'skipped', recoveryState: 'finalized', reason: 'Operation stopped' })) })) };
+    },
+  });
+  await term.waitFor(/Review cleanup/); assert.equal(executed.length, 0);
+  await term.key('\r'); await term.waitFor(/1\. Retry/);
+  await term.key('1'); assert.equal(scans, 0);
+  const from = term.text().length;
+  await term.key('\r'); await term.waitFor(/Review cleanup/, from);
+  assert.equal(scans, 1); assert.equal(executed.length, 1);
+  await term.key('1'); assert.equal(executed.length, 1);
+  await term.key('\r'); await term.waitFor(/Cleanup results/, from);
+  await term.key('q'); await running;
+  assert.equal(executed.length, 2);
+  assert.equal(executed[1][0], fresh);
+  assert.equal(executed[1][0].explicitTarget, first.explicitTarget);
+  assert.doesNotMatch(stripVTControlCharacters(term.text()), /private path must not be printed/);
+});
+
+test('cancelling cleanup keeps its returned receipt and never automatically rescans', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t), r = interruptedReceipt();
+  let started = false;
+  const running = runSelection(cleanupConfig, [r], term.context.signal, async () => { assert.fail('cancellation must not rescan'); }, {
+    readStats: async () => cleanupStats(), recoverOperations: async () => { assert.fail('no automatic recovery'); },
+    execute: async (_config, _plans, _dryRun, signal) => {
+      started = true;
+      await new Promise<void>(resolve => signal!.addEventListener('abort', () => resolve(), { once: true }));
+      return { schemaVersion: 1, receipts: [r] };
+    },
+  });
+  await term.waitFor(/Review cleanup/); await term.key('\r');
+  for (let i = 0; !started && i < 100; i++) await setTimeout(5);
+  assert.equal(started, true);
+  await term.key('q'); await term.waitFor(/Pending finalization: 1 items/);
+  assert.match(stripVTControlCharacters(term.text()), /1\. Continue/);
+  await term.key('q'); await running;
+});
+
+for (const [name, key] of [['Q', 'q'], ['Esc', '\x1b'], ['Ctrl+C', '\x03']]) {
+  test(`cleanup ${name} cancellation surfaces execution failures and reloads pending recovery`, { timeout: 5000 }, async t => {
+    const term = await cleanupTerminal(t), p = inertPlan(), started = Promise.withResolvers<void>();
+    const pending: Receipt = { ...interruptedReceipt(), ...p,
+      actions: p.actions.map(a => ({ ...a, status: 'completed', recoveryState: 'applied' })) };
+    let reads = 0;
+    const running = runSelection(cleanupConfig, [p], term.context.signal, async () => { assert.fail('failure must not rescan'); }, {
+      readStats: async () => cleanupStats(++reads === 1 ? [] : [pending]),
+      recoverOperations: async () => { assert.fail('failure must not automatically recover'); },
+      execute: async (_config, _plans, _dryRun, signal) => {
+        started.resolve();
+        await new Promise<void>(resolve => signal!.addEventListener('abort', () => resolve(), { once: true }));
+        throw new Error('Synthetic receipt persistence failure');
+      },
+    });
+    await term.waitFor(/Review cleanup/); await term.key('\r'); await started.promise;
+    const from = term.text().length;
+    await term.key(key);
+    const output = await term.waitFor(/Cleanup results/, from);
+    await term.key('q'); await running;
+    assert.match(output, /Cleanup stopped: Synthetic receipt persistence failure/);
+    assert.match(output, /Pending finalization: 1 items/);
+    assert.match(output, /1\. Continue/);
+    assert.doesNotMatch(output, /\d\. Retry|additional planned items were not started/);
+    assert.equal(reads, 2);
+  });
+}
+
+test('cancelling before any receipt is returned remains an interruption', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t);
+  const running = executeCleanup(cleanupConfig, [inertPlan()], term.context.signal, async (_config, _plans, _dryRun, signal) => {
+    await new Promise<void>(resolve => signal!.addEventListener('abort', () => resolve(), { once: true }));
+    return { schemaVersion: 1, receipts: [] };
+  });
+  await term.waitFor(/Applying cleanup/);
+  await term.key('q');
+  assert.deepEqual(await running, { schemaVersion: 1, receipts: [], cancelled: true });
+});
+
+test('pending recovery remains accessible with an empty plan and recovery failures do not start new work', { timeout: 5000 }, async t => {
+  const term = await cleanupTerminal(t), r = interruptedReceipt();
+  const running = runSelection(cleanupConfig, [{ ...r, actions: [] }], term.context.signal, async () => { assert.fail('blocked recovery must not replan'); }, {
+    readStats: async () => cleanupStats([r]), execute: async () => { assert.fail('blocked recovery must not execute'); },
+    recoverOperations: async () => { throw new Error('Synthetic recovery failure'); },
+  });
+  const saved = await term.waitFor(/Cleanup results/);
+  assert.match(saved, /An earlier cleanup needs review before a new cleanup can start/);
+  assert.match(saved, /saved results/);
+  await term.key('\r'); await term.key('\r');
+  const output = await term.waitFor(/Could not continue: Synthetic recovery failure/);
+  assert.doesNotMatch(output, /\d\. Retry|No cleanup items/);
+  await term.key('q'); await running;
+});
+
+test('selected-file retries exclude completed deletions cumulatively and retain bulk protection', async () => {
+  const p = inertPlan(), paths = ['a', 'b', 'c'].map(name => `${p.root}/${name}`);
+  const receipt: Receipt = { ...finalizedReceipt(interruptedReceipt()), provider: p.provider, root: p.root,
+    actions: paths.map(path => ({ ...p.actions[0], kind: 'delete-files', status: 'completed', recoveryState: 'finalized',
+      files: [{ ...p.actions[0].files[0], path }] })) };
+  const options = { files: paths, manual: true, deleteImages: true };
+  const seen: unknown[] = [];
+  const reload = selectedPlanLoader(cleanupConfig, p.provider, options, undefined, async (_config, _provider, selected) => {
+    seen.push(structuredClone(selected)); return p;
+  });
+  assert.deepEqual(await reload(), [p]);
+  await reload([{ ...receipt, actions: receipt.actions.slice(0, 1) }]);
+  await reload([{ ...receipt, actions: receipt.actions.slice(1, 2) }]);
+  assert.deepEqual(seen, [paths, paths.slice(1), paths.slice(2)].map(files => ({
+    ...options, files, sessions: undefined, bulkSelection: true,
+  })));
+  assert.deepEqual(await reload([{ ...receipt, actions: receipt.actions.slice(2) }]), []);
+  assert.equal(seen.length, 3, 'exhausted selections must not scan the provider');
+  assert.deepEqual(options.files, paths, 'original options are not mutated');
+});
+
+test('file retries retain unfinished, skipped, rewritten and unrelated targets', async () => {
+  const p = inertPlan(), path = p.actions[0].files[0].path;
+  const receipt: Receipt = { ...finalizedReceipt(interruptedReceipt()), provider: p.provider, root: p.root,
+    actions: [{ ...p.actions[0], kind: 'delete-files', status: 'completed', recoveryState: 'finalized' }] };
+  const variants: Receipt[] = [
+    { ...receipt, actions: [{ ...receipt.actions[0], recoveryState: 'applied' }] },
+    ...(['skipped', 'failed'] as const).map(status => ({ ...receipt, actions: [{ ...receipt.actions[0], status }] })),
+    { ...receipt, actions: [{ ...receipt.actions[0], kind: 'slim-history' }] },
+    { ...receipt, provider: 'claude' }, { ...receipt, root: '/inert/other-home' },
+  ];
+  let scans = 0;
+  const reload = selectedPlanLoader(cleanupConfig, p.provider, { files: [path], bulkSelection: true }, undefined,
+    async (_config, _provider, selected) => {
+      scans++; assert.deepEqual(selected?.files, [path]); assert.equal(selected?.bulkSelection, true); return p;
+    });
+  for (const r of variants) assert.deepEqual(await reload([r]), [p]);
+  assert.equal(scans, variants.length);
+});
+
+test('session retries exclude finalized parent and child deletions without widening their scope', async () => {
+  for (const provider of ['claude', 'codex'] as const) {
+    const p = { ...inertPlan(), provider, root: cleanupConfig.roots[provider] };
+    const receipt: Receipt = { ...finalizedReceipt(interruptedReceipt()), provider, root: p.root,
+      actions: [{ ...p.actions[0], kind: provider === 'codex' ? 'codex-delete' : 'delete-files',
+        status: 'completed', recoveryState: 'finalized', sessionIds: ['parent', 'child'] }] };
+    let scans = 0;
+    const reload = selectedPlanLoader(cleanupConfig, provider, { sessions: ['parent', 'child', 'other'], manual: true }, undefined,
+      async (_config, _provider, selected) => {
+        scans++; assert.deepEqual(selected?.sessions, ['other']); assert.equal(selected?.bulkSelection, true); return p;
+      });
+    assert.deepEqual(await reload([receipt]), [p]);
+    assert.deepEqual(await reload([{ ...receipt, actions: [{ ...receipt.actions[0], sessionIds: ['other'] }] }]), []);
+    assert.equal(scans, 1);
+  }
+});
+
+test('retry after deduplication retains the compressed sibling and preserves single-target selection semantics', async () => {
+  const p = inertPlan(), original = { ...p.actions[0].files[0], path: `${p.root}/one.jsonl` };
+  const compressed = { ...original, path: original.path + '.zst' };
+  const receipt: Receipt = { ...finalizedReceipt(interruptedReceipt()), provider: p.provider, root: p.root,
+    actions: [{ ...p.actions[0], kind: 'deduplicate-history', status: 'completed', recoveryState: 'finalized', files: [original, compressed] }] };
+  const reload = selectedPlanLoader(cleanupConfig, p.provider, { files: [original.path, compressed.path] }, undefined,
+    async (_config, _provider, selected) => {
+      assert.deepEqual(selected?.files, [compressed.path]); assert.equal(selected?.bulkSelection, true); return p;
+    });
+  assert.deepEqual(await reload([receipt]), [p]);
+  const single = selectedPlanLoader(cleanupConfig, p.provider, { files: [compressed.path] }, undefined,
+    async (_config, _provider, selected) => {
+      assert.deepEqual(selected?.files, [compressed.path]); assert.equal(selected?.bulkSelection, false); return p;
+    });
+  assert.deepEqual(await single(), [p]);
+});
 
 test('cleanup summary shows all session bytes beside savings in both views, excluding temporary roots', t => {
   const lines: string[] = [];

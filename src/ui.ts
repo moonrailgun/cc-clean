@@ -2,13 +2,13 @@ import { basename, dirname, relative } from 'node:path';
 import type { Analysis, Provider, Session, Usage } from './types.ts';
 import type { Config } from './config.ts';
 import { sharedFiles } from './codex-shared.ts';
-import type { Plan, Receipt } from './clean.ts';
+import { recoverOperations, type Plan, type Receipt } from './clean.ts';
 import { report, plan, cleanupPlans, includesSystemTemp, execute, CLAUDE_FILE_CLEANUP_NOTICE } from './app.ts';
 import { systemTempLabels } from './system-temp.ts';
 import { readStats } from './stats.ts';
 import type { CleanupLog } from './history.ts';
 import { directoryEntries, scanRoot } from './scan.ts';
-import { select, checkbox, withProgress, safe, size, paint, columns, screen, storageRow, table, tree, pager, type Choice, type TreeNode } from './terminal.ts';
+import { select, checkbox, withProgress, safe, size, paint, fit, columns, screen, storageRow, table, tree, pager, type Choice, type TreeNode } from './terminal.ts';
 export { safe, size } from './terminal.ts';
 
 const providerName = (provider: Provider) => provider === 'claude' ? 'Claude Code' : 'Codex';
@@ -179,6 +179,18 @@ function estimatedSavings(actions: Plan['actions']): string {
   const unknown = actions.filter(action => action.estimatedSavingsBytes == null).length;
   return unknown ? `${known ? `${size(known)} + ` : ''}unknown (${unknown} item${unknown === 1 ? '' : 's'})` : size(known);
 }
+function actionResult(a: Receipt['actions'][number]) {
+  if (a.status === 'planned' && a.recoveryState === 'prepared' && a.codexShared && !a.codexShared.started) return 'Not started';
+  if (a.recoveryState !== 'finalized') return 'Pending finalization';
+  if (a.status === 'planned' || a.reason === 'Operation stopped') return 'Not started';
+  return { completed: 'Completed', skipped: 'Skipped', failed: 'Failed' }[a.status];
+}
+function resultReason(reason: string) {
+  if (reason.startsWith('72-hour protection:')) return '72-hour protection: recent or invalid modification time; retained';
+  return reason.replace(/active session [0-9a-f-]{36}/gi, 'active session').replace(/^.*?\.jsonl(?:\.zst)?: /, '');
+}
+const unfinished = (r: Receipt) => r.actions.some(a => a.recoveryState !== 'finalized');
+const recoveryNeeded = (r: Receipt) => unfinished(r) || Boolean(r.executionStartedAt && !r.finishedAt);
 export function printReceipts(receipts: Receipt[]) {
   const previews = receipts.filter(r => r.status === 'dry-run');
   if (previews.length) { printPlans(previews); note('Preview only; no operations executed or savings credited'); }
@@ -187,9 +199,23 @@ export function printReceipts(receipts: Receipt[]) {
     console.log(paint(r.attributionComplete ? 'green' : 'yellow', `  Confirmed reduction: ${r.attributionComplete ? size(r.confirmedReductionBytes) : 'needs review'}`));
     const scope = r.systemTemp ? 'Matched temp files' : 'Directory';
     rows([{ label: `${scope} before`, value: size(r.rootBeforeBytes) }, { label: `${scope} after`, value: size(r.rootAfterBytes) }, { label: `${scope} change`, value: size(r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes) }]);
-    for (const [state, symbol] of [['completed', '✓'], ['skipped', '◎'], ['failed', '!']] as const) line(`  ${symbol} ${state}: ${r.actions.filter(a => a.status === state).length} items`);
-    for (const a of r.actions.filter(a => a.reason)) note(`${a.targetId}: ${a.reason}`);
-    for (const warning of r.warnings) note(warning);
+    for (const state of ['Completed', 'Pending finalization', 'Not started', 'Skipped', 'Failed'])
+      line(`  ${state}: ${r.actions.filter(a => actionResult(a) === state).length} items`);
+    const reasons = new Map<string, number>();
+    for (const a of r.actions.filter(a => a.reason && actionResult(a) !== 'Completed')) {
+      const reason = `${actionResult(a)} · ${resultReason(a.reason!)}`;
+      reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+    }
+    for (const [reason, count] of [...reasons].sort((a, b) => b[1] - a[1]).slice(0, 5))
+      line(fit(`  ${count} × ${reason}`, Math.max(40, columns())));
+    if (reasons.size > 5) note(`${reasons.size - 5} more reason types in View details.`);
+    if (unfinished(r)) note('Continue rechecks safety and finishes interrupted operations before Retry can start new work.');
+    else if (recoveryNeeded(r)) note('Continue finishes recording this interrupted operation; all file changes are already finalized.');
+    if (r.actions.some(a => actionResult(a) !== 'Completed' && /client|active session|open files|writer/i.test(a.reason ?? '')))
+      note('Activity reasons above are from the last check. Continue or Retry checks individual sessions again; idle open sessions stay protected.');
+    if (!unfinished(r) && (!r.attributionComplete || r.rootAfterBytes === null))
+      note('Savings need review; no unfinished file changes remain. Recovery cannot reconstruct earlier directory sizes.');
+    if (r.actions.some(a => a.reason) || r.warnings.length) note(`Full paths, reasons and ${r.warnings.length} scan notices: View details, or use --json.`);
   }
 }
 export function printStats(data: Awaited<ReturnType<typeof readStats>>, provider: Provider | 'all' = 'all') {
@@ -455,13 +481,116 @@ function providerList(value: Provider | 'all'): Provider[] { return value === 'a
 async function searchable<T>(message: string, items: Choice<T>[], signal?: AbortSignal, subtitle?: string, total?: number, clear = true): Promise<T | null> {
   return select({ message, subtitle, choices: items, searchable: true, total, clear }, context(signal));
 }
-async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal) {
-  screen();
-  if (!plans.some(p => p.actions.length)) {
-    if (await emptyPlansMenu(plans, signal) === 'slim') await cleanProviders(config, [...new Set(plans.map(p => p.provider))], 'slim', signal);
-    return;
+async function receiptDetails(receipts: Receipt[], signal?: AbortSignal) {
+  await pager({ message: 'Cleanup details', subtitle: 'Read-only · Full paths, original reasons and scan notices', pages: receipts.map(r => ({
+    name: `${providerName(r.provider)} · ${r.operationId}`, content: () => [r.root, `Status: ${r.status}`, '',
+      ...r.actions.flatMap(a => [`${actionResult(a)} · ${a.kind} · ${a.targetId}`,
+        `Status: ${a.status} · Recovery: ${a.recoveryState}`, ...(a.reason ? [a.reason] : []),
+        ...sharedFiles(a).map(f => f.path),
+        ...(a.codexShared ? ['', 'Coordinated Codex homes:', ...a.codexShared.homes.map(h => h.root),
+          ...(a.codexShared.compressedLinks.length ? ['', 'Create compressed hard links before removing originals:', ...a.codexShared.compressedLinks] : [])] : []),
+        '']), 'Scan notices', ...r.warnings,
+    ],
+  })) }, context(signal));
+}
+export async function cleanupResults(config: Config, receipts: Receipt[], retry: boolean, signal?: AbortSignal, recover = recoverOperations, notice?: string): Promise<Receipt[] | null> {
+  let error: string | undefined;
+  while (!signal?.aborted) {
+    screen(); printReceipts(receipts);
+    if (notice) note(notice);
+    if (error) note(`Could not continue: ${error}`);
+    const pending = receipts.filter(recoveryNeeded);
+    if (!retry && receipts.some(r => r.actions.some(a => actionResult(a) === 'Not started')))
+      note('To retry remaining items, return to Clean and select the original options again.');
+    const next = await select({ message: 'Cleanup results', clear: false, requireEnter: true, choices: [
+      ...(pending.length ? [{ name: 'Continue', description: 'Recheck and finish interrupted operations', value: 'continue' }] : []),
+      ...(retry && !receipts.some(r => recoveryNeeded(r) || r.status === 'needs-review')
+        ? [{ name: 'Retry', description: 'Rescan the original selection and options; review before applying', value: 'retry' }] : []),
+      { name: 'View details', description: 'Browse all paths and reasons', value: 'details' },
+      { name: 'Back', value: 'back' },
+    ] }, context(signal));
+    if (next === 'retry') return receipts;
+    if (next === 'details') { await receiptDetails(receipts, signal); continue; }
+    if (next !== 'continue') return null;
+    screen(); title('Continue interrupted cleanup');
+    for (const r of pending) line(`  ${providerName(r.provider)} · ${r.operationId} · ${r.root}`);
+    note('Recheck activity, age, file hashes and indexes. Unsafe operations remain blocked.');
+    note('Recovery may finish applied changes and permanently remove original backups, or restore an unstarted change. No undo after finalization.');
+    const confirm = await select({ message: 'Confirm recovery', clear: false, requireEnter: true, cancelLabel: 'Cancel',
+      choices: [{ name: 'Confirm continue', value: 'confirm' }] }, context(signal));
+    if (confirm !== 'confirm') continue;
+    try {
+      line('  Rechecking interrupted operations…');
+      const updated = await recover(config.stateDir, undefined, pending.map(r => r.operationId));
+      if (pending.some(r => !updated.some(item => item.operationId === r.operationId))) throw new Error('An operation record is missing; inspect Statistics.');
+      receipts = receipts.map(r => updated.find(item => item.operationId === r.operationId) ?? r);
+      error = undefined;
+    } catch (e) { error = (e as Error).message; }
   }
-  if (await confirmPlans(plans, signal)) { printReceipts((await execute(config, plans, false, signal, line)).receipts); await pause(signal); }
+  return null;
+}
+const cleanupServices = { execute, readStats, recoverOperations };
+export async function executeCleanup(config: Config, plans: Plan[], signal?: AbortSignal, run = execute) {
+  let execution: ReturnType<typeof execute> | undefined;
+  const result = await withProgress({ message: 'Cleaning', subtitle: 'Q / Esc stops new items after the current operation is safe.' }, async (localSignal, update) => {
+    let started = 0;
+    const total = plans.reduce((n, p) => n + p.actions.length, 0);
+    update({ phase: 'cleaning', completed: 0, total });
+    execution = run(config, plans, false, localSignal, () => update({ phase: 'cleaning', completed: ++started, total }));
+    return execution;
+  }, context(signal));
+  // Observe receipts and failures even when the progress prompt is cancelled.
+  return { schemaVersion: 1 as const, receipts: (await execution)?.receipts ?? [], cancelled: result === null };
+}
+export async function runSelection(config: Config, plans: Plan[], signal?: AbortSignal, reload?: (receipts: Receipt[]) => Promise<Plan[] | null>, services = cleanupServices) {
+  while (!signal?.aborted) {
+    screen();
+    const stats = await services.readStats(config.stateDir);
+    const pending = Object.values(stats.providers).flatMap(p => p.pendingOperations)
+      .filter(r => plans.some(p => p.provider === r.provider) && (recoveryNeeded(r) || r.status === 'needs-review'));
+    let retry: Receipt[] | null;
+    if (pending.length) {
+      retry = await cleanupResults(config, pending, Boolean(reload), signal, services.recoverOperations,
+        'An earlier cleanup needs review before a new cleanup can start. This page shows its saved results.');
+    } else {
+      if (!plans.some(p => p.actions.length)) {
+        if (await emptyPlansMenu(plans, signal) === 'slim') await cleanProviders(config, [...new Set(plans.map(p => p.provider))], 'slim', signal);
+        return;
+      }
+      if (!await confirmPlans(plans, signal)) return;
+      let receipts: Receipt[] = [];
+      let notice: string | undefined;
+      try {
+        receipts = (await executeCleanup(config, plans, signal, services.execute)).receipts;
+        const unstarted = plans.filter(p => !receipts.some(r => r.operationId === p.operationId)).reduce((n, p) => n + p.actions.length, 0);
+        if (unstarted) notice = `${unstarted} additional planned items were not started. Retry rescans the original selection.`;
+      } catch (e) {
+        notice = `Cleanup stopped: ${(e as Error).message}`;
+        const latest = await services.readStats(config.stateDir);
+        receipts = Object.values(latest.providers).flatMap(p => p.pendingOperations)
+          .filter(r => plans.some(p => p.provider === r.provider));
+      }
+      retry = await cleanupResults(config, receipts, Boolean(reload), signal, services.recoverOperations, notice);
+    }
+    if (!retry || !reload || signal?.aborted) return;
+    const fresh = await reload(retry);
+    if (!fresh) return;
+    plans = fresh;
+  }
+}
+export function selectedPlanLoader(config: Config, provider: Provider, options: NonNullable<Parameters<typeof plan>[2]>, signal?: AbortSignal, scan = scanPlan) {
+  let remaining = { ...options, bulkSelection: options.bulkSelection || new Set([...(options.files ?? []), ...(options.sessions ?? [])]).size > 1 };
+  return async (receipts: Receipt[] = []): Promise<Plan[] | null> => {
+    const deleted = receipts.filter(r => r.provider === provider && r.root === config.roots[provider]).flatMap(r => r.actions.filter(a =>
+      a.status === 'completed' && a.recoveryState === 'finalized' && ['delete-files', 'codex-delete', 'deduplicate-history'].includes(a.kind)));
+    const files = new Set(deleted.flatMap(a => (a.kind === 'deduplicate-history' ? a.files.slice(0, 1) : a.files).map(f => f.path)));
+    const sessions = new Set(deleted.flatMap(a => a.sessionIds ?? []));
+    remaining = { ...remaining, files: remaining.files?.filter(f => !files.has(f)), sessions: remaining.sessions?.filter(id => !sessions.has(id)) };
+    // An exhausted explicit selection must never become a provider-wide cleanup.
+    if (remaining.files?.length === 0 || remaining.sessions?.length === 0) return [];
+    const p = await scan(config, provider, remaining, signal);
+    return p ? [p] : null;
+  };
 }
 export async function cleanOptions(slim: boolean, signal?: AbortSignal, codex = true, claude = true) {
   if (!slim) return { includeFileCleanup: true, removeImages: true, compactTools: true, removeReasoning: codex, removeRequestArchives: claude, compactHooks: claude, compactToolDefinitions: claude, compactSkillListings: claude, removeOldSnapshots: codex };
@@ -483,13 +612,17 @@ async function cleanProviders(config: Config, selected: Provider[], mode: 'quick
   const options = mode === 'temp' ? {tempOnly: true} : await cleanOptions(mode === 'slim', signal, selected.includes('codex'), selected.includes('claude'));
   if (!options) return;
   screen(); title(mode === 'temp' ? 'Clean Temporary Files' : mode === 'slim' ? 'Slim History' : 'Quick Clean');
-  const plans: Plan[] = [];
-  for (const provider of selected) {
-    const p = await scanCleanupPlans(config, provider, options, signal);
-    if (!p) return;
-    plans.push(...p);
-  }
-  await runSelection(config, plans, signal);
+  const reload = async () => {
+    const plans: Plan[] = [];
+    for (const provider of selected) {
+      const p = await scanCleanupPlans(config, provider, options, signal);
+      if (!p) return null;
+      plans.push(...p);
+    }
+    return plans;
+  };
+  const plans = await reload();
+  if (plans) await runSelection(config, plans, signal, reload);
 }
 function sessionChoice(s: Session): Choice<Session> {
   return { name: `${s.id} · ${s.project ?? 'Unknown project'}`, bytes: s.bytes, value: s,
@@ -510,8 +643,9 @@ async function sessionsMenu(config: Config, data: Analysis, sessions: Session[],
     if (action === 'delete') {
       const ids = await checkbox({ message: 'Select Sessions', subtitle: 'Enter reviews the full deletion scope. Empty selection returns.', choices: sorted.filter(s => /^[0-9a-f-]{36}$/i.test(s.id)).map(s => ({ ...sessionChoice(s), value: s.id })) }, context(signal));
       if (ids.length) {
-        const p = await scanPlan(config, data.provider, { sessions: ids, manual: true }, signal);
-        if (p) await runSelection(config, [p], signal);
+        const reload = selectedPlanLoader(config, data.provider, { sessions: ids, manual: true }, signal);
+        const plans = await reload();
+        if (plans) await runSelection(config, plans, signal, reload);
         return;
       }
     } else {
@@ -528,8 +662,9 @@ async function sessionsMenu(config: Config, data: Analysis, sessions: Session[],
         ] }, context(signal));
         if (!next) break;
         if (next === 'delete') {
-          const p = await scanPlan(config, data.provider, { sessions: [s.id], manual: true }, signal);
-          if (p) await runSelection(config, [p], signal);
+          const reload = selectedPlanLoader(config, data.provider, { sessions: [s.id], manual: true }, signal);
+          const plans = await reload();
+          if (plans) await runSelection(config, plans, signal, reload);
           return;
         }
         if (next === 'details') {
@@ -563,8 +698,9 @@ async function filesMenu(config: Config, provider: Provider, signal?: AbortSigna
     { name: 'Delete files', description: 'Permanently delete all selected files, including PNGs', value: 'delete' }, { name: 'Back', value: 'back' },
   ] }, context(signal));
   if (mode && mode !== 'back') {
-    const selectedPlan = await scanPlan(config, provider, { manual: true, files: selected, deleteImages: mode === 'delete' }, signal);
-    if (selectedPlan) await runSelection(config, [selectedPlan], signal);
+    const reload = selectedPlanLoader(config, provider, { manual: true, files: selected, deleteImages: mode === 'delete' }, signal);
+    const plans = await reload();
+    if (plans) await runSelection(config, plans, signal, reload);
   }
 }
 async function directoriesMenu(config: Config, provider: Provider, signal?: AbortSignal) {
@@ -636,8 +772,8 @@ export async function menu(config: Config, signal?: AbortSignal) {
           screen();
           if ('savedBytes' in r) printCleanupLog(r);
           const pending = stats.providers[r.provider].pendingOperations.find(item => item.operationId === r.operationId);
-          if (pending) { printReceipts([pending]); printPlan(pending); }
-          await pause(signal);
+          if (pending) await cleanupResults(config, [pending], false, signal);
+          else await pause(signal);
         }
       } else {
         const mode = action === 'clean' ? await select<'quick' | 'files' | 'slim' | 'temp'>({ message: 'Clean', choices: [

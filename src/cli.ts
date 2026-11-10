@@ -80,8 +80,9 @@ async function main() {
     }
     if (!await ui.confirmPlans(plans, signal)) { process.exitCode = 130; return; }
   }
-  const result = await execute(config, plans, !!v['dry-run'], signal, message => { if (interactive) process.stderr.write(ui.safe(message) + '\n'); });
-  const status = signal.aborted ? 'interrupted'
+  const result = interactive && !v['dry-run'] ? await ui.executeCleanup(config, plans, signal)
+    : await execute(config, plans, !!v['dry-run'], signal);
+  const status = signal.aborted || ('cancelled' in result && result.cancelled) ? 'interrupted'
     : result.receipts.some(r => r.status === 'needs-review') ? 'needs-review'
     : result.receipts.some(r => !r.scanComplete || !['completed', 'dry-run'].includes(r.status)) ? 'partial'
     : v['dry-run'] ? 'dry-run' : 'completed';

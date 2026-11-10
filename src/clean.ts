@@ -45,8 +45,9 @@ export interface Receipt extends Plan {
   rootBeforeBytes:number|null;rootAfterBytes:number|null;confirmedReductionBytes:number;
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
-interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;tempOnly?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
-export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'>):string|undefined {
+interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];bulkSelection?:boolean;deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;tempOnly?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
+export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'|'bulkSelection'>):string|undefined {
+  if(options.bulkSelection)return undefined;
   const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
   return targets.length===1?targets[0]:undefined;
 }
@@ -389,7 +390,8 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
   const finish=async()=>{updateTotal(r);r.finishedAt=new Date().toISOString();await save();await recordCleanup(stateDir,r);return r;};
   let expectedIndexFingerprint=plan.codexIndexFingerprint;
   try {
-    await recoverUnlocked(stateDir,check);
+    const previous=(await jsonFiles(join(stateDir,'providers',r.provider,'operations'))).map(({data})=>(data as Receipt).operationId);
+    await recoverUnlocked(stateDir,check,previous);
     const pending=(await jsonFiles(join(stateDir,'providers',r.provider,'operations'))).some(({data})=>(data as Receipt).status==='needs-review');
     if(pending)throw new Error('An operation needs review; new mutations blocked. Inspect stats for details');
     r.executionStartedAt=new Date().toISOString();
@@ -536,12 +538,15 @@ async function rollbackPrepared(r:Plan,a:Action,dir:string,check:ActivityCheck):
     await cleanupWork(dir,a);return true;
   }catch{return false;}
 }
-async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
+async function recoverUnlocked(stateDir:string,check:ActivityCheck,operationIds?:string[]) {
+  const receipts:Receipt[]=[];
   await readCleanupLog(stateDir);
   for(const provider of ['claude','codex'] as const) {
     for(const {path,data} of await jsonFiles(join(stateDir,'providers',provider,'operations'))) {
       const r=validateReceipt(data,provider);
       if(path!==receiptPath(stateDir,r)||stateOverlaps(r,stateDir))throw new Error('Invalid operation record path');
+      if(operationIds&&!operationIds.includes(r.operationId))continue;
+      receipts.push(r);
       if(r.actions.every(a=>a.recoveryState==='finalized')){
         if(r.executionStartedAt&&!r.finishedAt){r.status='interrupted';r.rootAfterBytes=null;r.finishedAt=new Date().toISOString();await atomicJson(path,r);}
         await recordCleanup(stateDir,r);continue;
@@ -606,5 +611,6 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
       r.rootAfterBytes=null;r.finishedAt=new Date().toISOString();updateTotal(r);await atomicJson(path,r);await recordCleanup(stateDir,r);
     }
   }
+  return receipts;
 }
-export async function recoverOperations(stateDir:string,check:ActivityCheck=defaultActivity) {const unlock=await acquireLock(stateDir);try{await recoverUnlocked(stateDir,check);}finally{await unlock();}}
+export async function recoverOperations(stateDir:string,check:ActivityCheck=defaultActivity,operationIds?:string[]) {const unlock=await acquireLock(stateDir);try{return await recoverUnlocked(stateDir,check,operationIds);}finally{await unlock();}}

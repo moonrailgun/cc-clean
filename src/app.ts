@@ -11,7 +11,7 @@ import { discoverSessionTemps } from './session-temp.ts';
 
 export const CLAUDE_FILE_CLEANUP_NOTICE = 'Claude Code standalone-image deletion is not supported. Quick clean also checks known system temporary files; use Quick clean or Slim history to remove inline images or compact shell output.';
 
-type CleanupOptions = { sessions?: string[]; files?: string[]; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; tempOnly?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean; removeOldSnapshots?: boolean };
+type CleanupOptions = { sessions?: string[]; files?: string[]; bulkSelection?: boolean; deleteImages?: boolean; manual?: boolean; includeFileCleanup?: boolean; tempOnly?: boolean; removeImages?: boolean; compactTools?: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean; removeOldSnapshots?: boolean };
 export const includesSystemTemp = (options: CleanupOptions) => !options.manual && !options.files?.length && !options.sessions?.length &&
   (!!options.includeFileCleanup || !options.removeImages && !options.compactTools && !options.removeReasoning && !options.removeRequestArchives && !options.compactHooks && !options.compactToolDefinitions && !options.compactSkillListings && !options.removeOldSnapshots);
 
@@ -33,7 +33,7 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
   if (provider === 'codex' && inventory.exists) { try { version = await getCodexVersion(); } catch { /* Native session deletion requires a verified CLI version. */ } }
   const result = await createPlan(inventory, {
     version, source: options.manual ? 'analyze' : 'clean', sessions: analysis.sessions,
-    sessionIds: options.sessions, filePaths: options.files, deleteImages: options.deleteImages,
+    sessionIds: options.sessions, filePaths: options.files, bulkSelection: options.bulkSelection, deleteImages: options.deleteImages,
     slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools, removeReasoning: !!options.removeReasoning, removeRequestArchives: !!options.removeRequestArchives, compactHooks: !!options.compactHooks, compactToolDefinitions: !!options.compactToolDefinitions, compactSkillListings: !!options.compactSkillListings, removeOldSnapshots: !!options.removeOldSnapshots }, includeFileCleanup: options.includeFileCleanup,
     otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']],
   });

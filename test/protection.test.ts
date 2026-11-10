@@ -115,7 +115,8 @@ test('a standalone session can own several files but descendants disable its exc
 });
 
 test('bulk selection never gains an exception when only one action remains', () => {
-  for (const selected of [{}, {filePaths: ['/inert/file', '/inert/unsupported']}]) {
+  for (const selected of [{}, {filePaths: ['/inert/file', '/inert/unsupported']},
+    {filePaths: ['/inert/file'], bulkSelection: true}, {sessionIds: [session], bulkSelection: true}]) {
     const p = protectRecentContent(plan([action()], singleSelectedTarget(selected)), now);
     assert.equal(p.actions.length, 0);
     assert.equal(p.warnings.length, 1);

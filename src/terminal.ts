@@ -424,11 +424,11 @@ const progressPrompt = createPrompt<void, {
     rl.line = '';
     if (key.name === 'q' || key.name === 'escape') { setStopping(true); config.cancel(); }
   });
-  const labels = { discovering: 'Discovering files…', sessions: 'Scanning sessions…', index: 'Reading session index…', finalizing: 'Building report…', estimating: 'Estimating cleanup savings…' };
+  const labels = { discovering: 'Discovering files…', sessions: 'Scanning sessions…', index: 'Reading session index…', finalizing: 'Building report…', estimating: 'Estimating cleanup savings…', cleaning: 'Applying cleanup…' };
   const lines = ['', paint('purple', fit(`  ${config.message}`, width))];
   if (config.subtitle) lines.push(paint('plain', fit(`  ${config.subtitle}`, width)));
   lines.push('', paint('cyan', fit(`  ${stopping ? 'Stopping…' : labels[progress.phase]}`, width)));
-  lines.push(fit(`  ${progress.total === null ? `${progress.completed} files found · total pending` : `${progress.completed} / ${progress.total} ${progress.phase === 'estimating' ? 'cleanup items estimated' : 'session files scanned'}`}`, width));
+  lines.push(fit(`  ${progress.total === null ? `${progress.completed} files found · total pending` : `${progress.completed} / ${progress.total} ${progress.phase === 'cleaning' ? 'cleanup items started' : progress.phase === 'estimating' ? 'cleanup items estimated' : 'session files scanned'}`}`, width));
   if (progress.totalBytes !== undefined && progress.processedBytes !== undefined) {
     const ratio = progress.totalBytes ? Math.min(1, progress.processedBytes / progress.totalBytes) : 1;
     const barWidth = Math.min(30, Math.max(0, width - 14));
