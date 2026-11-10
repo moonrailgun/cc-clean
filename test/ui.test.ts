@@ -915,8 +915,8 @@ test('pending recovery remains accessible with an empty plan and recovery failur
     recoverOperations: async () => { throw new Error('Synthetic recovery failure'); },
   });
   const saved = await term.waitFor(/Cleanup results/);
-  assert.match(saved, /An earlier cleanup needs review before a new cleanup can start/);
-  assert.match(saved, /saved results/);
+  // The page must not read as the estimate from the scan that just finished.
+  assert.match(saved, /An earlier cleanup needs review before a new cleanup can start[^]*saved results, not an estimate from the scan that just ran[^]*Confirmed reduction/);
   await term.key('\r'); await term.key('\r');
   const output = await term.waitFor(/Could not continue: Synthetic recovery failure/);
   assert.doesNotMatch(output, /\d\. Retry|No cleanup items/);

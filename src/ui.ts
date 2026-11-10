@@ -501,8 +501,10 @@ async function receiptDetails(receipts: Receipt[], signal?: AbortSignal) {
 export async function cleanupResults(config: Config, receipts: Receipt[], retry: boolean, signal?: AbortSignal, recover = recoverOperations, notice?: string): Promise<Receipt[] | null> {
   let error: string | undefined;
   while (!signal?.aborted) {
-    screen(); printReceipts(receipts);
-    if (notice) note(notice);
+    screen();
+    // Lead with the notice so saved results are never mistaken for a fresh estimate.
+    if (notice) { line(); console.log(paint('yellow', `  ${notice}`)); }
+    printReceipts(receipts);
     if (error) note(`Could not continue: ${error}`);
     const pending = receipts.filter(recoveryNeeded);
     if (!retry && receipts.some(r => r.actions.some(a => actionResult(a) === 'Not started')))
@@ -556,7 +558,7 @@ export async function runSelection(config: Config, plans: Plan[], signal?: Abort
     let retry: Receipt[] | null;
     if (pending.length) {
       retry = await cleanupResults(config, pending, Boolean(reload), signal, services.recoverOperations,
-        'An earlier cleanup needs review before a new cleanup can start. This page shows its saved results.');
+        `An earlier cleanup needs review before a new cleanup can start (started ${pending.map(r => new Date(r.executionStartedAt ?? r.startedAt).toLocaleString('en-US')).join(', ')}).\n  This page shows its saved results, not an estimate from the scan that just ran.`);
     } else {
       if (!plans.some(p => p.actions.length)) {
         if (await emptyPlansMenu(plans, signal) === 'slim') await cleanProviders(config, [...new Set(plans.map(p => p.provider))], 'slim', signal);
