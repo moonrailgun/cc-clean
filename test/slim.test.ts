@@ -20,6 +20,32 @@ const claude = (type: string, content: unknown[], extra = {}) => ({type, session
 const meta = {type: 'session_meta', payload: {id: 'synthetic', cli_version: '0.167.0'}};
 const codex = (payload: unknown) => ({type: 'response_item', payload});
 const jsonl = (...rows: unknown[]) => Buffer.from(rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+test('Codex structured tool results remove only inline image blocks and preserve surrounding bytes', () => {
+  const inline = {type: 'input_image', image_url: 'data:image/png;base64,' + data, detail: 'original'};
+  const retained = [
+    {type: 'input_text', text: `Source example: ${inline.image_url}`},
+    {type: 'input_image', image_url: 'https://example.com/image.png'},
+    {type: 'input_image', file_id: 'image-file'},
+    {type: 'future_image', image_url: inline.image_url},
+  ];
+  for (const type of ['function_call_output', 'custom_tool_call_output']) {
+    const row = {type, call_id: 'same-call', output: [retained[0], inline, ...retained.slice(1)], future: 0};
+    const raw = JSON.stringify(codex(row)).replace('"future":0', '"future":9007199254740993123');
+    const latest = JSON.stringify({type: 'compacted', payload: {message: 'Keep checkpoint', replacement_history: [row]}});
+    const source = Buffer.from(JSON.stringify(meta) + '\r\n' + raw + '\r\n' + latest);
+    const result = slimHistory(source, 'codex', images);
+    const expected = source.toString().replace(JSON.stringify(inline), JSON.stringify({type: 'input_text', text: '[image removed]'}));
+    assert.ok(result.output);
+    assert.equal(result.output?.toString(), expected);
+    assert.deepEqual(result.counts, {images: 1, toolOutputs: 0});
+    assert.deepEqual(result.savingsBytes, {images: source.length - Buffer.byteLength(expected), toolOutputs: 0});
+    assert.equal(slimHistory(result.output!, 'codex', images).output, null);
+    assert.equal(slimHistory(source, 'codex', {removeImages: false, compactTools: false}).output, null);
+    for (const extra of [{status: 'failed'}, {status: 'in_progress'}, {is_error: true}])
+      assert.equal(slimHistory(jsonl(meta, codex({...row, ...extra})), 'codex', images).output, null);
+    assert.equal(slimHistory(jsonl(meta, codex({...row, output: JSON.stringify(row.output)})), 'codex', images).output, null);
+  }
+});
 const oldSnapshots = {removeImages: false, compactTools: false, removeOldSnapshots: true};
 const snapshot = (n: number) => ({type: 'compacted', payload: {
   message: `Summary ${n}`, window_id: n,

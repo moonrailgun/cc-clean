@@ -361,6 +361,9 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           counts.reasoning = (counts.reasoning ?? 0) + 1;
         }
         if (payload.type === 'message') replaceImages(payload.content, true);
+        if (['function_call_output', 'custom_tool_call_output'].includes(payload.type) && typeof payload.call_id === 'string' &&
+            (payload.status === undefined || payload.status === 'completed') && (payload.is_error === undefined || payload.is_error === false))
+          replaceImages(payload.output, true);
         if (options.compactTools && payload.type === 'function_call') {
           let args: Row = {};
           try { const decoded = JSON.parse(payload.arguments); if (object(decoded)) args = decoded; } catch { /* Unknown arguments remain untouched. */ }
