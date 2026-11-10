@@ -8,6 +8,7 @@ import { mkdtemp, mkdir, realpath, readFile, writeFile, rm } from 'node:fs/promi
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { scanRoot } from '../src/scan.ts';
+import { modernSnapshot } from './fixtures/codex-snapshot.ts';
 
 // Synthetic buffers only: never call the cleanup planner, executor or native clients.
 const both = { removeImages: true, compactTools: true };
@@ -616,6 +617,73 @@ test('supported snapshot tools and metadata preserve the latest row independentl
   ]) {
     const payload = {...latest.payload, replacement_history: [invalid], replacement_history_metadata: [{}]};
     assert.throws(() => slimHistory(jsonl(meta, snapshot(1), {...latest, payload}), 'codex', oldSnapshots), /snapshots retained/);
+  }
+});
+
+test('modern snapshot state is validated while only superseded replacement arrays are removed', () => {
+  const older = modernSnapshot(1), latest = modernSnapshot(2);
+  for (const eol of ['\n', '\r\n']) {
+    const raw = [meta, older, latest].map(row => JSON.stringify(row));
+    const input = Buffer.from(raw.join(eol));
+    const result = slimHistory(input, 'codex', oldSnapshots);
+    const expected = structuredClone(older) as any;
+    delete expected.payload.replacement_history; delete expected.payload.replacement_history_metadata;
+    assert.equal(result.output?.toString(), [raw[0], JSON.stringify(expected), raw[2]].join(eol));
+    assert.equal(result.counts.oldSnapshots, 1);
+    assert.equal(result.savingsBytes.oldSnapshots, input.length - result.output!.length);
+    assert.equal(slimHistory(result.output!, 'codex', oldSnapshots).output, null);
+  }
+  const minimal = {type: 'compacted', payload: {message: 'Legacy defaults', window_number: 3, replacement_history: [],
+    retained_context: {verified_answers: [], incomplete: false}, guardian_history: [],
+    mcp_resource_origins: {origins: [], turns: []}, resume_metadata: {dynamic_tools: null, turn_attribution: null,
+      previous_turn_settings: {model: 'synthetic', cyber_access_program: null}}}};
+  assert.equal(slimHistory(jsonl(meta, older, minimal), 'codex', oldSnapshots).counts.oldSnapshots, 1);
+});
+
+test('unknown or malformed modern state protects both older and latest snapshots and combined image cleanup', () => {
+  const mutations: [string, unknown][] = [
+    ['replacement_history.0.internal_chat_message_metadata_passthrough.future', true],
+    ['replacement_history.0.internal_chat_message_metadata_passthrough.create_time', '123'],
+    ['replacement_history.0.internal_chat_message_metadata_passthrough.content_item_metadata.0.provenance.type', 'future'],
+    ['replacement_history.0.internal_chat_message_metadata_passthrough.content_item_metadata.5.provenance.from_additional_requirements', null],
+    ['replacement_history.0.internal_chat_message_metadata_passthrough.executed_tool_calls.0.tool_result_sources.0.id', 1],
+    ['replacement_history.0.content.3.audio_url', null],
+    ['replacement_history.2.content.1.encrypted_content', false],
+    ['replacement_history.3.output.3', {type: 'input_audio', file_id: 'unsupported'}],
+    ['replacement_history.4.call_id', null],
+    ['replacement_history.4.namespace', 'unsupported'],
+    ['replacement_history.5.tools', {}],
+    ['replacement_history_metadata.0.guardian_sources.0.id.role', 'developer'],
+    ['replacement_history_metadata.0.retained_source.complete', 'true'],
+    ['replacement_history_metadata.0.mcp_attribution.status', 'future'],
+    ['replacement_history_metadata.0.mcp_attribution.sources.0.first_turn_id', 1],
+    ['replacement_history_metadata.0.sender_user_messages.text', null],
+    ['guardian_history.0.guardian_metadata.future', true],
+    ['guardian_history.1.type', 'future'],
+    ['retained_context.verified_answers.0.questions.0.answer', null],
+    ['retained_context.user_messages.0.origin', null],
+    ['retained_context.assistant_messages.0.phase', 'future'],
+    ['retained_context.sender_deliveries.0.order', -1],
+    ['retained_context.next_order', 0.5],
+    ['mcp_resource_origins.origins.0.ambiguous_account', 0],
+    ['mcp_resource_origins.turns', [1]],
+    ['resume_metadata.dynamic_tools.thread_id', 'invalid'],
+    ['resume_metadata.dynamic_tools.tools.0.inputSchema', undefined],
+    ['resume_metadata.dynamic_tools.tools.0.deferLoading', null],
+    ['resume_metadata.dynamic_tools.tools.1.tools.0.type', 'namespace'],
+    ['resume_metadata.turn_attribution.initiating_agent_path', '/root/root'],
+    ['resume_metadata.turn_attribution.initiating_agent_path', '/root/worker/'],
+    ['resume_metadata.previous_turn_settings.cyber_access_program', 'future'],
+  ];
+  for (const [path, value] of mutations) for (const position of [0, 1]) {
+    const rows = [modernSnapshot(1), modernSnapshot(2)];
+    const keys = path.split('.'), key = keys.pop()!;
+    const parent = keys.reduce<any>((item, part) => item[part], rows[position].payload);
+    parent[key] = value;
+    const input = jsonl(meta, codex({type: 'message', role: 'user', content: [{type: 'input_image', image_url: 'data:image/png;base64,' + data}]}), ...rows);
+    const before = Buffer.from(input);
+    assert.throws(() => slimHistory(input, 'codex', {...oldSnapshots, removeImages: true}), /snapshots retained/, `${path} in snapshot ${position}`);
+    assert.deepEqual(input, before);
   }
 });
 
