@@ -546,6 +546,71 @@ test('a growing unrelated rollout retains its inbound references without blockin
   await assert.rejects(verifyCodexDeletionHistories(inv, new Set(['independent']), new Set([independent])), /changed/);
 });
 
+test('completed replacements retain affected histories without aborting independent reference checks', async t => {
+  for (const suffix of ['.jsonl', '.jsonl.zst']) await t.test(suffix, async t => {
+    const {root, put} = await layout(t);
+    const source = await put('sessions/source.jsonl', {id: 'source', session_id: 'stable'});
+    const independent = await put('sessions/independent.jsonl', {id: 'independent'});
+    const pair = await put('sessions/pair.jsonl', {id: 'pair'});
+    await put('sessions/pair.jsonl.zst', {id: 'pair'});
+    const changing = await put('sessions/changing' + suffix, {id: 'changing', history_base: {thread_id: 'stable', end_byte_offset: 99}});
+    const time = new Date('2020-01-01T00:00:00Z'); await utimes(changing, time, time);
+    const inv = await scanRoot(root, 'codex'), before = inv.files.find(f => f.path === changing)!;
+    const bytes = await readFile(changing);
+    await writeFile(changing + '.replacement', bytes);
+    await utimes(changing + '.replacement', time, time);
+    await rename(changing + '.replacement', changing);
+    const after = await lstat(changing);
+    assert.notEqual(after.ino, before.ino);
+    assert.equal(after.size, before.size); assert.equal(after.mtimeMs, before.mtimeMs);
+    for (const duplicates of [false, true]) {
+      const blocked = await verifyCodexRewriteLayout(inv, undefined, duplicates);
+      assert.equal(blocked.has(independent), false);
+      assert.equal(blocked.has(changing), true);
+      assert.match(blocked.get(source)!, /referenced/);
+      if (duplicates) for (const path of [pair, pair + '.zst']) assert.equal(blocked.has(path), false);
+    }
+    assert.deepEqual(await readFile(changing), bytes);
+    await assert.rejects(readCodexHeader(before), /changed/);
+    await assert.rejects(verifyCodexDeletionHistories(inv, new Set(['independent']), new Set([independent])), /changed/);
+  });
+});
+
+test('new references in a replacement header retain their source', async t => {
+  for (const suffix of ['.jsonl', '.jsonl.zst']) await t.test(suffix, async t => {
+    const {root, put} = await layout(t);
+    const source = await put('sessions/source.jsonl', {id: 'source', session_id: 'stable'});
+    const independent = await put('sessions/independent.jsonl', {id: 'independent'});
+    const changing = await put('sessions/changing' + suffix, {id: 'old'});
+    const inv = await scanRoot(root, 'codex');
+    const replacement = await put('replacement' + suffix, {id: 'new', history_base: {thread_id: 'stable', end_byte_offset: 99}});
+    await rename(replacement, changing);
+    for (const duplicates of [false, true]) {
+      const blocked = await verifyCodexRewriteLayout(inv, undefined, duplicates);
+      assert.equal(blocked.has(changing), true);
+      assert.match(blocked.get(source)!, /referenced/);
+      assert.equal(blocked.has(independent), false);
+    }
+  });
+});
+
+test('replacement headers retain old and new physical aliases', async t => {
+  const primary = await layout(t), other = await layout(t);
+  const source = await primary.put('sessions/source.jsonl', {id: 'source'});
+  const independent = await primary.put('sessions/independent.jsonl', {id: 'independent'});
+  const changing = await primary.put('sessions/changing.jsonl', {id: 'old'});
+  const oldAlias = join(other.root, 'sessions/changing.jsonl'); await link(changing, oldAlias);
+  const replacement = await primary.put('sessions/replacement.jsonl', {id: 'new', history_base: {thread_id: 'source', end_byte_offset: 99}});
+  const invs = await Promise.all([primary, other].map(h => scanRoot(h.root, 'codex')));
+  await link(replacement, changing + '.replacement'); await rename(changing + '.replacement', changing);
+  for (const duplicates of [false, true]) {
+    const blocked = await verifyCodexRewriteLayout(invs[0], undefined, duplicates, invs.slice(1));
+    for (const path of [changing, oldAlias, replacement]) assert.equal(blocked.has(path), true);
+    assert.match(blocked.get(source)!, /referenced/);
+    assert.equal(blocked.has(independent), false);
+  }
+});
+
 test('link-count changes retain affected histories and references without blocking unrelated histories', async t => {
   for (const remove of [false, true]) await t.test(remove ? 'removed link' : 'added link', async t => {
     const {root, put} = await layout(t);
@@ -616,27 +681,59 @@ test('reference inspection rejects a header rewritten between its two reads', as
   assert.equal(changed, true);
 });
 
-test('link changes still reject incomplete plain headers and compressed histories', async t => {
-  for (const compressed of [false, true]) {
+test('link changes during inspection still reject incomplete plain headers and compressed histories', async t => {
+  for (const compressed of [false, true]) await t.test(compressed ? 'compressed' : 'incomplete', async t => {
     const {root, put} = await layout(t);
     const path = await put(compressed ? 'sessions/one.jsonl.zst' : 'sessions/one.jsonl', {id: 'one'});
     if (!compressed) await writeFile(path, JSON.stringify({type: 'session_meta', payload: {id: 'one'}}));
     const inv = await scanRoot(root, 'codex');
-    await link(path, join(root, 'bridge-link'));
+    const handle = await open(path, 'r'), prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    const stat = prototype.stat;
+    let changed = false;
+    const mock = t.mock.method(prototype, 'stat', async function(this: FileHandle, ...args: any[]) {
+      const result = await Reflect.apply(stat, this, args);
+      if (!changed) { changed = true; await link(path, join(root, 'bridge-link')); }
+      return result;
+    });
     await assert.rejects(verifyCodexRewriteLayout(inv), /changed/);
-  }
+    mock.mock.restore();
+    assert.equal(changed, true);
+  });
 });
 
-test('reference inspection still rejects replaced, truncated, incomplete and changed compressed headers', async t => {
+test('reference inspection rejects replacement or truncation during the header read', async t => {
+  for (const replace of [false, true]) await t.test(replace ? 'replaced' : 'truncated', async t => {
+    const {root, put} = await layout(t);
+    const path = await put('sessions/one.jsonl', {id: 'one'});
+    const inv = await scanRoot(root, 'codex'), bytes = await readFile(path);
+    const headerLine = lines({type: 'session_meta', payload: {id: 'one'}});
+    const handle = await open(path, 'r'), prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    const read = prototype.read;
+    let changed = false;
+    const mock = t.mock.method(prototype, 'read', async function(this: FileHandle, ...args: any[]) {
+      if (!changed && args[0]?.length === headerLine.length) {
+        changed = true;
+        if (replace) { await writeFile(path + '.replacement', bytes); await rename(path + '.replacement', path); }
+        else await writeFile(path, headerLine);
+      }
+      return Reflect.apply(read, this, args);
+    });
+    await assert.rejects(verifyCodexRewriteLayout(inv), /changed/);
+    mock.mock.restore();
+    assert.equal(changed, true);
+  });
+});
+
+test('completed changes retain their files while unreadable current headers still block reference checks', async t => {
   const {root, put} = await layout(t);
   const plain = await put('sessions/one.jsonl', {id: 'one'});
+  const independent = await put('sessions/independent.jsonl', {id: 'independent'});
   let inv = await scanRoot(root, 'codex');
   await writeFile(plain, lines({type: 'session_meta', payload: {id: 'one'}}));
-  await assert.rejects(verifyCodexRewriteLayout(inv), /changed/);
-  inv = await scanRoot(root, 'codex');
-  await rename(plain, plain + '.old');
-  await put('sessions/one.jsonl', {id: 'one'});
-  await assert.rejects(verifyCodexRewriteLayout(inv), /changed/);
+  const blocked = await verifyCodexRewriteLayout(inv);
+  assert.equal(blocked.has(plain), true); assert.equal(blocked.has(independent), false);
   await writeFile(plain, JSON.stringify({type: 'session_meta', payload: {id: 'one'}}));
   assert.equal((await verifyCodexRewriteLayout(await scanRoot(root, 'codex'))).has(plain),false);
   await writeFile(plain, '{"type":"session_meta","payload":');
@@ -645,7 +742,10 @@ test('reference inspection still rejects replaced, truncated, incomplete and cha
   const zipped = await put('sessions/two.jsonl.zst', {id: 'two'});
   inv = await scanRoot(root, 'codex');
   await appendFile(zipped, zstdCompressSync('extra'));
-  await assert.rejects(verifyCodexRewriteLayout(inv), /changed/);
+  const changed = await verifyCodexRewriteLayout(inv);
+  assert.equal(changed.has(zipped), true); assert.equal(changed.has(independent), false);
+  await rm(plain);
+  await assert.rejects(verifyCodexRewriteLayout(inv), /ENOENT/);
 });
 
 test('inbound references through rollout and session identities retain only dependent histories', async t => {

@@ -109,12 +109,17 @@ export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSig
     signal?.throwIfAborted();
     let row;
     try {
-      row = await readCodexHeader(file, signal, {allowAppend:true});
+      // Deep analysis can outlive a file replacement; inspect current references but retain changed files.
+      const current=await lstat(file.path);
+      row = await readCodexHeader({...current,path:file.path}, signal, {allowAppend:true});
       const stat=await lstat(file.path);
-      if(!stat.isFile()||stat.isSymbolicLink()||(['dev','ino'] as const).some(k=>stat[k]!==file[k])||stat.size<file.size||file.path.endsWith('.zst')&&stat.nlink!==file.nlink)
+      if(!stat.isFile()||stat.isSymbolicLink()||(file.path.endsWith('.zst')?snapshotKeys:(['dev','ino'] as const)).some(k=>stat[k]!==current[k])||stat.size<current.size)
         throw new Error('Codex history changed during header inspection');
-      if(snapshotKeys.some(k=>stat[k]!==file[k]))for(const alias of physical.get(physicalKey(file))!)
-        blocked.set(alias.path,'History changed since scan; only its stable header was inspected');
+      if(snapshotKeys.some(k=>current[k]!==file[k]||stat[k]!==file[k])) {
+        const originals=physical.get(physicalKey(file))!,replacements=physical.get(physicalKey({...file,...current}))??[];
+        for(const alias of [...originals,...replacements])
+          blocked.set(alias.path,'History changed since scan; only its stable header was inspected');
+      }
     }
     catch (error) { throw new Error(`${file.relative}: cannot inspect inbound history references: ${(error as Error).message}`); }
     const meta = row.payload;
