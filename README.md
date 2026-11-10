@@ -10,6 +10,12 @@ Requires **Node.js 24+**. Cleanup currently supports **macOS**; other platforms 
 
 Choose **Clean → Quick clean**, review the estimated savings, then press **Enter** to confirm.
 
+| Claude Code | Codex |
+| :---: | :---: |
+| ![Quick clean preview for Claude Code: 916.35 MiB estimated savings out of 2.75 GiB](docs/screenshots/quick-clean-claude.png) | ![Quick clean preview for Codex: 5.84 GiB estimated savings out of 30.86 GiB](docs/screenshots/quick-clean-codex.png) |
+
+Real Quick clean previews; your savings depend on your own history.
+
 ## What gets cleaned
 
 - **Temporary files** — old task outputs, logs, working-directory records and leftover installers in recognized locations.
