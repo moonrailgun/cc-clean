@@ -144,6 +144,30 @@ test('history receipts validate lossy options and count files without recording 
   assert.equal((await readStats(state)).savedBytes, 9);
 });
 
+test('large compressed history receipts use stored savings and require recovery projections', () => {
+  const r = receipt('/synthetic'), a = r.actions[0], f = a.files[0];
+  const size = 65 * 1024 * 1024;
+  Object.assign(f, {path: join(r.root, 'sessions/large.jsonl.zst'), relative: 'sessions/large.jsonl.zst', category: 'sessions', size});
+  Object.assign(a, {kind: 'slim-history', targetId: f.relative, beforeBytes: size, afterBytes: size - 1024,
+    estimatedSavingsBytes: 1024, beforeHash: 'a'.repeat(64), afterHash: 'b'.repeat(64), codexProjection: [],
+    slimOptions: {removeImages: true, compactTools: false, removeReasoning: true},
+    slimCounts: {images: 1, toolOutputs: 0, reasoning: 1}, slimSavingsBytes: {images: 700, toolOutputs: 0, reasoning: 324}});
+  r.rootBeforeBytes = size; r.rootAfterBytes = size - 1024; r.confirmedReductionBytes = 1024;
+  for (const recoveryState of ['prepared', 'applied', 'finalized'] as const) {
+    a.recoveryState = recoveryState;
+    a.status = recoveryState === 'prepared' ? 'planned' : 'completed';
+    r.status = recoveryState === 'finalized' ? 'completed' : 'interrupted';
+    r.confirmedReductionBytes = a.status === 'completed' ? 1024 : 0;
+    assert.equal(validateReceipt(r), r);
+    if (recoveryState !== 'finalized') {
+      const missing = structuredClone(r); delete missing.actions[0].codexProjection;
+      assert.throws(() => validateReceipt(missing), /receipt/);
+    }
+  }
+  a.slimSavingsBytes!.images++;
+  assert.throws(() => validateReceipt(r), /receipt/);
+});
+
 test('privateDir refuses an existing directory below a symlink ancestor', async t => {
   const {base} = await fixture(t);
   await mkdir(join(base, 'external', 'nested'), {recursive: true});

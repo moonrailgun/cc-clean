@@ -389,6 +389,7 @@ export function cleanupFileNodes(plans: Plan[]): TreeNode[] {
               `${operation} · ${count(a.files.length, 'file')}`,
               `Estimated savings: ${size(a.estimatedSavingsBytes ?? null)}`,
               `Source size: ${size(a.beforeBytes)}`,
+              ...(a.kind === 'slim-history' && a.files[0]?.path.endsWith('.zst') ? ['Savings use the recompressed file size; operation amounts are proportional estimates.'] : []),
               ...(a.kind === 'deduplicate-history' ? [`Remove: ${safe(a.files[0].path)}`, `Keep: ${safe(a.files[1].path)}`] : []),
               ...effects.map(e => e.detail), '', 'Full paths:', ...sharedFiles(a).map(f => safe(f.path)),
               ...(a.codexShared ? ['', 'Coordinated Codex homes:', ...a.codexShared.homes.map(h => safe(h.root)),

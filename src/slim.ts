@@ -3,6 +3,8 @@ import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
 import { knownCompactionSnapshot, completeCompactionSnapshot } from './providers/codex-snapshots.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
+export const MAX_CODEX_HISTORY_BYTES = 512 * 1024 * 1024;
+export const historyByteLimit = (provider: Provider) => provider === 'codex' ? MAX_CODEX_HISTORY_BYTES : MAX_HISTORY_BYTES;
 export interface SlimOptions { removeImages: boolean; compactTools: boolean; removeReasoning?: boolean; removeRequestArchives?: boolean; compactHooks?: boolean; compactToolDefinitions?: boolean; compactSkillListings?: boolean; removeOldSnapshots?: boolean }
 export interface SlimCounts { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number; oldSnapshots?: number }
 export interface SlimSavingsBytes { images: number; toolOutputs: number; reasoning?: number; requestRecords?: number; hooks?: number; toolDefinitions?: number; skillListings?: number; oldSnapshots?: number }
@@ -231,11 +233,18 @@ export function assertCodexMeta(row: Row) {
 }
 
 export function slimHistory(input: Buffer, provider: Provider, options: SlimOptions): {output: Buffer | null; counts: SlimCounts; savingsBytes: SlimSavingsBytes} {
-  if (input.length > MAX_HISTORY_BYTES) throw new Error('History exceeds the 64 MiB rewrite limit');
-  let text: string;
-  try { text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(input); }
-  catch { throw new Error('History is not valid UTF-8'); }
-  const lines = text.split('\n'), counts: SlimCounts = {images: 0, toolOutputs: 0};
+  if (input.length > historyByteLimit(provider)) throw new Error(`History exceeds the ${historyByteLimit(provider) / 1024 / 1024} MiB rewrite limit`);
+  const lines: Buffer[] = [], counts: SlimCounts = {images: 0, toolOutputs: 0};
+  for (let start = 0; start < input.length;) {
+    const newline = input.indexOf(10, start), end = newline < 0 ? input.length : newline;
+    if (end - start > MAX_HISTORY_BYTES) throw new Error('History line exceeds the 64 MiB rewrite limit');
+    const next = newline < 0 ? end : end + 1;
+    lines.push(input.subarray(start, next)); start = next;
+  }
+  const decode = (line: Buffer) => {
+    try { return new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(line); }
+    catch { throw new Error('History is not valid UTF-8'); }
+  };
   const savingsBytes: SlimSavingsBytes = {images: 0, toolOutputs: 0};
   if (options.removeReasoning) { counts.reasoning = 0; savingsBytes.reasoning = 0; }
   if (options.removeRequestArchives) { counts.requestRecords = 0; savingsBytes.requestRecords = 0; }
@@ -255,8 +264,9 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     calls.set(id, commandFilter(command));
   }
   for (let n = 0; n < lines.length; n++) {
-    if (!lines[n].trim()) continue;
-    const parsed = parseLine(lines[n]), row = parsed.row;
+    const text = decode(lines[n]);
+    if (!text.trim()) continue;
+    const parsed = parseLine(text), row = parsed.row;
     const replaceImages = (content: unknown, codex: boolean) => {
       if (!Array.isArray(content)) return;
       for (let i = 0; i < content.length; i++) {
@@ -378,7 +388,9 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
         }
       }
     }
-    lines[n] = parsed.render(); records++;
+    const rendered = parsed.render();
+    if (rendered !== text) lines[n] = Buffer.from(rendered);
+    records++;
     savingsBytes.images += parsed.savingsBytes.images;
     savingsBytes.toolOutputs += parsed.savingsBytes.toolOutputs;
     if (options.removeReasoning) savingsBytes.reasoning! += parsed.savingsBytes.reasoning ?? 0;
@@ -394,10 +406,10 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
     for (const n of oldSnapshots) {
       // Remove in separate passes so adjacent members cannot overlap their comma spans.
       for (const key of ['replacement_history', 'replacement_history_metadata']) {
-        const parsed = parseLine(lines[n]);
+        const parsed = parseLine(decode(lines[n]));
         if (!Object.hasOwn(parsed.row.payload, key)) continue;
         parsed.remove(parsed.row.payload, key, 'oldSnapshots');
-        lines[n] = parsed.render();
+        lines[n] = Buffer.from(parsed.render());
         savingsBytes.oldSnapshots! += parsed.savingsBytes.oldSnapshots!;
       }
       counts.oldSnapshots!++;
@@ -406,7 +418,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   // Remove the entire known archive family together; unknown siblings may still reference it.
   if (requestsKnown && conversationRecords) {
     if (options.removeRequestArchives) counts.requestRecords = requestLines.size;
-    for (const n of requestLines) savingsBytes.requestRecords! += Buffer.byteLength(lines[n]) + (n < lines.length - 1 ? 1 : 0);
+    for (const n of requestLines) savingsBytes.requestRecords! += lines[n].length;
   } else requestLines.clear();
-  return {output: Object.values(counts).some(Boolean) ? Buffer.from(lines.map((line, n) => requestLines.has(n) ? '' : line + (n < lines.length - 1 ? '\n' : '')).join('')) : null, counts, savingsBytes};
+  return {output: Object.values(counts).some(Boolean) ? Buffer.concat(lines.filter((_, n) => !requestLines.has(n))) : null, counts, savingsBytes};
 }

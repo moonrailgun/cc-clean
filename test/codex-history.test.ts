@@ -1,16 +1,18 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtemp, realpath, mkdir, writeFile, appendFile, readFile, rm, link, rename, symlink, open, type FileHandle } from 'node:fs/promises';
+import { mkdtemp, realpath, mkdir, writeFile, appendFile, readFile, rm, link, rename, symlink, open, lstat, utimes, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { zstdCompressSync } from 'node:zlib';
 import { slimHistory, slimCodexItem } from '../src/slim.ts';
+import { decodeHistory, slimStoredHistory } from '../src/history-codec.ts';
 import { byteOffsetMap, projectionSnapshot, rewriteProjection, projectionHash, projectionState, applyProjection, readCodexHeader, verifyCodexRewriteLayout, verifyCodexDeletionHistories, decodeDuplicateHistory } from '../src/providers/codex-history.ts';
 import { assertCodexDeleteCapabilities } from '../src/codex-delete.ts';
 import { scanRoot } from '../src/scan.ts';
 import * as shared from '../src/codex-shared.ts';
 import type { Action } from '../src/clean.ts';
+import { modernSnapshot } from './fixtures/codex-snapshot.ts';
 
 const options = {removeImages: true, compactTools: true};
 const url = 'data:image/png;base64,' + 'YQ=='.repeat(300);
@@ -124,6 +126,41 @@ test('projection maps UTF-8 line boundaries and cached items without touching ot
   } finally { db.close(); }
 });
 
+test('structured tool images coordinate decoded offsets, cache preservation and recovery hashes', async () => {
+  const source = lines(header,
+    {ordinal: 0, type: 'response_item', payload: {type: 'function_call_output', call_id: 'tool', output: [{type: 'input_image', image_url: url}]}},
+    {ordinal: 1, type: 'response_item', payload: {type: 'custom_tool_call_output', call_id: 'custom', output: [{type: 'input_image', image_url: url}]}},
+    {ordinal: 2, type: 'future', payload: {text: 'Keep'}});
+  for (const path of ['history.jsonl', 'history.jsonl.zst']) {
+    const stored = path.endsWith('.zst') ? zstdCompressSync(source) : source;
+    const result = await slimStoredHistory(stored, 'codex', path, options);
+    assert.ok(result.output);
+    assert.equal(result.counts.images, 2);
+    const output = await decodeHistory(result.output, path), db = fixture();
+    try {
+      db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=? WHERE thread_id=?').run(source.length, 'rollout');
+      const start = source.indexOf(10) + 1, end = source.indexOf(10, start) + 1;
+      db.prepare('UPDATE thread_turns SET rollout_byte_offset=?,rollout_end_byte_offset=? WHERE thread_id=?').run(start, end, 'rollout');
+      // Tool text may quote data URLs; only recognized image blocks may be replaced.
+      const cached = JSON.stringify({type: 'commandExecution', id: 'tool', status: 'completed', exitCode: 0, command: 'echo source', aggregatedOutput: url});
+      db.prepare('UPDATE thread_items SET item_json=?').run(cached);
+      db.prepare('INSERT INTO thread_realtime_items VALUES(?,?,?)').run('rollout', 'tool', cached);
+      const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+      const after = rewriteProjection(before, byteOffsetMap(source, output), options);
+      assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
+      assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.indexOf(10, start) + 1));
+      assert.equal(after.thread_turns[0].extra, 9007199254740993123n);
+      assert.equal(after.thread_items[0].item_json, cached);
+      assert.equal(after.thread_realtime_items[0].item_json, cached);
+      const receipt = {beforeHash: projectionHash(before), afterHash: projectionHash(after)};
+      assert.equal(projectionState(projectionHash(before), receipt), 'before');
+      db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
+      assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'after');
+      assert.deepEqual(projectionSnapshot(db, 'other'), other);
+    } finally { db.close(); }
+  }
+});
+
 test('projection recovery distinguishes before, after, unchanged and conflicts', () => {
   assert.equal(projectionState('a', {beforeHash: 'a', afterHash: 'b'}), 'before');
   assert.equal(projectionState('b', {beforeHash: 'a', afterHash: 'b'}), 'after');
@@ -131,20 +168,31 @@ test('projection recovery distinguishes before, after, unchanged and conflicts',
   assert.throws(() => projectionState('c', {beforeHash: 'a', afterHash: 'b'}), /changed/);
 });
 
-test('independent home indexes converge from mixed commits without altering other threads', () => {
+for (const suffix of ['.jsonl', '.jsonl.zst']) test(`${suffix} home indexes converge from mixed commits without altering other threads`, async () => {
   const homes = [fixture(), fixture()];
   try {
-    const output = slimHistory(input, 'codex', options).output!;
+    const path = 'history' + suffix, stored = suffix.endsWith('.zst') ? zstdCompressSync(input) : input;
+    const result = await slimStoredHistory(stored, 'codex', path, options);
+    assert.ok(result.output);
+    // Backups have no extension; recovery must use the original history path.
+    const decodedInput = await decodeHistory(stored, path), output = await decodeHistory(result.output, path);
+    assert.deepEqual(decodedInput, input);
+    if (suffix.endsWith('.zst')) assert.notEqual(output.length, result.output.length);
     const snapshots = homes.map(db => projectionSnapshot(db, 'rollout'));
     const other = homes.map(db => projectionSnapshot(db, 'other'));
-    const rewritten = snapshots.map(before => rewriteProjection(before, byteOffsetMap(input, output), options));
+    const rewritten = snapshots.map(before => rewriteProjection(before, byteOffsetMap(decodedInput, output), options));
+    for (const after of rewritten) {
+      assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
+      assert.equal(after.thread_turns[0].extra, 9007199254740993123n);
+      assert.doesNotMatch(String(after.thread_items[0].item_json), /base64/);
+    }
     const receipts = snapshots.map((before, i) => ({beforeHash: projectionHash(before), afterHash: projectionHash(rewritten[i])}));
     applyProjection(homes[0], snapshots[0], rewritten[0]);
     assert.deepEqual(homes.map((db, i) => projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipts[i])), ['after', 'before']);
     for (let pass = 0; pass < 2; pass++) for (const [i, db] of homes.entries()) {
       const before = projectionSnapshot(db, 'rollout');
       if (projectionState(projectionHash(before), receipts[i]) === 'before') {
-        db.exec('BEGIN'); applyProjection(db, before, rewriteProjection(before, byteOffsetMap(input, output), options)); db.exec('COMMIT');
+        db.exec('BEGIN'); applyProjection(db, before, rewriteProjection(before, byteOffsetMap(decodedInput, output), options)); db.exec('COMMIT');
       }
       assert.equal(projectionHash(projectionSnapshot(db, 'rollout')), receipts[i].afterHash);
       assert.deepEqual(projectionSnapshot(db, 'other'), other[i]);
@@ -155,36 +203,52 @@ test('independent home indexes converge from mixed commits without altering othe
   } finally {for (const db of homes) db.close();}
 });
 
-test('old snapshot slimming coordinates line offsets and recovery hashes while preserving caches and ordinals', () => {
+test('plain and zstd old snapshots coordinate decoded offsets and recovery hashes while preserving caches and ordinals', async () => {
   const opts = {removeImages: false, compactTools: false, removeOldSnapshots: true};
   const snapshot = {type: 'compacted', payload: {message: 'Keep summary', window_number: 1,
     replacement_history: [{type: 'message', role: 'user', content: [{type: 'input_text', text: 'Old context'}]}],
     replacement_history_metadata: [{}]}};
-  const source = lines(header, {...snapshot, ordinal: 0}, {ordinal: 1, type: 'event_msg', payload: {type: 'item_completed', item}},
-    {...snapshot, ordinal: 2, payload: {...snapshot.payload, window_number: 2}});
-  const result = slimHistory(source, 'codex', opts), output = result.output!;
-  const start = lines(header, {...snapshot, ordinal: 0}).length;
-  const db = fixture();
-  try {
-    db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=?, next_rollout_ordinal=3').run(source.length);
-    db.prepare("UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=?, rollout_ordinal=1 WHERE thread_id='rollout'").run(start, source.length);
-    const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
-    const after = rewriteProjection(before, byteOffsetMap(source, output), opts);
-    assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
-    assert.equal(after.thread_turns[0].rollout_byte_offset, BigInt(start - result.savingsBytes.oldSnapshots!));
-    assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.length));
-    assert.equal(after.thread_turns[0].rollout_ordinal, 1n);
-    assert.equal(after.thread_history_projection_state[0].next_rollout_ordinal, 3n);
-    assert.deepEqual(after.thread_items, structuredClone(before.thread_items));
-    const receipt = {beforeHash: projectionHash(before), afterHash: projectionHash(after)};
-    assert.notEqual(receipt.beforeHash, receipt.afterHash);
-    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'before');
-    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('ROLLBACK');
-    assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
-    db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
-    assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'after');
-    assert.deepEqual(projectionSnapshot(db, 'other'), other);
-  } finally { db.close(); }
+  for (const older of [snapshot, modernSnapshot(1)]) for (const path of ['history.jsonl', 'history.jsonl.zst']) {
+    const latest = {...older, ordinal: 2, payload: {...older.payload, window_number: 2}};
+    const superseded = {...older, ordinal: 0, payload: {...older.payload,
+      replacement_history: [...older.payload.replacement_history, {type: 'message', role: 'user',
+        content: [{type: 'input_text', text: Array.from({length: 50}, (_, i) => `Superseded context ${i}`).join('\n')}]}],
+      replacement_history_metadata: [...older.payload.replacement_history_metadata, {}]}};
+    const source = lines(header, superseded, {ordinal: 1, type: 'event_msg', payload: {type: 'item_completed', item}}, latest);
+    const stored = path.endsWith('.zst') ? zstdCompressSync(source) : source;
+    const result = await slimStoredHistory(stored, 'codex', path, opts);
+    assert.ok(result.output);
+    assert.equal(result.counts.oldSnapshots, 1);
+    assert.equal(result.savingsBytes.oldSnapshots, stored.length - result.output.length);
+    const output = await decodeHistory(result.output, path);
+    assert.deepEqual(result.decodedInput, source);
+    assert.deepEqual(result.decodedOutput, output);
+    assert.deepEqual(output.subarray(output.length - lines(latest).length), lines(latest));
+    const start = lines(header, superseded).length;
+    const db = fixture();
+    try {
+      db.prepare('UPDATE thread_history_projection_state SET next_rollout_byte_offset=?, next_rollout_ordinal=3').run(source.length);
+      db.prepare("UPDATE thread_turns SET rollout_byte_offset=?, rollout_end_byte_offset=?, rollout_ordinal=1 WHERE thread_id='rollout'").run(start, source.length);
+      db.prepare('INSERT INTO thread_realtime_items VALUES(?,?,?)').run('rollout', 'u', JSON.stringify(item));
+      const before = projectionSnapshot(db, 'rollout'), other = projectionSnapshot(db, 'other');
+      const after = rewriteProjection(before, byteOffsetMap(source, output), opts);
+      assert.equal(after.thread_history_projection_state[0].next_rollout_byte_offset, BigInt(output.length));
+      assert.equal(after.thread_turns[0].rollout_byte_offset, BigInt(start - (source.length - output.length)));
+      assert.equal(after.thread_turns[0].rollout_end_byte_offset, BigInt(output.length));
+      assert.equal(after.thread_turns[0].rollout_ordinal, 1n);
+      assert.equal(after.thread_history_projection_state[0].next_rollout_ordinal, 3n);
+      assert.deepEqual(after.thread_items, structuredClone(before.thread_items));
+      assert.deepEqual(after.thread_realtime_items, structuredClone(before.thread_realtime_items));
+      const receipt = {beforeHash: projectionHash(before), afterHash: projectionHash(after)};
+      assert.notEqual(receipt.beforeHash, receipt.afterHash);
+      assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'before');
+      db.exec('BEGIN'); applyProjection(db, before, after); db.exec('ROLLBACK');
+      assert.deepEqual(projectionSnapshot(db, 'rollout'), before);
+      db.exec('BEGIN'); applyProjection(db, before, after); db.exec('COMMIT');
+      assert.equal(projectionState(projectionHash(projectionSnapshot(db, 'rollout')), receipt), 'after');
+      assert.deepEqual(projectionSnapshot(db, 'other'), other);
+    } finally { db.close(); }
+  }
 });
 
 test('in-memory projection updates commit or roll back as a unit and preserve other threads', () => {
@@ -277,10 +341,10 @@ async function layout(t: TestContext) {
   return {root, put};
 }
 
-test('shared layout accepts fully accounted aliases and retains independent copies and inbound references', async t => {
+for (const suffix of ['.jsonl', '.jsonl.zst']) test(`${suffix} shared layout accepts aliases and retains independent copies and references`, async t => {
   const primary = await layout(t), other = await layout(t);
-  const plain = await primary.put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
-  const alias = join(other.root, 'sessions/one.jsonl'); await link(plain, alias);
+  const plain = await primary.put('sessions/one' + suffix, {id: 'one', session_id: 'stable'});
+  const alias = join(other.root, 'sessions/one' + suffix); await link(plain, alias);
   const inspect = async (duplicates = false, coordinated: string[][] = []) => {
     const inventories = await Promise.all([primary, other].map(home => scanRoot(home.root, 'codex')));
     return verifyCodexRewriteLayout(inventories[0], undefined, duplicates, inventories.slice(1), coordinated);
@@ -293,7 +357,7 @@ test('shared layout accepts fully accounted aliases and retains independent copi
   const dependent = await other.put('archived_sessions/dependent.jsonl', {id: 'dependent', history_base: {thread_id: 'stable', end_byte_offset: 100}});
   for (const path of [plain, alias]) assert.match((await inspect()).get(path)!, /referenced/);
   await rm(dependent);
-  const zipped = await primary.put('sessions/one.jsonl.zst', {id: 'one', session_id: 'stable'});
+  const zipped = await primary.put('sessions/one' + (suffix.endsWith('.zst') ? '.jsonl' : '.jsonl.zst'), {id: 'one', session_id: 'stable'});
   assert.equal((await inspect(true)).size, 0, 'missing compressed alias can be coordinated');
   for (const path of [plain, alias, zipped]) assert.ok((await inspect()).has(path));
   await rm(zipped);
@@ -302,7 +366,7 @@ test('shared layout accepts fully accounted aliases and retains independent copi
   const invs = await Promise.all([primary, other].map(home => scanRoot(home.root, 'codex')));
   await assert.rejects(verifyCodexRewriteLayout(invs[0], undefined, false, [{...invs[1], complete: false}]), /complete/);
   // Model a partially replaced alias with header-only fixtures; no cleanup/recovery executor.
-  await rm(alias); await other.put('sessions/one.jsonl', {id: 'one', session_id: 'stable'});
+  await rm(alias); await other.put('sessions/one' + suffix, {id: 'one', session_id: 'stable'});
   assert.match((await inspect()).get(plain)!, /copies/);
   assert.equal((await inspect(false, [[plain, alias]])).size, 0);
 });
@@ -397,6 +461,60 @@ test('header inspection supports plain and compressed layouts and rejects stale 
   await assert.rejects(readCodexHeader(inv.files.find(f => f.path === plain)!), /changed/);
 });
 
+test('header inspection reads concatenated zstd frames across empty, UTF-8 and newline boundaries', async t => {
+  const {root} = await layout(t);
+  const row = {type: 'session_meta', payload: {id: 'framed', cwd: '/保留'}}, data = lines(row);
+  const split = data.indexOf(Buffer.from('保留')) + 1;
+  for (const parts of [[Buffer.alloc(0), data], [data.subarray(0, split), data.subarray(split)],
+    [data.subarray(0, -1), Buffer.from('\n')], [Buffer.alloc(0), data.subarray(0, -1)]]) {
+    const stored = Buffer.concat(parts.map(part => zstdCompressSync(part)));
+    for (const name of ['framed.jsonl.zst', 'extensionless']) {
+      const path = join(root, name); await writeFile(path, stored);
+      assert.deepEqual(await readCodexHeader({...await lstat(path), path}, undefined, {detectCompression: true}), row);
+      assert.deepEqual(await readFile(path), stored);
+    }
+  }
+});
+
+test('multi-frame header inspection enforces the combined limit and rejects damaged input and cancellation', async t => {
+  const {root} = await layout(t), path = join(root, 'framed.jsonl.zst');
+  const first = zstdCompressSync(lines(header).subarray(0, -1));
+  const newline = zstdCompressSync('\n');
+  for (const stored of [Buffer.concat([first, Buffer.from('invalid frame')]),
+    Buffer.concat([first, newline.subarray(0, -1)]),
+    Buffer.concat([zstdCompressSync(''), zstdCompressSync('')])]) {
+    await writeFile(path, stored);
+    await assert.rejects(readCodexHeader({...await lstat(path), path}));
+  }
+  const large = lines({type: 'session_meta', payload: {id: 'large', cwd: 'x'.repeat(1024 * 1024)}});
+  await writeFile(path, Buffer.concat([zstdCompressSync(large.subarray(0, 600000)), zstdCompressSync(large.subarray(600000))]));
+  await assert.rejects(readCodexHeader({...await lstat(path), path}), /exceeds 1 MiB/);
+  await writeFile(path, Buffer.concat([zstdCompressSync(''), zstdCompressSync(lines(header))]));
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(readCodexHeader({...await lstat(path), path}, controller.signal), {name: 'AbortError'});
+});
+
+test('header inspection stops at the first complete line without decoding later frames', async t => {
+  const {root} = await layout(t), path = join(root, 'header-only.jsonl.zst');
+  await writeFile(path, Buffer.concat([zstdCompressSync(''), zstdCompressSync(lines(header)), Buffer.from('unread body')]));
+  assert.deepEqual(await readCodexHeader({...await lstat(path), path}), header);
+});
+
+test('multi-frame reference inspection preserves inbound protection without blocking independent histories', async t => {
+  const {root, put} = await layout(t);
+  const independent = await put('sessions/independent.jsonl', {id: 'independent'});
+  const source = await put('sessions/source.jsonl', {id: 'source', session_id: 'stable'});
+  const path = join(root, 'sessions/framed.jsonl.zst');
+  const data = lines({type: 'session_meta', payload: {id: 'framed', history_base: {thread_id: 'stable', end_byte_offset: 99}}});
+  await writeFile(path, Buffer.concat([zstdCompressSync(''), zstdCompressSync(data.subarray(0, 32)), zstdCompressSync(data.subarray(32))]));
+  const inv = await scanRoot(root, 'codex');
+  for (const duplicates of [false, true]) {
+    const blocked = await verifyCodexRewriteLayout(inv, undefined, duplicates);
+    assert.equal(blocked.has(independent), false);
+    assert.match(blocked.get(source)!, /referenced/);
+  }
+});
+
 test('unrelated compressed and hardlinked histories do not block an independent paginated target', async t => {
   const {root, put} = await layout(t);
   const independent = await put('sessions/independent.jsonl', {id: 'independent', history_mode: 'paginated'});
@@ -406,7 +524,7 @@ test('unrelated compressed and hardlinked histories do not block an independent 
   await writeFile(join(root, 'thread_history_1.sqlite'), 'layout-only sentinel');
   const blocked = await verifyCodexRewriteLayout(await scanRoot(root, 'codex'));
   assert.equal(blocked.has(independent), false);
-  assert.match(blocked.get(zipped)!, /Compressed/);
+  assert.equal(blocked.has(zipped), false);
   assert.match(blocked.get(linked)!, /hard links/);
 });
 

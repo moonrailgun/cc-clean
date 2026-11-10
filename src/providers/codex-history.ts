@@ -10,34 +10,16 @@ import { assertCodexMeta, slimCodexItem, MAX_HISTORY_BYTES, type SlimOptions } f
 import { physicalKey } from '../scan.ts';
 import { existingDir } from '../state.ts';
 import { verifyCodexSqliteLocation } from './codex.ts';
+import { decodeHistory } from '../history-codec.ts';
 
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value, (_, v) => typeof v === 'bigint' ? {integer: v.toString()} : v)).digest('hex');
 const historyPath = /^(?:sessions|archived_sessions)\/.*\.jsonl(?:\.zst)?$/;
 const databaseName = /^thread_history_\d+\.sqlite$/;
 
-// Node stops at the first zstd frame; consume every frame, including trailing data.
 export async function decodeDuplicateHistory(compressed: Buffer, limit: number, signal?: AbortSignal): Promise<Buffer> {
   if (!compressed.length || compressed.length > MAX_HISTORY_BYTES || !Number.isSafeInteger(limit) || limit > MAX_HISTORY_BYTES || limit < 1)
     throw new Error('Duplicate history exceeds the 64 MiB verification limit or is empty');
-  const chunks: Buffer[] = [];
-  let offset = 0, size = 0;
-  while (offset < compressed.length) {
-    signal?.throwIfAborted();
-    const decoder = createZstdDecompress(), source = Readable.from([compressed.subarray(offset)]);
-    source.on('error', error => decoder.destroy(error));
-    source.pipe(decoder);
-    try {
-      for await (const chunk of decoder) {
-        signal?.throwIfAborted();
-        size += chunk.length;
-        if (size > limit) throw new Error('Compressed history differs from the original or exceeds its size');
-        chunks.push(Buffer.from(chunk));
-      }
-      if (!decoder.bytesWritten) throw new Error('Compressed history contains an invalid frame');
-      offset += decoder.bytesWritten;
-    } finally { source.destroy(); decoder.destroy(); }
-  }
-  return Buffer.concat(chunks, size);
+  return decodeHistory(compressed, 'history.jsonl.zst', limit, signal);
 }
 
 type HeaderFile=Pick<FileEntry,'path'|'dev'|'ino'|'size'|'mtimeMs'|'ctimeMs'|'nlink'>;
@@ -60,33 +42,51 @@ export async function readCodexHeader(file: HeaderFile, signal?: AbortSignal, op
       compressed=magic.readUInt32LE(0)===0xfd2fb528;
     }
     await unchanged();
-    const source = handle.createReadStream({autoClose: false, start:0, highWaterMark: 16 * 1024, signal});
-    const decoder = compressed ? createZstdDecompress({chunkSize: 16 * 1024}) : undefined;
-    const stream = decoder ? source.pipe(decoder) : source;
-    if (decoder) source.on('error', error => decoder.destroy(error));
-    let buffer = Buffer.alloc(0), found = false;
-    try {
-      for await (const chunk of stream.iterator({destroyOnReturn: false})) {
+    let buffer = Buffer.alloc(0), found = false, frameStart = 0;
+    do {
+      signal?.throwIfAborted();
+      async function* raw(): AsyncGenerator<Buffer> {
+        for (let position = frameStart; position < size;) {
+          signal?.throwIfAborted();
+          const data = Buffer.allocUnsafe(Math.min(16 * 1024, size - position));
+          const {bytesRead} = await handle.read(data, 0, data.length, position);
+          if (!bytesRead) throw new Error('Codex history changed during header inspection');
+          position += bytesRead;
+          yield data.subarray(0, bytesRead);
+        }
+      }
+      const source = Readable.from(raw(), {objectMode: false, highWaterMark: 16 * 1024, signal});
+      const decoder = compressed ? createZstdDecompress({chunkSize: 16 * 1024}) : undefined;
+      const stream = decoder ? source.pipe(decoder) : source;
+      if (decoder) source.on('error', error => decoder.destroy(error));
+      try {
+        for await (const chunk of stream.iterator({destroyOnReturn: false})) {
+          signal?.throwIfAborted();
+          const data = Buffer.from(chunk), newline = data.indexOf(10);
+          buffer = Buffer.concat([buffer, newline < 0 ? data : data.subarray(0, newline)]);
+          if (buffer.length > 1024 * 1024) throw new Error('Codex history header exceeds 1 MiB');
+          if (newline >= 0) { found = true; break; }
+        }
         signal?.throwIfAborted();
-        const data = Buffer.from(chunk), newline = data.indexOf(10);
-        buffer = Buffer.concat([buffer, newline < 0 ? data : data.subarray(0, newline)]);
-        if (buffer.length > 1024 * 1024) throw new Error('Codex history header exceeds 1 MiB');
-        if (newline >= 0) { found = true; break; }
-      }
-      if (!found && !buffer.length) throw new Error('Codex history header is empty');
-      if(options.allowAppend&&!compressed) {
-        // Growth or link changes are safe to inspect only while the identity/reference header stays identical.
-        if(!found)await unchanged(true);
-        const expected=found?Buffer.concat([buffer,Buffer.from('\n')]):buffer,again=Buffer.alloc(expected.length);
-        const {bytesRead}=await handle.read(again,0,again.length,0);
-        if(bytesRead!==expected.length||!again.equals(expected))throw new Error('Codex history header changed during inspection');
-      }
-      await unchanged(!found);
-      const row = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(buffer));
-      if (row.type !== 'session_meta' || typeof row.payload?.id !== 'string' || !row.payload.id)
-        throw new Error('Codex history header has no recognized identity');
-      return row;
-    } finally { source.destroy(); decoder?.destroy(); }
+        if (found || !decoder) break;
+        // Node stops at each zstd frame; a header may continue in the next one.
+        if (!decoder.bytesWritten) throw new Error('Codex history contains an invalid zstd frame');
+        frameStart += decoder.bytesWritten;
+      } finally { source.destroy(); decoder?.destroy(); }
+    } while (frameStart < size);
+    if (!found && !buffer.length) throw new Error('Codex history header is empty');
+    if(options.allowAppend&&!compressed) {
+      // Growth or link changes are safe to inspect only while the identity/reference header stays identical.
+      if(!found)await unchanged(true);
+      const expected=found?Buffer.concat([buffer,Buffer.from('\n')]):buffer,again=Buffer.alloc(expected.length);
+      const {bytesRead}=await handle.read(again,0,again.length,0);
+      if(bytesRead!==expected.length||!again.equals(expected))throw new Error('Codex history header changed during inspection');
+    }
+    await unchanged(!found);
+    const row = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(buffer));
+    if (row.type !== 'session_meta' || typeof row.payload?.id !== 'string' || !row.payload.id)
+      throw new Error('Codex history header has no recognized identity');
+    return row;
   } finally { await handle.close(); }
 }
 
@@ -134,7 +134,6 @@ export async function verifyCodexRewriteLayout(inv: Inventory, signal?: AbortSig
     if (!logical.has(file.path) && (file.nlink !== 1 && !related.length || physical.get(physicalKey(file))!.length !== file.nlink ||
       physical.get(physicalKey(file))!.some(f => f.relative !== file.relative || snapshotKeys.some(k => f[k] !== file[k]))))
       blocked.set(file.path, 'History has unaccounted or inconsistent hard links; all copies are required');
-    if (!duplicates && file.path.endsWith('.zst')) blocked.set(file.path, 'Compressed history is inspected for references but is not rewritten');
   }
   for (const id of references) for (const path of aliases.get(id) ?? [])
     blocked.set(path, 'History is referenced by another rollout; dependent updates are required');

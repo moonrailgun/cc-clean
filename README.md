@@ -15,7 +15,7 @@ Choose **Clean → Quick clean**, review the estimated savings, then press **Ent
 - **Temporary files** — old task outputs, logs, working-directory records and leftover installers in recognized locations.
 - **Conversation history** — remove embedded images and shorten supported shell outputs while keeping chat text and recorded token/cost usage.
 - **Claude Code extras** — remove API request archives and compact successful hooks, saved tool definitions and skill listings.
-- **Codex extras** — remove encrypted reasoning and older compaction snapshots; remove duplicate history originals when an identical compressed copy exists.
+- **Codex extras** — slim plain or zstd history up to 512 MiB stored and decoded, including encrypted reasoning and older compaction snapshots; remove duplicate history originals when an identical compressed copy exists.
 - **Generated PNGs** — losslessly compress supported Codex images.
 
 Use **Clean temporary files** or **Slim history** to choose a narrower cleanup. **Analyze** shows storage and usage; **Statistics** shows past cleanup savings.

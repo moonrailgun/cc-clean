@@ -16,7 +16,8 @@ import { deleteCodexSession, verifyCodexDeleteCapabilities } from './codex-delet
 import { validateReceipt } from './state.ts';
 import { readCodexIndex, type IndexThread } from './providers/codex.ts';
 import { readCleanupLog, recordCleanup } from './history.ts';
-import { slimHistory, MAX_HISTORY_BYTES, type SlimOptions, type SlimCounts, type SlimSavingsBytes } from './slim.ts';
+import { historyByteLimit, MAX_HISTORY_BYTES, MAX_CODEX_HISTORY_BYTES, type SlimOptions, type SlimCounts, type SlimSavingsBytes } from './slim.ts';
+import { decodeHistory, slimStoredHistory } from './history-codec.ts';
 import { decodeDuplicateHistory, verifyCodexRewriteLayout, verifyCodexDeletionHistories, previewProjection, prepareProjection, verifyProjectionBefore, type ProjectionReceipt } from './providers/codex-history.ts';
 export { verifyCodexRewriteLayout } from './providers/codex-history.ts';
 const exec=promisify(execFile);
@@ -167,7 +168,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
   let related:Inventory[]=[];let sharedError:string|undefined;
   if(inv.provider==='codex'&&!options.tempOnly)try {related=(await sharedInventories(inv)).slice(1);}catch(error){sharedError=(error as Error).message;}
-  const historyEligible=(f:FileEntry)=>!referenced(inv,f.path)&&within(inv.root,f.path)&&f.size<=MAX_HISTORY_BYTES;
+  const historyEligible=(f:FileEntry,limit=MAX_HISTORY_BYTES)=>!referenced(inv,f.path)&&within(inv.root,f.path)&&f.size<=limit;
   if(options.slim?.removeImages||options.slim?.compactTools||options.slim?.removeReasoning||options.slim?.removeRequestArchives||options.slim?.compactHooks||options.slim?.compactToolDefinitions||options.slim?.compactSkillListings||options.slim?.removeOldSnapshots) {
     let layoutValid=true,blocked=new Map<string,string>();
     if(inv.provider==='codex') {
@@ -176,7 +177,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
     if(layoutValid)for(const f of inv.files) {
       if(f.category!=='sessions'||selected&&!selected.has(f.path))continue;
       if(blocked.has(f.path)){plan.warnings.push(`${f.relative}: ${blocked.get(f.path)}`);continue;}
-      if(!historyEligible(f)||inv.provider!=='codex'&&!eligible(f)){plan.warnings.push(`${f.relative}: history is linked, referenced or exceeds 64 MiB; retained`);continue;}
+      if(!historyEligible(f,historyByteLimit(inv.provider))||inv.provider!=='codex'&&!eligible(f)){plan.warnings.push(`${f.relative}: history is linked, referenced or exceeds ${historyByteLimit(inv.provider)/1024/1024} MiB; retained`);continue;}
       try {
         const codexShared=inv.provider==='codex'?await sharedHistoryScope([f],[inv,...related]):undefined;
         plan.actions.push({...makeAction('slim-history',f.relative,[f]),slimOptions:{...options.slim},codexShared});
@@ -224,8 +225,8 @@ async function verifyFile(root:string,f:FileEntry,plan?:Plan) {
   for(const part of relative(root,dirname(f.path)).split('/').filter(Boolean)) {cursor=join(cursor,part);const s=await lstat(cursor);if(!s.isDirectory()||s.isSymbolicLink())throw new Error('Parent directory changed or contains a symlink');}
   if(!same(f,await lstat(f.path)))throw new Error('File changed or has hard links');
 }
-async function readVerified(root:string,f:FileEntry) {
-  await verifyFile(root,f);const data=await readOrdinaryFile(f.path,MAX_PNG_BYTES);await verifyFile(root,f);return data;
+async function readVerified(root:string,f:FileEntry,limit=MAX_PNG_BYTES) {
+  await verifyFile(root,f);const data=await readOrdinaryFile(f.path,limit);await verifyFile(root,f);return data;
 }
 async function readDuplicate(root:string,a:Action,signal?:AbortSignal,preview=false) {
   const compressed=await (a.codexShared?readSharedFile(a.files[1]):readVerified(root,a.files[1]));
@@ -262,12 +263,12 @@ export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:
       }
     } else if(action.kind==='slim-history') {
       try {
-        const input=await (action.codexShared?readSharedFile(action.files[0]):readVerified(plan.root,action.files[0]));
-        const {output,counts,savingsBytes}=slimHistory(input,plan.provider,action.slimOptions!);
+        const input=await (action.codexShared?readSharedFile(action.files[0]):readVerified(plan.root,action.files[0],historyByteLimit(plan.provider)));
+        const {output,counts,savingsBytes,decodedInput,decodedOutput}=await slimStoredHistory(input,plan.provider,action.files[0].path,action.slimOptions!,signal);
         action.slimCounts=counts;action.slimSavingsBytes=savingsBytes;action.estimatedSavingsBytes=output?input.length-output.length:0;
         if(output){
-          if(action.codexShared)await previewSharedProjection(action,input,output);
-          else if(plan.provider==='codex')action.codexProjection=await previewProjection(plan.root,input,output,action.slimOptions!);
+          if(action.codexShared)await previewSharedProjection(action,decodedInput,decodedOutput!);
+          else if(plan.provider==='codex')action.codexProjection=await previewProjection(plan.root,decodedInput,decodedOutput!,action.slimOptions!);
           action.beforeHash=hash(input);action.afterHash=hash(output);
         }
       } catch(error) {
@@ -340,9 +341,9 @@ async function syncDirectory(path:string) {
   const dir=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);
   try {await dir.sync();}finally{await dir.close();}
 }
-async function currentHash(root:string,path:string):Promise<string> {
+async function currentHash(root:string,path:string,limit=MAX_PNG_BYTES):Promise<string> {
   if(!within(root,path)||await realpath(root)!==root||await realpath(dirname(path))!==dirname(path))throw new Error('Recovery path changed');
-  return hash(await readOrdinaryFile(path,MAX_PNG_BYTES));
+  return hash(await readOrdinaryFile(path,limit));
 }
 function updateTotal(r:Receipt) {r.confirmedReductionBytes=r.actions.reduce((n,a)=>n+(a.status==='completed'?a.beforeBytes-a.afterBytes:0),0);}
 const scanPlanScope=(p:Plan)=>p.systemTemp?scanSystemTemp(p.root,p.provider,p.systemTemp):scanRoot(p.root,p.provider);
@@ -456,8 +457,8 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
         } else if(replacement(a.kind)) {
           const f=a.files[0];
           if(process.platform==='darwin'){const {stdout}=await exec('/usr/bin/xattr',[f.path],{timeout:5000});if(stdout.trim())throw new Error('File has extended attributes; original retained');}
-          const input=await readVerified(r.root,f);
-          const slim=a.kind==='slim-history'?slimHistory(input,r.provider,a.slimOptions!):null;
+          const input=await readVerified(r.root,f,a.kind==='slim-history'?historyByteLimit(r.provider):MAX_PNG_BYTES);
+          const slim=a.kind==='slim-history'?await slimStoredHistory(input,r.provider,f.path,a.slimOptions!,options.signal):null;
           const output=slim?slim.output:await recompressPng(input);
           if(!output){a.status='skipped';a.reason='Transformation did not reduce file size';a.recoveryState='finalized';await save();continue;}
           if(slim) {
@@ -470,7 +471,7 @@ export async function executePlan(plan:Plan,options:ExecuteOptions):Promise<Rece
           await save();await verifyFile(r.root,f);
           if(a.kind==='slim-history'&&r.provider==='codex') {
             if(!a.codexProjection)throw new Error('History index preview is missing; preview again');
-            projection=await prepareProjection(r.root,a.codexProjection,input,output,a.slimOptions!);
+            projection=await prepareProjection(r.root,a.codexProjection,slim!.decodedInput,slim!.decodedOutput!,a.slimOptions!);
             await verifyHistoryDependencies(a,r.root,options.signal);
             await verifyFile(r.root,f);
           }
@@ -564,7 +565,7 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
             if(s?.ino===f.ino&&s.dev===f.dev&&s.size===f.size&&s.mtimeMs===f.mtimeMs) {
               if(await rollbackPrepared(r,a,dir,check)){a.status='skipped';a.reason='Previous operation was interrupted; original file was not replaced';a.afterBytes=a.beforeBytes;a.recoveryState='finalized';continue;}
             }
-            if(a.afterHash&&s&&(await currentHash(r.root,f.path))===a.afterHash){a.status='completed';a.recoveryState='applied';}
+            if(a.afterHash&&s&&(await currentHash(r.root,f.path,a.kind==='slim-history'?historyByteLimit(r.provider):MAX_PNG_BYTES))===a.afterHash){a.status='completed';a.recoveryState='applied';}
           }
           if(a.recoveryState==='applied') {
             if(a.kind==='deduplicate-history') {
@@ -580,16 +581,17 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck) {
               try {await verifyHistoryDependencies(a,r.root);await projection.commit();}finally{projection.rollback();}
             }
             if(a.kind==='delete-files'&&(await Promise.all(a.files.map(f=>exists(f.path)))).some(Boolean)){pending=true;continue;}
-            if(replacement(a.kind)&&(!a.afterHash||(await currentHash(r.root,a.files[0].path))!==a.afterHash)){pending=true;continue;}
+            if(replacement(a.kind)&&(!a.afterHash||(await currentHash(r.root,a.files[0].path,a.kind==='slim-history'?historyByteLimit(r.provider):MAX_PNG_BYTES))!==a.afterHash)){pending=true;continue;}
             if(provider==='codex'&&a.kind==='slim-history') {
               const backup=join(dir,'0.original');let input:Buffer|null=null;
               if(await exists(backup)) {
-                await verifyBackup(dir,a,0);input=await readOrdinaryFile(backup,MAX_HISTORY_BYTES);
+                await verifyBackup(dir,a,0);input=await readOrdinaryFile(backup,MAX_CODEX_HISTORY_BYTES);
                 if(hash(input)!==a.beforeHash)throw new Error('Original history backup changed');
               }
-              const output=await readOrdinaryFile(a.files[0].path,MAX_HISTORY_BYTES);
+              const output=await readOrdinaryFile(a.files[0].path,MAX_CODEX_HISTORY_BYTES);
               if(hash(output)!==a.afterHash)throw new Error('Rewritten history changed');
-              const projection=await prepareProjection(r.root,a.codexProjection!,input,output,a.slimOptions!,true);
+              const decodedInput=input?await decodeHistory(input,a.files[0].path):null,decodedOutput=await decodeHistory(output,a.files[0].path);
+              const projection=await prepareProjection(r.root,a.codexProjection!,decodedInput,decodedOutput,a.slimOptions!,true);
               try {await verifyHistoryDependencies(a,r.root);await projection.commit();}finally{projection.rollback();}
             }
             a.status='completed';updateTotal(r);await atomicJson(path,r);

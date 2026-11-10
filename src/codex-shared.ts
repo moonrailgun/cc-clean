@@ -10,7 +10,8 @@ import type { Action } from './clean.ts';
 import { physicalKey, scanRoot } from './scan.ts';
 import { existingDir, privateDir, within } from './state.ts';
 import { activityReason, type ActivityCheck } from './activity.ts';
-import { slimHistory, MAX_HISTORY_BYTES } from './slim.ts';
+import { MAX_CODEX_HISTORY_BYTES } from './slim.ts';
+import { decodeHistory, slimStoredHistory } from './history-codec.ts';
 import { decodeDuplicateHistory, previewProjection, prepareProjection, verifyProjectionBefore, verifyCodexRewriteLayout, type ProjectionReceipt } from './providers/codex-history.ts';
 
 export interface SharedHistory {
@@ -114,7 +115,7 @@ export async function readSharedFile(file: FileEntry): Promise<Buffer> {
   };
   try {
     await check();
-    if (file.size > MAX_HISTORY_BYTES) throw new Error('Shared history exceeds 64 MiB');
+    if (file.size > MAX_CODEX_HISTORY_BYTES) throw new Error('Shared history exceeds 512 MiB');
     const data = Buffer.alloc(file.size + 1); let length = 0;
     while (length < data.length) {const r = await handle.read(data, length, data.length - length, length); if (!r.bytesRead) break; length += r.bytesRead;}
     await check(); if (length !== file.size) throw new Error('Shared history size changed');
@@ -284,31 +285,33 @@ export async function applySharedHistory(a: Action, dir: string, check: Activity
     state = await verify();
   }
   const old = [...state.entries.values()].find(f => f && physicalKey(f) === physicalKey(original));
-  let input = old ? await readSharedFile(old) : null, output: Buffer;
+  const input = old ? await readSharedFile(old) : null;
+  let decodedInput: Buffer | null = null, decodedOutput: Buffer;
   if (a.kind === 'deduplicate-history') {
     const bytes = await readSharedFile(state.entries.get(a.files[1].path)!);
-    output = await decodeDuplicateHistory(bytes, original.size);
-    if (hash(bytes) !== a.afterHash || hash(output) !== a.beforeHash || input && !input.equals(output)) throw new Error('Shared compressed history differs from preview');
-    input = output;
+    decodedOutput = await decodeDuplicateHistory(bytes, original.size);
+    if (hash(bytes) !== a.afterHash || hash(decodedOutput) !== a.beforeHash || input && !input.equals(decodedOutput)) throw new Error('Shared compressed history differs from preview');
+    decodedInput = decodedOutput;
   } else if (input) {
-    const result = slimHistory(input, 'codex', a.slimOptions!);
+    const result = await slimStoredHistory(input, 'codex', original.path, a.slimOptions!);
     if (!result.output || result.output.length !== a.afterBytes || hash(result.output) !== a.afterHash) throw new Error('Shared transformation differs from preview');
-    output = result.output;
+    decodedInput = result.decodedInput; decodedOutput = result.decodedOutput!;
     if (!scope.outputIdentity) {
       const out = await open(outputPath, 'wx', original.mode & 0o777);
       try {
-        await out.writeFile(output); await out.chmod(original.mode & 0o777); await out.utimes(original.mtimeMs / 1000, original.mtimeMs / 1000); await out.sync();
+        await out.writeFile(result.output); await out.chmod(original.mode & 0o777); await out.utimes(original.mtimeMs / 1000, original.mtimeMs / 1000); await out.sync();
         const s = await out.stat(); scope.outputIdentity = {dev: s.dev, ino: s.ino};
       } finally {await out.close();}
       await syncDir(dir); await save();
     }
   } else {
     if (!state.complete || a.recoveryState !== 'applied') throw new Error('Original shared history backup is missing');
-    output = await readSharedFile(state.entries.get(original.path)!);
+    const output = await readSharedFile(state.entries.get(original.path)!);
+    if (hash(output) !== a.afterHash) throw new Error('Shared output differs from preview');
+    decodedOutput = await decodeHistory(output, original.path);
   }
-  if (a.kind === 'slim-history' && hash(output) !== a.afterHash) throw new Error('Shared output differs from preview');
   await verify();
-  const tx = await prepareSharedProjection(a, input, output, recovery);
+  const tx = await prepareSharedProjection(a, decodedInput, decodedOutput, recovery);
   try {
     await verifyHistoryDependencies(a, scope.homes[0].root);
     state = await verify();
@@ -341,7 +344,7 @@ export async function applySharedHistory(a: Action, dir: string, check: Activity
   } catch (error) {tx.rollback(); throw error;}
   a.status = 'completed'; a.recoveryState = 'applied'; await save();
   // Require every index to be at its committed after-state before discarding the original inode.
-  const committed = await prepareSharedProjection(a, null, output, true);
+  const committed = await prepareSharedProjection(a, null, decodedOutput, true);
   try {
     for (const name of ['next', '0.original', 'output']) {
       state = await verify();

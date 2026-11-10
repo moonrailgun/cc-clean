@@ -685,6 +685,22 @@ test('cleanup file rows group and rank savings, hide inactive effects and retain
   assert.deepEqual(p, original, 'formatting must not mutate the plan');
 });
 
+test('compressed history details explain stored savings without changing the plan', () => {
+  const p = inertPlan(), a = p.actions[0];
+  p.actions = [{...a, kind: 'slim-history', estimatedSavingsBytes: 1024,
+    files: [{...a.files[0], path: `${p.root}/sessions/history.jsonl.zst`}],
+    slimOptions: {removeImages: true, compactTools: false, removeReasoning: true},
+    slimCounts: {images: 2, toolOutputs: 0, reasoning: 3},
+    slimSavingsBytes: {images: 768, toolOutputs: 0, reasoning: 256}}];
+  const original = structuredClone(p), [provider] = cleanupFileNodes([p]);
+  const file = provider.children![0].children![0];
+  assert.equal(provider.bytes, 1024); assert.equal(file.bytes, 1024);
+  assert.match(file.detail!, /recompressed file size; operation amounts are proportional estimates/);
+  assert.match(file.detail!, /Remove inline images: 2 · 768 B/);
+  assert.match(file.detail!, /Remove encrypted reasoning: 3 · 256 B/);
+  assert.deepEqual(p, original);
+});
+
 test('cleanup folders rank known savings even when some estimates are unknown', () => {
   const p = inertPlan(), base = p.actions[0];
   p.actions = ([
