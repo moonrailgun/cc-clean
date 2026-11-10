@@ -607,7 +607,7 @@ async function recoverUnlocked(stateDir:string,check:ActivityCheck,operationIds?
         }catch(error){a.reason=(error as Error).message;pending=true;}
       }
       r.attributionComplete=!pending;r.status=pending?'needs-review':'interrupted';
-      // A later recovery scan cannot reconstruct the directory size when cleanup was interrupted.
+      // A later recovery scan would count unrelated writes; history.afterBytes derives the size from confirmed reductions.
       r.rootAfterBytes=null;r.finishedAt=new Date().toISOString();updateTotal(r);await atomicJson(path,r);await recordCleanup(stateDir,r);
     }
   }

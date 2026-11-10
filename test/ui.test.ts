@@ -688,6 +688,24 @@ test('shared results distinguish unstarted entries from interrupted and unknown 
   assert.match(output, /Continue rechecks safety/);
 });
 
+test('unfinished results explain why the after-size is unknown', t => {
+  const lines: string[] = [];
+  t.mock.method(console, 'log', (...args: unknown[]) => lines.push(args.join(' ')));
+  printReceipts([{ ...interruptedReceipt(), rootAfterBytes: null }]);
+  const unmeasured = stripVTControlCharacters(lines.join('\n'));
+  assert.match(unmeasured, /unknown\s+Directory after/);
+  assert.match(unmeasured, /Directory after and change are unknown: this cleanup stopped before its final size measurement/);
+  lines.length = 0;
+  printReceipts([{ ...interruptedReceipt(), rootAfterBytes: null, attributionComplete: true, confirmedReductionBytes: 10000 }]);
+  const derived = stripVTControlCharacters(lines.join('\n'));
+  assert.match(derived, /87\.89 KiB\s+Directory after/);
+  assert.match(derived, /9\.77 KiB\s+Directory change/);
+  assert.match(derived, /Directory after and change are derived from Confirmed reduction/);
+  lines.length = 0;
+  printReceipts([interruptedReceipt()]);
+  assert.doesNotMatch(stripVTControlCharacters(lines.join('\n')), /stopped before its final size measurement/);
+});
+
 async function cleanupTerminal(t: test.TestContext) {
   const term = await terminal(t);
   for (const [name, value] of [['stdin', term.context.input], ['stdout', term.context.output], ['stderr', term.context.output]] as const) {

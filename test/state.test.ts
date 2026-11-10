@@ -391,8 +391,9 @@ test('logging retains prior lines, updates recovered operations once, and never 
   await recordCleanup(state, r); await recordCleanup(state, r);
   const after = (await readFile(join(state, 'cleanup.jsonl'), 'utf8')).trim().split('\n');
   assert.equal(after.length, 2); assert.equal(after[1], before[1]);
-  assert.equal(JSON.parse(after[0]).savedBytes, null);
-  assert.equal((await readStats(state)).savedBytes, 19);
+  // No final scan ran, so the verified per-item reduction stands in for the measured difference.
+  assert.deepEqual([JSON.parse(after[0]).afterBytes, JSON.parse(after[0]).savedBytes, JSON.parse(after[0]).needsReview], [81, 19, false]);
+  assert.equal((await readStats(state)).savedBytes, 38);
   const preview = receipt(base); preview.status = 'dry-run';
   await recordCleanup(state, preview);
   assert.deepEqual(await readFile(join(state, 'cleanup.jsonl'), 'utf8'), after.join('\n') + '\n');
@@ -406,7 +407,7 @@ test('unknown measurements and unfinished actions are excluded; real growth stay
   r.rootAfterBytes = 105;
   await recordCleanup(state, r);
   assert.equal((await readStats(state)).savedBytes, -5);
-  const unknown = receipt(base); unknown.rootAfterBytes = null;
+  const unknown = receipt(base); unknown.rootAfterBytes = null; unknown.attributionComplete = false;
   await recordCleanup(state, unknown);
   const pending = receipt(base); pending.actions[0].recoveryState = 'applied';
   await recordCleanup(state, pending); await save(state, pending);

@@ -15,6 +15,13 @@ export function pendingReceipt(r: Receipt): boolean {
   return !r.attributionComplete || r.status === 'needs-review' || r.actions.some(a =>
     a.recoveryState !== 'finalized' || a.status === 'planned');
 }
+// An interrupted run never reaches its final scan, and a later scan would count unrelated writes.
+// Verified per-item reductions stand in once attribution is complete.
+export function afterBytes(r: Receipt): number | null {
+  if (r.rootAfterBytes !== null || !r.attributionComplete || r.rootBeforeBytes === null) return r.rootAfterBytes;
+  const derived = r.rootBeforeBytes - r.confirmedReductionBytes;
+  return derived >= 0 ? derived : null;
+}
 function validLog(value: unknown): asserts value is CleanupLog {
   const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
   const count = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
@@ -68,15 +75,16 @@ export async function recordCleanup(stateDir: string, r: Receipt): Promise<void>
     const type = action.sessionIds ? 'delete-sessions' : action.kind === 'compress-png' || action.kind === 'slim-history' || action.kind === 'deduplicate-history' ? action.kind : 'delete-files';
     counts.set(type, (counts.get(type) ?? 0) + (action.kind === 'deduplicate-history' ? 1 : action.sessionIds?.length ?? action.files.length));
   }
+  const after = afterBytes(r);
   const entry: CleanupLog = {
     schemaVersion: 1, operationId: r.operationId, provider: r.provider, root: r.root, source: r.source,
     ...(r.systemTemp ? {scope: 'system-temp' as const} : {}),
     startedAt: r.executionStartedAt, finishedAt: r.finishedAt, status: r.status,
-    beforeBytes: r.rootBeforeBytes, afterBytes: r.rootAfterBytes,
-    savedBytes: r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes,
+    beforeBytes: r.rootBeforeBytes, afterBytes: after,
+    savedBytes: r.rootBeforeBytes === null || after === null ? null : r.rootBeforeBytes - after,
     cleanedRecords: [...counts.values()].reduce((sum, n) => sum + n, 0),
     cleanupTypes: [...counts].map(([type, cleanedRecords]) => ({type, cleanedRecords})),
-    needsReview: pendingReceipt(r) || r.rootBeforeBytes === null || r.rootAfterBytes === null,
+    needsReview: pendingReceipt(r) || r.rootBeforeBytes === null || after === null,
   };
   validLog(entry);
   const entries = await readCleanupLog(stateDir), index = entries.findIndex(log => log.operationId === r.operationId);

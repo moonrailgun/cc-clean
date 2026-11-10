@@ -6,7 +6,7 @@ import { recoverOperations, type Plan, type Receipt } from './clean.ts';
 import { report, plan, cleanupPlans, includesSystemTemp, execute, CLAUDE_FILE_CLEANUP_NOTICE } from './app.ts';
 import { systemTempLabels } from './system-temp.ts';
 import { readStats } from './stats.ts';
-import type { CleanupLog } from './history.ts';
+import { afterBytes, type CleanupLog } from './history.ts';
 import { directoryEntries, scanRoot } from './scan.ts';
 import { select, checkbox, withProgress, safe, size, paint, fit, columns, screen, storageRow, table, tree, pager, type Choice, type TreeNode } from './terminal.ts';
 export { safe, size } from './terminal.ts';
@@ -198,7 +198,8 @@ export function printReceipts(receipts: Receipt[]) {
     title(`${providerName(r.provider)}${r.systemTemp ? ' · System temporary files' : ''} · ${r.status}`, r.root);
     console.log(paint(r.attributionComplete ? 'green' : 'yellow', `  Confirmed reduction: ${r.attributionComplete ? size(r.confirmedReductionBytes) : 'needs review'}`));
     const scope = r.systemTemp ? 'Matched temp files' : 'Directory';
-    rows([{ label: `${scope} before`, value: size(r.rootBeforeBytes) }, { label: `${scope} after`, value: size(r.rootAfterBytes) }, { label: `${scope} change`, value: size(r.rootBeforeBytes === null || r.rootAfterBytes === null ? null : r.rootBeforeBytes - r.rootAfterBytes) }]);
+    const after = afterBytes(r);
+    rows([{ label: `${scope} before`, value: size(r.rootBeforeBytes) }, { label: `${scope} after`, value: size(after) }, { label: `${scope} change`, value: size(r.rootBeforeBytes === null || after === null ? null : r.rootBeforeBytes - after) }]);
     for (const state of ['Completed', 'Pending finalization', 'Not started', 'Skipped', 'Failed'])
       line(`  ${state}: ${r.actions.filter(a => actionResult(a) === state).length} items`);
     const reasons = new Map<string, number>();
@@ -209,11 +210,15 @@ export function printReceipts(receipts: Receipt[]) {
     for (const [reason, count] of [...reasons].sort((a, b) => b[1] - a[1]).slice(0, 5))
       line(fit(`  ${count} × ${reason}`, Math.max(40, columns())));
     if (reasons.size > 5) note(`${reasons.size - 5} more reason types in View details.`);
+    if (after !== null && r.rootAfterBytes === null)
+      note(`${scope} after and change are derived from Confirmed reduction: this cleanup stopped before its final size measurement.`);
+    else if (unfinished(r) && after === null)
+      note(`${scope} after and change are unknown: this cleanup stopped before its final size measurement, and a later scan would count unrelated changes.`);
     if (unfinished(r)) note('Continue rechecks safety and finishes interrupted operations before Retry can start new work.');
     else if (recoveryNeeded(r)) note('Continue finishes recording this interrupted operation; all file changes are already finalized.');
     if (r.actions.some(a => actionResult(a) !== 'Completed' && /client|active session|open files|writer/i.test(a.reason ?? '')))
       note('Activity reasons above are from the last check. Continue or Retry checks individual sessions again; idle open sessions stay protected.');
-    if (!unfinished(r) && (!r.attributionComplete || r.rootAfterBytes === null))
+    if (!unfinished(r) && (!r.attributionComplete || after === null))
       note('Savings need review; no unfinished file changes remain. Recovery cannot reconstruct earlier directory sizes.');
     if (r.actions.some(a => a.reason) || r.warnings.length) note(`Full paths, reasons and ${r.warnings.length} scan notices: View details, or use --json.`);
   }
