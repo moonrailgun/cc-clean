@@ -10,7 +10,7 @@ export interface Inventory {
   totalBytes: number; allocatedBytes: number; errors: string[];
 }
 export interface ScanProgress {
-  phase: 'discovering' | 'sessions' | 'index' | 'finalizing' | 'estimating' | 'cleaning';
+  phase: 'discovering' | 'sessions' | 'index' | 'finalizing' | 'activity' | 'estimating' | 'cleaning';
   completed: number; total: number | null;
   processedBytes?: number; totalBytes?: number; currentFile?: string;
 }

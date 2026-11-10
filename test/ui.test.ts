@@ -373,6 +373,22 @@ test('tree abort restores input, cursor and resize listeners', async t => {
   assert.ok(term.text().includes('\x1b[?25h'));
 });
 
+test('activity and estimate progress draw a bar from item counts', async t => {
+  const term = await terminal(t);
+  await withProgress({ message: 'Deep Scan Before Cleanup' }, async (_signal, update) => {
+    update({ phase: 'activity', completed: 250, total: 1000 });
+    await setTimeout(120);
+    const activity = stripVTControlCharacters(term.text());
+    assert.match(activity, /Checking for open sessions…/);
+    assert.match(activity, /250 \/ 1000 candidate paths checked/);
+    assert.match(activity, /█+░+\s+25\.0%/);
+    assert.doesNotMatch(activity, / B \/ /);
+    update({ phase: 'estimating', completed: 1, total: 2 });
+    await setTimeout(120);
+    assert.match(stripVTControlCharacters(term.text()), /50\.0%/);
+  }, term.context);
+});
+
 test('scan progress shows counts, returns results, and propagates failures', async t => {
   const term = await terminal(t);
   const value = await withProgress({ message: 'Deep Scan' }, async (_signal, update) => {

@@ -32,7 +32,7 @@ export async function plan(config: Config, provider: Provider, options: CleanupO
   let version = 'unknown';
   if (provider === 'codex' && inventory.exists) { try { version = await getCodexVersion(); } catch { /* Native session deletion requires a verified CLI version. */ } }
   const result = await createPlan(inventory, {
-    version, source: options.manual ? 'analyze' : 'clean', sessions: analysis.sessions,
+    onProgress, version, source: options.manual ? 'analyze' : 'clean', sessions: analysis.sessions,
     sessionIds: options.sessions, filePaths: options.files, bulkSelection: options.bulkSelection, deleteImages: options.deleteImages,
     slim: { removeImages: !!options.removeImages, compactTools: !!options.compactTools, removeReasoning: !!options.removeReasoning, removeRequestArchives: !!options.removeRequestArchives, compactHooks: !!options.compactHooks, compactToolDefinitions: !!options.compactToolDefinitions, compactSkillListings: !!options.compactSkillListings, removeOldSnapshots: !!options.removeOldSnapshots }, includeFileCleanup: options.includeFileCleanup,
     otherRoots: [config.roots[provider === 'claude' ? 'codex' : 'claude']],

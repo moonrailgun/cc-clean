@@ -45,7 +45,7 @@ export interface Receipt extends Plan {
   rootBeforeBytes:number|null;rootAfterBytes:number|null;confirmedReductionBytes:number;
   attributionComplete:boolean;executionStartedAt?:string;finishedAt?:string;
 }
-interface PlanOptions {now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];bulkSelection?:boolean;deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;tempOnly?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
+interface PlanOptions {onProgress?:(progress:ScanProgress)=>void;now?:number;version?:string;source?:'clean'|'analyze';filePaths?:string[];bulkSelection?:boolean;deleteImages?:boolean;sessions?:Session[];sessionIds?:string[];otherRoots?:string[];slim?:SlimOptions;includeFileCleanup?:boolean;tempOnly?:boolean;systemTemp?:SystemTempScope;checkActivity?:ActivityCheck}
 export function singleSelectedTarget(options:Pick<PlanOptions,'filePaths'|'sessionIds'|'bulkSelection'>):string|undefined {
   if(options.bulkSelection)return undefined;
   const targets=[...new Set([...(options.filePaths??[]),...(options.sessionIds??[])])];
@@ -69,9 +69,9 @@ export function protectRecentContent(plan:Plan,now=Date.now()):Plan {
   });
   return plan;
 }
-export async function protectActiveContent(plan:Plan,check:ActivityCheck=defaultActivity):Promise<Plan> {
+export async function protectActiveContent(plan:Plan,check:ActivityCheck=defaultActivity,onProgress?:(progress:ScanProgress)=>void):Promise<Plan> {
   if(!plan.actions.length)return plan;
-  const reasons=await planActivity(plan,check);
+  const reasons=await planActivity(plan,check,plan.actions,undefined,onProgress);
   plan.actions=plan.actions.filter(a=>!reasons.has(a));
   for(const reason of new Set(reasons.values()))plan.warnings.push(`Activity protection: ${reason}`);
   return plan;
@@ -139,7 +139,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   if(options.systemTemp) {
     for(const f of inv.files)if(eligible(f)&&f.uid===options.systemTemp.uid&&!tempExcluded(f.path,options.systemTemp)&&scopedTempKind(inv.root,f.path,inv.provider,options.systemTemp))
       plan.actions.push(makeAction('delete-files',f.relative,[f]));
-    return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
+    return protectActiveContent(protectRecentContent(plan,now),options.checkActivity,options.onProgress);
   }
   if(options.sessionIds?.length) {
     const sessions=options.sessions??[];
@@ -163,7 +163,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
       await verifyCodexDeleteCapabilities(inv.root);
       plan.codexIndexFingerprint=index.fingerprint;
     }
-    return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
+    return protectActiveContent(protectRecentContent(plan,now),options.checkActivity,options.onProgress);
   }
   const selected=options.filePaths?new Set(options.filePaths):null;
   if(selected&&[...selected].some(p=>!inv.files.some(f=>f.path===p)))throw new Error('Selection contains unknown files');
@@ -184,7 +184,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
         plan.actions.push({...makeAction('slim-history',f.relative,[f]),slimOptions:{...options.slim},codexShared});
       }catch(error){plan.warnings.push(`${f.relative}: ${(error as Error).message}`);}
     }
-    if(!options.includeFileCleanup)return protectActiveContent(protectRecentContent(plan,now),options.checkActivity);
+    if(!options.includeFileCleanup)return protectActiveContent(protectRecentContent(plan,now),options.checkActivity,options.onProgress);
   }
   const stateValid=inv.provider==='codex'&&await validState(inv.root);
   if(inv.provider==='codex'&&!options.tempOnly) {
@@ -217,7 +217,7 @@ export async function createPlan(inv:Inventory,options:PlanOptions={}):Promise<P
   }
   protectRecentContent(plan,now);
   if(selected&&plan.actions.length===0)plan.warnings.push('Selected files have no eligible operations');
-  return protectActiveContent(plan,options.checkActivity);
+  return protectActiveContent(plan,options.checkActivity,options.onProgress);
 }
 async function verifyFile(root:string,f:FileEntry,plan?:Plan) {
   if(plan?.systemTemp)await verifySystemTempParents(root,f.path,plan.provider,plan.systemTemp);
@@ -237,7 +237,7 @@ async function readDuplicate(root:string,a:Action,signal?:AbortSignal,preview=fa
 }
 export async function estimateSavings(plan:Plan,signal?:AbortSignal,onProgress?:(progress:ScanProgress)=>void) {
   signal?.throwIfAborted();
-  await protectActiveContent(plan);
+  await protectActiveContent(plan,undefined,onProgress);
   for(const [index,action] of plan.actions.entries()) {
     signal?.throwIfAborted();
     onProgress?.({phase:'estimating',completed:index,total:plan.actions.length,currentFile:action.targetId});
@@ -348,14 +348,20 @@ async function currentHash(root:string,path:string,limit=MAX_PNG_BYTES):Promise<
 }
 function updateTotal(r:Receipt) {r.confirmedReductionBytes=r.actions.reduce((n,a)=>n+(a.status==='completed'?a.beforeBytes-a.afterBytes:0),0);}
 const scanPlanScope=(p:Plan)=>p.systemTemp?scanSystemTemp(p.root,p.provider,p.systemTemp):scanRoot(p.root,p.provider);
-async function planActivity(p:Plan,check:ActivityCheck,actions=p.actions,openPaths?:string[]) {
+async function planActivity(p:Plan,check:ActivityCheck,actions=p.actions,openPaths?:string[],onProgress?:(progress:ScanProgress)=>void) {
   const reasons=new Map<Action,string>();
   const scopes=p.systemTemp?.session?(['claude','codex'] as const).map(provider=>({provider,root:p.systemTemp!.session!.roots[provider]})):
     [...new Set([p.root,...actions.flatMap(a=>a.codexShared?.homes.map(h=>h.root)??[])])].map(root=>({provider:p.provider,root}));
-  for(const {provider,root} of scopes) {
-    const relevant=actions.filter(a=>p.systemTemp?.session||root===p.root||a.codexShared?.homes.some(h=>h.root===root));
-    const paths=openPaths??[...new Set(relevant.flatMap(a=>sharedFiles(a).map(f=>f.path)))];
-    const result=await check(provider,root,paths).catch(()=>'Cannot reliably check client activity');
+  const work=scopes.map(scope=>{
+    const relevant=actions.filter(a=>p.systemTemp?.session||scope.root===p.root||a.codexShared?.homes.some(h=>h.root===scope.root));
+    return {...scope,relevant,paths:openPaths??[...new Set(relevant.flatMap(a=>sharedFiles(a).map(f=>f.path)))]};
+  });
+  const total=work.reduce((n,w)=>n+w.paths.length,0);let done=0;
+  onProgress?.({phase:'activity',completed:0,total});
+  for(const {provider,root,relevant,paths} of work) {
+    const result=await check(provider,root,paths,(completed,batches)=>onProgress?.({phase:'activity',completed:done+Math.round(paths.length*completed/batches),total}))
+      .catch(()=>'Cannot reliably check client activity');
+    done+=paths.length;
     for(const a of relevant) {
       const ownedPaths=p.systemTemp?.session?[p.systemTemp.session.source]:sharedFiles(a).map(f=>f.path);
       const reason=activityReason(result,root,openPaths??sharedFiles(a).map(f=>f.path),a.sessionIds,ownedPaths);

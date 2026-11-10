@@ -5,7 +5,18 @@ import { claudeActiveSessions, claudeSessionOwner, type ActivityCommand, type Ac
 import { codexActiveSessions, codexSessionOwners } from './codex-activity.ts';
 const exec=promisify(execFile);
 export type ActivityResult=string|null|{sessionIds:string[];openFiles:string[];codexOwners?:Record<string,string[]>};
-export type ActivityCheck=(provider:Provider,root:string,files?:string[])=>Promise<ActivityResult>;
+export type ActivityCheck=(provider:Provider,root:string,files?:string[],onProgress?:(completed:number,total:number)=>void)=>Promise<ActivityResult>;
+// lsof rescans every process on each call, so candidates are batched by argument bytes instead of a small count.
+const LSOF_BATCH_BYTES=128*1024;
+function lsofBatches(files:string[]):string[][] {
+  const batches:string[][]=[];let bytes=0;
+  for(const file of files) {
+    const size=Buffer.byteLength(file)+1;
+    if(!batches.length||bytes+size>LSOF_BATCH_BYTES){batches.push([]);bytes=0;}
+    batches.at(-1)!.push(file);bytes+=size;
+  }
+  return batches;
+}
 export function activityReason(result:ActivityResult,root:string,files:string[],sessionIds:string[]=[],ownershipPaths=files):string|null {
   if(typeof result==='string'||result===null)return result;
   if(result.openFiles.some(path=>files.includes(path)))return 'Candidate contains open files; close the writer first';
@@ -23,7 +34,7 @@ export function activityReason(result:ActivityResult,root:string,files:string[],
   if(!owners.length||owners.some(id=>!id))return 'Cannot associate candidate files with a Claude session while clients are running';
   return null;
 }
-export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platform=process.platform,readMetadata?:ActivityMetadata):ActivityCheck=>async(provider,root,files)=>{
+export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platform=process.platform,readMetadata?:ActivityMetadata):ActivityCheck=>async(provider,root,files,onProgress)=>{
   if(platform!=='darwin') return 'Mutations are not verified on this platform; analysis only';
   try {
     const {stdout}=await run('/bin/ps',['-axo','comm='],{timeout:5000,maxBuffer:4*1024*1024});
@@ -46,9 +57,9 @@ export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platf
       if(!files)return 'Clients are running; candidate paths are required for session activity checks';
     }
     // Explicit files must never fall back to a recursive scan of a shared system temp directory.
-    const targets = files ? Array.from({length: Math.ceil(files.length / 100)}, (_, i) => ['--', ...files.slice(i * 100, (i + 1) * 100)]) : [['+D', root]];
+    const targets = files ? lsofBatches(files).map(batch => ['--', ...batch]) : [['+D', root]];
     const openFiles:string[]=[];
-    for (const target of targets) {
+    for (const [index, target] of targets.entries()) {
       let opened:string;
       // The current process may hold the coordinated SQLite write transaction.
       try {
@@ -67,6 +78,7 @@ export const createActivityCheck=(run:ActivityCommand=exec,platform:NodeJS.Platf
         if(!names.length||names.some(path=>!files.includes(path)))return 'Cannot reliably check open files';
         openFiles.push(...names);
       }
+      onProgress?.(index+1,targets.length);
     }
     return sessionIds.length||openFiles.length?{sessionIds,openFiles:[...new Set(openFiles)],...provider==='codex'?{codexOwners:await codexSessionOwners(sessionIds.length?files??[]:[])}:{}}:null;
   } catch {return 'Cannot reliably check client activity';}

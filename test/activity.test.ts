@@ -61,12 +61,18 @@ test('open candidate files and unreliable OS inspection remain protected', async
 });
 
 test('external candidates are checked in bounded batches without recursively scanning shared temp roots', async () => {
-  const f = fixture(), files = Array.from({length: 205}, (_, i) => `/tmp/candidate-${i}`);
-  assert.equal(await f.check('claude', '/tmp', files), null);
-  const scans = f.calls.filter(c => c.file.endsWith('lsof'));
+  // lsof rescans every process per call, so batches are bounded by argument bytes rather than a small count.
+  const f = fixture(), files = Array.from({length: 3000}, (_, i) => `/tmp/${'candidate'.repeat(10)}-${String(i).padStart(5, '0')}`);
+  const progress: number[][] = [];
+  assert.equal(await f.check('claude', '/tmp', files, (completed, total) => progress.push([completed, total])), null);
+  const scans = f.calls.filter(c => c.file.endsWith('lsof')), names = (c: typeof scans[number]) => c.args.slice(c.args.indexOf('--') + 1);
   assert.equal(scans.length, 3);
-  assert.ok(scans.every(c => !c.args.includes('+D')));
-  assert.deepEqual(scans.flatMap(c => c.args.slice(c.args.indexOf('--') + 1)), files);
+  assert.ok(scans.every(c => !c.args.includes('+D') && names(c).join('\0').length <= 128 * 1024));
+  assert.deepEqual(scans.flatMap(names), files);
+  assert.deepEqual(progress, [[1, 3], [2, 3], [3, 3]]);
+  const small = fixture();
+  await small.check('claude', '/tmp', files.slice(0, 205));
+  assert.equal(small.calls.filter(c => c.file.endsWith('lsof')).length, 1);
 });
 
 test('macOS lsof exit 1 may contain matched candidates alongside closed files', async () => {

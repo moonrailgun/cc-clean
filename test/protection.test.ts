@@ -39,6 +39,18 @@ test('session temporary files require strict age and both providers closed', asy
   }
 });
 
+test('activity protection reports path progress across every checked scope', async () => {
+  const p = plan([action('slim-history', cutoff - 1, '/inert/a.jsonl'), action('slim-history', cutoff - 1, '/inert/b.jsonl')]);
+  const seen: [number, number | null][] = [];
+  await protectActiveContent(p, async (_provider, _root, paths, onProgress) => {
+    assert.deepEqual(paths, ['/inert/a.jsonl', '/inert/b.jsonl']);
+    onProgress?.(1, 2); onProgress?.(2, 2);
+    return null;
+  }, progress => { assert.equal(progress.phase, 'activity'); seen.push([progress.completed, progress.total]); });
+  assert.deepEqual(seen, [[0, 2], [1, 2], [2, 2]]);
+  assert.equal(p.actions.length, 2);
+});
+
 test('temporary scopes run before evidence-changing history plans without mutating the list', () => {
   const history = plan([action('slim-history')]), temp = plan([action()]), fixed = plan([action()]);
   temp.systemTemp = {uid: 501, excludedRoots: [], session: sessionTemp};
