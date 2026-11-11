@@ -3,6 +3,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { systemTextFilters, filterJson, summarizeDependencies } from '../src/vendor/rtk-native-system-text.ts';
+import { filterRtkOutput, matchRtkFilter } from '../src/vendor/rtk.ts';
+
+test('ast-grep caps large per-file matches and retains counts and file order', () => {
+  const rows = Array.from({length: 60000}, (_, i) => `x.ts:${i + 1}:x`);
+  const input = [...rows, 'y.ts:1:y'].join('\n') + '\n';
+  const filter = matchRtkFilter(['ast-grep', 'run', '-p', '$A', 'x.ts', 'y.ts']);
+  assert.equal(filter, 'native:ast-grep');
+  assert.ok(Buffer.byteLength(input) < 1_048_576);
+  assert.equal(filterRtkOutput(filter!, input),
+    [...rows.slice(0, 10), '  … 59990 more match line(s) in x.ts', 'y.ts:1:y'].join('\n') + '\n');
+});
 
 test('black retains the upstream colon-path and count behavior', () => {
   assert.equal(systemTextFilters.black('would reformat: /project/src/a.py\nOh no! 💥 💔 💥\n1 file would be reformatted, 2 files would be left unchanged.\n'), 'Format (black): 1 files need formatting\n1. src/a.py\n\n2 files already formatted\n\n[hint] Run `black .` to format these files');

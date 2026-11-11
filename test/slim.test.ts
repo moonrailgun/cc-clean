@@ -402,7 +402,8 @@ test('RTK ports cap groups and preserve failures, warnings, controls and unknown
   const pytest = '================ test session starts ================\nplatform darwin -- Python 3.12\ncollected 20 items\ntests/test_example.py .................... [100%]\n================ 20 passed in 0.02s ================\n';
   assert.equal(filterRtkOutput('pytest', pytest), 'Pytest: 20 passed in 0.02s');
   for (const [filter, original] of [['cargo-test', cargo], ['pytest', pytest], ['grep', matches]] as const) {
-    for (const text of [original + '\nwarning: details', original + '\nerror: details', '\x1b[32m' + original, original + '\r']) assert.equal(filterRtkOutput(filter, text), text);
+    for (const text of [original + '\nwarning: details', original + '\nerror: details', '\x1b[2J' + original, original + '\r']) assert.equal(filterRtkOutput(filter, text), text);
+    assert.equal(filterRtkOutput(filter, '\x1b[32m' + original + '\x1b[0m'), filterRtkOutput(filter, original));
   }
   assert.equal(filterRtkOutput('cargo-test', cargo.replace('0 failed', '1 failed')), cargo.replace('0 failed', '1 failed'));
   assert.equal(filterRtkOutput('grep', 'a.ts:1:short'), 'a.ts:1:short');
