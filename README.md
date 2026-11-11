@@ -38,4 +38,4 @@ See the [full guide](docs/usage.md) for CLI options, agent/JSON usage, configura
 
 Licensed under [MIT](LICENSE), except for third-party code covered by its own license.
 
-Menu navigation is inspired by [Mole](https://github.com/tw93/mole). Shell-output compaction uses modified TypeScript ports of selected [RTK CLI](https://github.com/rtk-ai/rtk) filters (© 2026 RTK AI Labs), licensed under [Apache-2.0](third_party/rtk/LICENSE). See [ported functions and source details](third_party/rtk/UPSTREAM.md).
+Menu navigation is inspired by [Mole](https://github.com/tw93/mole). Shell-output compaction uses TypeScript ports of the Apache-2.0 [RTK CLI](https://github.com/rtk-ai/rtk) filters (© 2026 RTK AI Labs), licensed under [Apache-2.0](third_party/rtk/LICENSE). The pinned port covers all 23 pipe groups, 62 built-in rules and native historical-text filters. See [coverage, format limits and source details](third_party/rtk/UPSTREAM.md).
