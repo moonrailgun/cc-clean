@@ -1,0 +1,908 @@
+[
+  {
+    "filter": "ansible-playbook",
+    "name": "strips ok and skipping lines, keeps changed and failures",
+    "input": "PLAY [all] *********************************************************************\n\nTASK [Gathering Facts] *********************************************************\nok: [web01]\nok: [web02]\n\nTASK [Install nginx] ***********************************************************\nchanged: [web01]\nskipping: [web02]\n\nPLAY RECAP *********************************************************************\nweb01                      : ok=2    changed=1    unreachable=0    failed=0\nweb02                      : ok=1    changed=0    unreachable=0    failed=0\n",
+    "expected": "PLAY [all] *********************************************************************\nTASK [Gathering Facts] *********************************************************\nTASK [Install nginx] ***********************************************************\nchanged: [web01]\nPLAY RECAP *********************************************************************\nweb01                      : ok=2    changed=1    unreachable=0    failed=0\nweb02                      : ok=1    changed=0    unreachable=0    failed=0"
+  },
+  {
+    "filter": "ansible-playbook",
+    "name": "failed task preserved",
+    "input": "TASK [Start service] ***\nfailed: [web01] => {\"msg\": \"Service not found\"}\nPLAY RECAP ***\nweb01 : ok=1 failed=1",
+    "expected": "TASK [Start service] ***\nfailed: [web01] => {\"msg\": \"Service not found\"}\nPLAY RECAP ***\nweb01 : ok=1 failed=1"
+  },
+  {
+    "filter": "basedpyright",
+    "name": "strips noise, keeps errors and summary",
+    "input": "basedpyright 1.22.0\nSearching for source files\nFound 42 source files\n\n/home/user/app/main.py\n  /home/user/app/main.py:10:5 - error: \"foo\" is not defined (reportUndefinedVariable)\n  /home/user/app/main.py:25:1 - error: Type \"str\" is not assignable to type \"int\" (reportAssignmentType)\n\n/home/user/app/utils.py\n  /home/user/app/utils.py:8:9 - warning: Variable \"x\" is not accessed (reportUnusedVariable)\n\n3 errors, 1 warning, 0 informations\n",
+    "expected": "/home/user/app/main.py\n  /home/user/app/main.py:10:5 - error: \"foo\" is not defined (reportUndefinedVariable)\n  /home/user/app/main.py:25:1 - error: Type \"str\" is not assignable to type \"int\" (reportAssignmentType)\n/home/user/app/utils.py\n  /home/user/app/utils.py:8:9 - warning: Variable \"x\" is not accessed (reportUnusedVariable)\n3 errors, 1 warning, 0 informations"
+  },
+  {
+    "filter": "basedpyright",
+    "name": "clean output",
+    "input": "basedpyright 1.22.0\nSearching for source files\nFound 10 source files\n\n0 errors, 0 warnings, 0 informations\n",
+    "expected": "0 errors, 0 warnings, 0 informations"
+  },
+  {
+    "filter": "basedpyright",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "basedpyright: ok"
+  },
+  {
+    "filter": "biome",
+    "name": "lint strips noise, keeps diagnostics",
+    "input": "Checked 42 files in 0.5s\n\nsrc/app.tsx:5:3 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━\n  × Unexpected any. Specify a different type.\n  3 │ interface Props {\n  4 │   data: any;\n  5 │         ^^^\n\nsrc/utils.ts:12:1 lint/complexity/noForEach ━━━━━━━━━━━━━━━━━━━━\n  × Prefer for...of instead of forEach.\n 12 │ items.forEach(item => process(item));\n    │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\nFound 2 errors.\n",
+    "expected": "src/app.tsx:5:3 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━\n  × Unexpected any. Specify a different type.\n  3 │ interface Props {\n  4 │   data: any;\n  5 │         ^^^\nsrc/utils.ts:12:1 lint/complexity/noForEach ━━━━━━━━━━━━━━━━━━━━\n  × Prefer for...of instead of forEach.\n 12 │ items.forEach(item => process(item));\n    │ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFound 2 errors."
+  },
+  {
+    "filter": "biome",
+    "name": "clean check",
+    "input": "Checked 42 files in 0.3s\n",
+    "expected": "biome: ok"
+  },
+  {
+    "filter": "biome",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "biome: ok"
+  },
+  {
+    "filter": "brew-install",
+    "name": "already installed short-circuits",
+    "input": "Warning: rtk 0.27.1 is already installed and up-to-date.\nTo reinstall 0.27.1, run:\n  brew reinstall rtk\n",
+    "expected": "ok (already installed)"
+  },
+  {
+    "filter": "brew-install",
+    "name": "install strips download lines",
+    "input": "==> Fetching jq\n==> Downloading https://homebrew.bintray.com/bottles/jq-1.7.1.arm64_sonoma.bottle.tar.gz\n######################################################################## 100.0%\n==> Pouring jq-1.7.1.arm64_sonoma.bottle.tar.gz\n==> Summary\n/opt/homebrew/Cellar/jq/1.7.1: 18 files, 1.2MB\n",
+    "expected": "==> Summary\n/opt/homebrew/Cellar/jq/1.7.1: 18 files, 1.2MB"
+  },
+  {
+    "filter": "bundle-install",
+    "name": "all cached short-circuits",
+    "input": "Using bundler 2.5.6\nUsing rake 13.1.0\nUsing ast 2.4.2\nUsing base64 0.2.0\nUsing minitest 5.22.2\nBundle complete! 85 Gemfile dependencies, 200 gems now installed.\nUse `bundle info [gemname]` to see where a bundled gem is installed.\n",
+    "expected": "ok bundle: complete"
+  },
+  {
+    "filter": "bundle-install",
+    "name": "mixed install keeps Fetching and Installing lines",
+    "input": "Fetching gem metadata from https://rubygems.org/.........\nResolving dependencies...\nUsing rake 13.1.0\nUsing ast 2.4.2\nFetching rspec 3.13.0\nInstalling rspec 3.13.0\nUsing rubocop 1.62.0\nFetching simplecov 0.22.0\nInstalling simplecov 0.22.0\nBundle complete! 85 Gemfile dependencies, 202 gems now installed.\n",
+    "expected": "ok bundle: complete"
+  },
+  {
+    "filter": "bundle-install",
+    "name": "update output",
+    "input": "Fetching gem metadata from https://rubygems.org/.........\nResolving dependencies...\nUsing rake 13.1.0\nFetching rspec 3.14.0 (was 3.13.0)\nInstalling rspec 3.14.0 (was 3.13.0)\nBundle updated!\n",
+    "expected": "ok bundle: updated"
+  },
+  {
+    "filter": "bundle-install",
+    "name": "empty output",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "composer-install",
+    "name": "nothing to do short-circuits",
+    "input": "Loading composer repositories with package information\nUpdating dependencies\nLock file operations: 0 installs, 0 updates, 0 removals\nNothing to install, update or remove\nGenerating autoload files\n",
+    "expected": "ok (up to date)"
+  },
+  {
+    "filter": "composer-install",
+    "name": "install strips download lines",
+    "input": "Loading composer repositories with package information\nUpdating dependencies\n  - Downloading symfony/console (v6.4.0)\n  - Installing symfony/console (v6.4.0): Extracting archive\n  - Downloading psr/log (3.0.0)\n  - Installing psr/log (3.0.0): Extracting archive\nWriting lock file\nGenerating autoload files\n",
+    "expected": "Writing lock file\nGenerating autoload files"
+  },
+  {
+    "filter": "df",
+    "name": "short output passes through unchanged",
+    "input": "Filesystem     1K-blocks   Used Available Use% Mounted on\n/dev/sda1        4096000 123456   3972544   4% /",
+    "expected": "Filesystem     1K-blocks   Used Available Use% Mounted on\n/dev/sda1        4096000 123456   3972544   4% /"
+  },
+  {
+    "filter": "df",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "dotnet-build",
+    "name": "successful build short-circuits to ok",
+    "input": "Microsoft (R) Build Engine version 17.8.3+195e7f5a3\nCopyright (C) Microsoft Corporation. All rights reserved.\n\n  Determining projects to restore...\n  All projects are up-to-date for restore.\n  MyApp -> /home/user/MyApp/bin/Debug/net8.0/MyApp.dll\n\nBuild succeeded.\n    0 Warning(s)\n    0 Error(s)\n\nTime Elapsed 00:00:02.34\n",
+    "expected": "ok (build succeeded)"
+  },
+  {
+    "filter": "dotnet-build",
+    "name": "build with warnings not short-circuited",
+    "input": "Microsoft (R) Build Engine version 17.8.3+195e7f5a3\nCopyright (C) Microsoft Corporation. All rights reserved.\n\n  Determining projects to restore...\n  MyApp -> /home/user/MyApp/bin/Debug/net8.0/MyApp.dll\n\nBuild succeeded.\n    3 Warning(s)\n    0 Error(s)\n\nTime Elapsed 00:00:01.87\n",
+    "expected": "  MyApp -> /home/user/MyApp/bin/Debug/net8.0/MyApp.dll\nBuild succeeded.\n    3 Warning(s)\n    0 Error(s)\nTime Elapsed 00:00:01.87"
+  },
+  {
+    "filter": "dotnet-build",
+    "name": "build errors pass through",
+    "input": "Microsoft (R) Build Engine version 17.8.3+195e7f5a3\nCopyright (C) Microsoft Corporation. All rights reserved.\n\n  Determining projects to restore...\nsrc/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]\n\nBuild FAILED.\n    0 Warning(s)\n    1 Error(s)\n",
+    "expected": "src/Program.cs(10,5): error CS1002: ; expected [/home/user/MyApp/MyApp.csproj]\nBuild FAILED.\n    0 Warning(s)\n    1 Error(s)"
+  },
+  {
+    "filter": "du",
+    "name": "preserves sizes, strips blank lines",
+    "input": "4.0K\t./src\n\n8.0K\t./tests\n16K\t.",
+    "expected": "4.0K\t./src\n8.0K\t./tests\n16K\t."
+  },
+  {
+    "filter": "du",
+    "name": "single line passthrough",
+    "input": "128K\t.",
+    "expected": "128K\t."
+  },
+  {
+    "filter": "fail2ban-client",
+    "name": "strips blank lines",
+    "input": "Status for the jail: sshd\n|- Filter\n|  |- Currently failed: 3\n\n|- Actions\n   `- Total banned: 42",
+    "expected": "Status for the jail: sshd\n|- Filter\n|  |- Currently failed: 3\n|- Actions\n   `- Total banned: 42"
+  },
+  {
+    "filter": "fail2ban-client",
+    "name": "single line passthrough",
+    "input": "Shutdown successful",
+    "expected": "Shutdown successful"
+  },
+  {
+    "filter": "gcc",
+    "name": "strips include chain, keeps errors and warnings",
+    "input": "In file included from /usr/include/stdio.h:42:\n                 from main.c:1:\nmain.c:10:5: error: use of undeclared identifier 'foo'\n    foo();\n    ^\nmain.c:15:12: warning: unused variable 'x' [-Wunused-variable]\n    int x = 42;\n        ^\n2 warnings generated.\n1 error generated.\n",
+    "expected": "main.c:10:5: error: use of undeclared identifier 'foo'\n    foo();\n    ^\nmain.c:15:12: warning: unused variable 'x' [-Wunused-variable]\n    int x = 42;\n        ^"
+  },
+  {
+    "filter": "gcc",
+    "name": "clean compilation",
+    "input": "",
+    "expected": "gcc: ok"
+  },
+  {
+    "filter": "gcc",
+    "name": "linker error kept",
+    "input": "/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'\ncollect2: error: ld returned 1 exit status\n",
+    "expected": "/usr/bin/ld: /tmp/main.o: undefined reference to 'missing_func'\ncollect2: error: ld returned 1 exit status"
+  },
+  {
+    "filter": "gcc",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "gcc: ok"
+  },
+  {
+    "filter": "gcloud",
+    "name": "strips blank lines, preserves output",
+    "input": "Updated property [core/project].\n\nNAME        REGION        STATUS\nmy-cluster  us-central1   RUNNING\n",
+    "expected": "Updated property [core/project].\nNAME        REGION        STATUS\nmy-cluster  us-central1   RUNNING"
+  },
+  {
+    "filter": "gcloud",
+    "name": "single line passthrough",
+    "input": "Listed 0 items.",
+    "expected": "Listed 0 items."
+  },
+  {
+    "filter": "hadolint",
+    "name": "Dockerfile warnings kept, blank lines stripped",
+    "input": "Dockerfile:3 DL3008 warning: Pin versions in apt-get install\nDockerfile:5 DL3009 info: Delete apt-get lists after installing\n\nDockerfile:8 DL4006 warning: Set SHELL option -o pipefail before RUN with pipe\n",
+    "expected": "Dockerfile:3 DL3008 warning: Pin versions in apt-get install\nDockerfile:5 DL3009 info: Delete apt-get lists after installing\nDockerfile:8 DL4006 warning: Set SHELL option -o pipefail before RUN with pipe"
+  },
+  {
+    "filter": "hadolint",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "helm",
+    "name": "strips blank lines, preserves release info",
+    "input": "NAME: my-release\nLAST DEPLOYED: Mon Jan 15 10:30:00 2024\nNAMESPACE: default\nSTATUS: deployed\nREVISION: 3\n\nNOTES:\nApplication is running.\n",
+    "expected": "NAME: my-release\nLAST DEPLOYED: Mon Jan 15 10:30:00 2024\nNAMESPACE: default\nSTATUS: deployed\nREVISION: 3\nNOTES:\nApplication is running."
+  },
+  {
+    "filter": "helm",
+    "name": "strips glog W-prefix warnings",
+    "input": "W0115 10:30:00 warning message from internal\nNAME: my-chart\nSTATUS: deployed",
+    "expected": "NAME: my-chart\nSTATUS: deployed"
+  },
+  {
+    "filter": "helm",
+    "name": "helm template output is not truncated",
+    "input": "# Source: my-chart/templates/namespace.yaml\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: my-ns\n---\n# Source: my-chart/templates/secret.yaml\napiVersion: v1\nkind: Secret\nmetadata:\n  name: my-secret\n---\n# Source: my-chart/templates/configmap.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-cm\n---\n# Source: my-chart/templates/pvc.yaml\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: my-pvc\n---\n# Source: my-chart/templates/service.yaml\napiVersion: v1\nkind: Service\nmetadata:\n  name: my-svc\n---\n# Source: my-chart/templates/deployment.yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-deploy\n",
+    "expected": "# Source: my-chart/templates/namespace.yaml\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: my-ns\n---\n# Source: my-chart/templates/secret.yaml\napiVersion: v1\nkind: Secret\nmetadata:\n  name: my-secret\n---\n# Source: my-chart/templates/configmap.yaml\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: my-cm\n---\n# Source: my-chart/templates/pvc.yaml\napiVersion: v1\nkind: PersistentVolumeClaim\nmetadata:\n  name: my-pvc\n---\n# Source: my-chart/templates/service.yaml\napiVersion: v1\nkind: Service\nmetadata:\n  name: my-svc\n---\n# Source: my-chart/templates/deployment.yaml\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-deploy"
+  },
+  {
+    "filter": "iptables",
+    "name": "strips Docker chains, preserves real rules",
+    "input": "Chain INPUT (policy ACCEPT)\nnum  target     prot opt source               destination\n1    ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0\nChain DOCKER (1 references)\n    DOCKER     all  --  0.0.0.0/0            0.0.0.0/0\nChain BR-abcdef (0 references)\n",
+    "expected": "Chain INPUT (policy ACCEPT)\nnum  target     prot opt source               destination\n1    ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0\n    DOCKER     all  --  0.0.0.0/0            0.0.0.0/0"
+  },
+  {
+    "filter": "iptables",
+    "name": "preserves FORWARD and OUTPUT chains",
+    "input": "Chain FORWARD (policy DROP)\n1 ACCEPT tcp\nChain OUTPUT (policy ACCEPT)\n1 ACCEPT all",
+    "expected": "Chain FORWARD (policy DROP)\n1 ACCEPT tcp\nChain OUTPUT (policy ACCEPT)\n1 ACCEPT all"
+  },
+  {
+    "filter": "jira",
+    "name": "strips blank lines from issue list",
+    "input": "TYPE\tKEY\tSUMMARY\tSTATUS\n\nStory\tPROJ-123\tAdd login feature\tIn Progress\n\nBug\tPROJ-456\tFix crash on startup\tOpen",
+    "expected": "TYPE\tKEY\tSUMMARY\tSTATUS\nStory\tPROJ-123\tAdd login feature\tIn Progress\nBug\tPROJ-456\tFix crash on startup\tOpen"
+  },
+  {
+    "filter": "jira",
+    "name": "single issue view",
+    "input": "KEY: PROJ-123\nSummary: Add login feature\nStatus: In Progress\nAssignee: john@example.com",
+    "expected": "KEY: PROJ-123\nSummary: Add login feature\nStatus: In Progress\nAssignee: john@example.com"
+  },
+  {
+    "filter": "jj",
+    "name": "log output stripped of hints",
+    "input": "@  qpvuntsm patrick@example.com 2026-03-10 12:00 abc123\n│  feat: add new feature\n◉  zzzzzzzz root()\n\nWorking copy now at: qpvuntsm abc123 feat: add new feature\nHint: use `jj log` to see the full history\n",
+    "expected": "@  qpvuntsm patrick@example.com 2026-03-10 12:00 abc123\n│  feat: add new feature\n◉  zzzzzzzz root()"
+  },
+  {
+    "filter": "jj",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "jq",
+    "name": "short output passes through",
+    "input": "{\n  \"name\": \"test\",\n  \"version\": \"1.0\"\n}\n",
+    "expected": "{\n  \"name\": \"test\",\n  \"version\": \"1.0\"\n}"
+  },
+  {
+    "filter": "jq",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "just",
+    "name": "preserves command output",
+    "input": "cargo test\n\ntest result: ok. 42 passed; 0 failed\n",
+    "expected": "cargo test\ntest result: ok. 42 passed; 0 failed"
+  },
+  {
+    "filter": "just",
+    "name": "preserves error output",
+    "input": "error: Compilation failed\nsrc/main.rs:10: expected `;`",
+    "expected": "error: Compilation failed\nsrc/main.rs:10: expected `;`"
+  },
+  {
+    "filter": "just",
+    "name": "empty input",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "liquibase",
+    "name": "strip ascii banner and info logs from subcommand",
+    "input": "####################################################\n##   _     _             _ _                      ##\n##  | |   (_)           (_) |                     ##\n####################################################\nStarting Liquibase at 10:12:11 (version 4.29.1)\nLiquibase Version: 4.29.1\nLiquibase Open Source 4.29.1 by Liquibase\nINFO [liquibase.integration] Starting command\nINFO [liquibase.core] Reading resource db/changelog.xml\nINFO [liquibase.core] Parsing db/changelog.xml\nRunning Changeset: filepath::id::author\nChangeset filepath::id::author ran successfully\n",
+    "expected": "Liquibase Version: 4.29.1\nRunning Changeset: filepath::id::author\nChangeset filepath::id::author ran successfully"
+  },
+  {
+    "filter": "liquibase",
+    "name": "strip --version noise, keep only version line",
+    "input": "####################################################\n##   _     _             _ _                      ##\n####################################################\nStarting Liquibase at 13:45:24 using Java 17.0.15 (version 4.30.0 #4943 built at 2024-10-31 17:00+0000)\nLiquibase Home: D:\\mcp\\bash\\lbr\\third-party\nJava Home C:\\Program Files\\Java\\jdk-17.0.15 (Version 17.0.15)\nLibraries:\n  - internal\\lib\\commons-io.jar: Apache Commons IO 2.17.0 By The Apache Software Foundation\n  - internal\\lib\\picocli.jar: picocli 4.7.6 By Remko Popma\n  - lib\\ojdbc10-19.30.0.0.jar: JDBC 19.30.0.0.0 By Oracle Corporation\n\nLiquibase Version: 4.30.0\nLiquibase Open Source 4.30.0 by Liquibase\n",
+    "expected": "Liquibase Version: 4.30.0"
+  },
+  {
+    "filter": "liquibase",
+    "name": "keep status and error lines",
+    "input": "####################################################\n##   _     _             _ _                      ##\n####################################################\nStarting Liquibase at 10:00:00 (version 4.30.0)\nLiquibase Version: 4.30.0\nLiquibase Open Source 4.30.0 by Liquibase\nHR@jdbc:oracle:thin:@localhost:1523:XE is up to date\nLiquibase command 'status' was executed successfully.\n",
+    "expected": "Liquibase Version: 4.30.0\nHR@jdbc:oracle:thin:@localhost:1523:XE is up to date\nLiquibase command 'status' was executed successfully."
+  },
+  {
+    "filter": "liquibase",
+    "name": "empty input",
+    "input": "",
+    "expected": "liquibase: ok"
+  },
+  {
+    "filter": "make",
+    "name": "strips entering/leaving lines",
+    "input": "make[1]: Entering directory '/home/user'\ngcc -O2 foo.c\nmake[1]: Leaving directory '/home/user'\n",
+    "expected": "gcc -O2 foo.c\n"
+  },
+  {
+    "filter": "make",
+    "name": "strips blank lines",
+    "input": "gcc -O2 foo.c\n\ngcc -O2 bar.c\n",
+    "expected": "gcc -O2 foo.c\ngcc -O2 bar.c\n"
+  },
+  {
+    "filter": "make",
+    "name": "on_empty when all stripped",
+    "input": "make[1]: Entering directory '/home/user'\nmake[1]: Leaving directory '/home/user'\n",
+    "expected": "make: ok"
+  },
+  {
+    "filter": "markdownlint",
+    "name": "linting errors stripped of blank lines",
+    "input": "README.md:1:1 MD041/first-line-heading/first-line-h1 First line in file should be a top level heading\nREADME.md:10:1 MD022/blanks-around-headings Headings should be surrounded by blank lines\n\nREADME.md:15:80 MD013/line-length Line length [Expected: 80; Actual: 95]\n",
+    "expected": "README.md:1:1 MD041/first-line-heading/first-line-h1 First line in file should be a top level heading\nREADME.md:10:1 MD022/blanks-around-headings Headings should be surrounded by blank lines\nREADME.md:15:80 MD013/line-length Line length [Expected: 80; Actual: 95]"
+  },
+  {
+    "filter": "markdownlint",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "mise",
+    "name": "strips install noise, keeps task output",
+    "input": "mise Installing node@20.0.0\nmise Downloading node@20.0.0\nmise Extracting node@20.0.0\nmise node@20.0.0 installed\n\nlint check passed\n2 warnings found",
+    "expected": "lint check passed\n2 warnings found"
+  },
+  {
+    "filter": "mise",
+    "name": "preserves error output",
+    "input": "mise run lint\nError: biome check failed\nsrc/index.ts:5 — unused variable",
+    "expected": "mise run lint\nError: biome check failed\nsrc/index.ts:5 — unused variable"
+  },
+  {
+    "filter": "mise",
+    "name": "empty after stripping",
+    "input": "mise trust ~/dev/.mise.toml ✓\nmise install node@20 ✓\n",
+    "expected": "mise: ok"
+  },
+  {
+    "filter": "mix-compile",
+    "name": "strips compile noise, preserves warnings",
+    "input": "Compiling 12 files (.ex)\nGenerated my_app app\n\nwarning: variable \"conn\" is unused\n  lib/router.ex:42\n",
+    "expected": "warning: variable \"conn\" is unused\n  lib/router.ex:42"
+  },
+  {
+    "filter": "mix-compile",
+    "name": "on_empty when only noise",
+    "input": "Compiling 3 files (.ex)\nGenerated my_app app\n",
+    "expected": "mix compile: ok"
+  },
+  {
+    "filter": "mix-format",
+    "name": "empty output returns ok",
+    "input": "",
+    "expected": "mix format: ok"
+  },
+  {
+    "filter": "mix-format",
+    "name": "changed files pass through",
+    "input": "lib/my_app.ex\ntest/my_app_test.exs",
+    "expected": "lib/my_app.ex\ntest/my_app_test.exs"
+  },
+  {
+    "filter": "nx",
+    "name": "strips Nx noise, keeps build output",
+    "input": "\n   > NX   Running target build for project myapp\n\n———————————————————————————————————————\nCompiled successfully.\nOutput: dist/apps/myapp\n\n   > NX   View logs at /tmp/.nx/runs/abc123\n\n   Nx (powered by computation caching)\n",
+    "expected": "Compiled successfully.\nOutput: dist/apps/myapp"
+  },
+  {
+    "filter": "nx",
+    "name": "preserves error output",
+    "input": "ERROR: Cannot find module '@myapp/shared'\n\n   > NX   Running target build for project myapp\n\nFailed at step: build",
+    "expected": "ERROR: Cannot find module '@myapp/shared'\nFailed at step: build"
+  },
+  {
+    "filter": "ollama",
+    "name": "strips spinner lines, keeps response",
+    "input": "⠋ \n⠙ \n⠹ \nHello! How can I help you today?",
+    "expected": "Hello! How can I help you today?"
+  },
+  {
+    "filter": "ollama",
+    "name": "preserves multi-line response",
+    "input": "⠋ \n⠙ \nLine one of the response.\nLine two of the response.",
+    "expected": "Line one of the response.\nLine two of the response."
+  },
+  {
+    "filter": "ollama",
+    "name": "empty input",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "oxlint",
+    "name": "strips noise, keeps diagnostics",
+    "input": "  × eslint(no-console): Unexpected console statement.\n   ╭─[src/app.ts:5:3]\n 5 │   console.log(\"debug\");\n   │   ^^^^^^^^^^^\n   ╰────\n\n  × eslint(no-unused-vars): 'x' is defined but never used.\n   ╭─[src/utils.ts:2:7]\n 2 │   let x = 42;\n   │       ^\n   ╰────\n\nFound 2 warnings on 2 files.\nFinished in 12ms on 100 files.\n",
+    "expected": "  × eslint(no-console): Unexpected console statement.\n   ╭─[src/app.ts:5:3]\n 5 │   console.log(\"debug\");\n   │   ^^^^^^^^^^^\n   ╰────\n  × eslint(no-unused-vars): 'x' is defined but never used.\n   ╭─[src/utils.ts:2:7]\n 2 │   let x = 42;\n   │       ^\n   ╰────"
+  },
+  {
+    "filter": "oxlint",
+    "name": "clean output",
+    "input": "Finished in 5ms on 100 files.\n",
+    "expected": "oxlint: ok"
+  },
+  {
+    "filter": "oxlint",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "oxlint: ok"
+  },
+  {
+    "filter": "ping",
+    "name": "success keeps summary only",
+    "input": "PING example.com (93.184.216.34): 56 data bytes\n64 bytes from 93.184.216.34: icmp_seq=0 ttl=56 time=14.2 ms\n64 bytes from 93.184.216.34: icmp_seq=1 ttl=56 time=13.8 ms\n64 bytes from 93.184.216.34: icmp_seq=2 ttl=56 time=14.1 ms\n64 bytes from 93.184.216.34: icmp_seq=3 ttl=56 time=13.9 ms\n\n--- example.com ping statistics ---\n4 packets transmitted, 4 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 13.8/14.0/14.2/0.2 ms\n",
+    "expected": "--- example.com ping statistics ---\n4 packets transmitted, 4 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 13.8/14.0/14.2/0.2 ms"
+  },
+  {
+    "filter": "ping",
+    "name": "windows format keeps stats block only",
+    "input": "Pinging 192.0.2.1 with 32 bytes of data:\nReply from 192.0.2.1: bytes=32 time=14ms TTL=56\nReply from 192.0.2.1: bytes=32 time=13ms TTL=56\nReply from 192.0.2.1: bytes=32 time=14ms TTL=56\nReply from 192.0.2.1: bytes=32 time=13ms TTL=56\n\nPing statistics for 192.0.2.1:\n    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),\nApproximate round trip times in milli-seconds:\n    Minimum = 13ms, Maximum = 14ms, Average = 13ms\n",
+    "expected": "Ping statistics for 192.0.2.1:\n    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),\nApproximate round trip times in milli-seconds:\n    Minimum = 13ms, Maximum = 14ms, Average = 13ms"
+  },
+  {
+    "filter": "ping",
+    "name": "unreachable host passes error through",
+    "input": "PING unreachable.example.com (192.0.2.1): 56 data bytes\nRequest timeout for icmp_seq 0\nRequest timeout for icmp_seq 1\n\n--- unreachable.example.com ping statistics ---\n2 packets transmitted, 0 packets received, 100.0% packet loss\n",
+    "expected": "Request timeout for icmp_seq 0\nRequest timeout for icmp_seq 1\n--- unreachable.example.com ping statistics ---\n2 packets transmitted, 0 packets received, 100.0% packet loss"
+  },
+  {
+    "filter": "pio-run",
+    "name": "strips build noise, preserves errors",
+    "input": "Verbose mode can be enabled via `-v, --verbose` option\nCONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32dev.html\nLDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf\nCompiling .pio/build/esp32dev/src/main.cpp.o\nBuilding .pio/build/esp32dev/firmware.elf\nLinking .pio/build/esp32dev/firmware.elf\nChecking size .pio/build/esp32dev/firmware.elf\nsrc/main.cpp:10:3: error: 'LED_BUILTINN' was not declared\n",
+    "expected": "src/main.cpp:10:3: error: 'LED_BUILTINN' was not declared"
+  },
+  {
+    "filter": "pio-run",
+    "name": "on_empty when clean build with only noise",
+    "input": "Verbose mode can be enabled via `-v, --verbose` option\nCompiling .pio/build/esp32dev/src/main.cpp.o\nLinking .pio/build/esp32dev/firmware.elf\n",
+    "expected": "pio run: ok"
+  },
+  {
+    "filter": "poetry-install",
+    "name": "up to date short-circuits",
+    "input": "Installing dependencies from lock file\n\nNo dependencies to install or update\n",
+    "expected": "ok (up to date)"
+  },
+  {
+    "filter": "poetry-install",
+    "name": "poetry 2.x bullet syntax short-circuits to ok",
+    "input": "• Installing requests (2.31.0)\n• Installing certifi (2023.11.17)\n\nNo changes.\n",
+    "expected": "ok (up to date)"
+  },
+  {
+    "filter": "poetry-install",
+    "name": "install strips download lines",
+    "input": "Installing dependencies from lock file\n\n  - Downloading requests-2.31.0-py3-none-any.whl (62.6 kB)\n  - Installing certifi (2023.11.17)\n  - Installing charset-normalizer (3.3.2)\n  - Installing idna (3.6)\n  - Installing urllib3 (2.1.0)\n  - Installing requests (2.31.0)\n\nWriting lock file\n",
+    "expected": "Installing dependencies from lock file\nWriting lock file"
+  },
+  {
+    "filter": "pre-commit",
+    "name": "strips INFO install noise, keeps hook results",
+    "input": "[INFO] Installing environment for https://github.com/psf/black.\n[INFO] Once installed this environment will be reused.\n[INFO] This may take a few minutes...\nTrim Trailing Whitespace.................................................Passed\nFix End of Files.........................................................Passed\nCheck Yaml...............................................................Failed\n- hook id: check-yaml\n- exit code: 1\n",
+    "expected": "Trim Trailing Whitespace.................................................Passed\nFix End of Files.........................................................Passed\nCheck Yaml...............................................................Failed\n- hook id: check-yaml\n- exit code: 1"
+  },
+  {
+    "filter": "pre-commit",
+    "name": "all passed — no INFO noise",
+    "input": "[INFO] Installing environment for https://github.com/pre-commit/mirrors-isort.\n[INFO] Once installed this environment will be reused.\nisort....................................................................Passed\nblack....................................................................Passed\n",
+    "expected": "isort....................................................................Passed\nblack....................................................................Passed"
+  },
+  {
+    "filter": "ps",
+    "name": "short process list passes through unchanged",
+    "input": "USER   PID %CPU %MEM COMMAND\nroot     1  0.0  0.0 /sbin/launchd\nflorian  42  0.1  0.2 bash",
+    "expected": "USER   PID %CPU %MEM COMMAND\nroot     1  0.0  0.0 /sbin/launchd\nflorian  42  0.1  0.2 bash"
+  },
+  {
+    "filter": "ps",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "pulumi-destroy",
+    "name": "strips destroy header and url banner",
+    "input": "Destroying (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/43\n\n     Type                          Name              Status\n -   pulumi:pulumi:Stack           my-proj-dev       deleted\n -   └─ aws:s3:Bucket              my-bucket         deleted\n\nResources:\n    - 2 deleted\n\nDuration: 7s\n",
+    "expected": " -   pulumi:pulumi:Stack           my-proj-dev       deleted\n -   └─ aws:s3:Bucket              my-bucket         deleted\nResources:\n    - 2 deleted"
+  },
+  {
+    "filter": "pulumi-destroy",
+    "name": "on_empty when nothing to destroy",
+    "input": "Destroying (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/43\n\nDuration: 1s\n",
+    "expected": "pulumi destroy: nothing to destroy"
+  },
+  {
+    "filter": "pulumi-preview",
+    "name": "strips header, url and duration noise",
+    "input": "Previewing update (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/previews/abc123\n\n     Type                          Name              Plan\n +   pulumi:pulumi:Stack           my-proj-dev       create\n +   └─ aws:s3:Bucket              my-bucket         create\n\nResources:\n    + 2 to create\n\nDuration: 3s\n",
+    "expected": " +   pulumi:pulumi:Stack           my-proj-dev       create\n +   └─ aws:s3:Bucket              my-bucket         create\nResources:\n    + 2 to create"
+  },
+  {
+    "filter": "pulumi-preview",
+    "name": "on_empty when only noise lines present",
+    "input": "Previewing update (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/previews/abc123\n\nDuration: 1s\n",
+    "expected": "pulumi preview: no changes"
+  },
+  {
+    "filter": "pulumi-refresh",
+    "name": "strips refresh header and passes drift rows",
+    "input": "Refreshing (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/44\n\n     Type                          Name              Status\n ~   aws:s3:Bucket                 my-bucket         refreshed\n\nResources:\n    ~ 1 updated\n\nDuration: 4s\n",
+    "expected": " ~   aws:s3:Bucket                 my-bucket         refreshed\nResources:\n    ~ 1 updated"
+  },
+  {
+    "filter": "pulumi-refresh",
+    "name": "on_empty when no drift detected",
+    "input": "Refreshing (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/44\n\nDuration: 2s\n",
+    "expected": "pulumi refresh: no drift"
+  },
+  {
+    "filter": "pulumi-stack",
+    "name": "no stacks short-circuits",
+    "input": "No stacks found in the current workspace.\n",
+    "expected": "pulumi stack: empty"
+  },
+  {
+    "filter": "pulumi-stack",
+    "name": "keeps stack identity, strips prompt noise",
+    "input": "Please choose a stack, or create a new one:\nCurrent stack is dev:\n    Managed by my-user\n    Owner: my-org\n    Last updated: 2 hours ago\n    Pulumi version used: v3.120.0\n\nCurrent stack resources (3):\n    TYPE                          NAME\n    pulumi:pulumi:Stack           my-proj-dev\n    aws:s3:Bucket                 my-bucket\n    aws:iam:Role                  my-role\n",
+    "expected": "Current stack is dev:\n    Managed by my-user\n    Owner: my-org\n    Last updated: 2 hours ago\n    Pulumi version used: v3.120.0\nCurrent stack resources (3):\n    TYPE                          NAME\n    pulumi:pulumi:Stack           my-proj-dev\n    aws:s3:Bucket                 my-bucket\n    aws:iam:Role                  my-role"
+  },
+  {
+    "filter": "pulumi-up",
+    "name": "strips update header and url banner",
+    "input": "Updating (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/42\n\n     Type                          Name              Status\n +   pulumi:pulumi:Stack           my-proj-dev       created\n +   └─ aws:s3:Bucket              my-bucket         created\n\nOutputs:\n    bucket_name: \"my-bucket-abc123\"\n\nResources:\n    + 2 created\n\nDuration: 15s\n",
+    "expected": " +   pulumi:pulumi:Stack           my-proj-dev       created\n +   └─ aws:s3:Bucket              my-bucket         created\nOutputs:\n    bucket_name: \"my-bucket-abc123\"\nResources:\n    + 2 created"
+  },
+  {
+    "filter": "pulumi-up",
+    "name": "on_empty when all noise stripped",
+    "input": "Updating (dev)\n\nView in Browser (Ctrl+O): https://app.pulumi.com/org/my-proj/dev/updates/42\n\nDuration: 2s\n",
+    "expected": "pulumi up: no changes"
+  },
+  {
+    "filter": "quarto-render",
+    "name": "success short-circuits to ok",
+    "input": "processing file: index.qmd\n  Validating schema\n  Resolving resources\npandoc to html5\nOutput created: _site/index.html\n",
+    "expected": "ok (output created)"
+  },
+  {
+    "filter": "quarto-render",
+    "name": "error passes through",
+    "input": "processing file: broken.qmd\n  Validating schema\nERROR: Render failed\n\ncaused by:\n  syntax error at line 10\n",
+    "expected": "ERROR: Render failed\ncaused by:\n  syntax error at line 10"
+  },
+  {
+    "filter": "rsync",
+    "name": "successful sync short-circuits to ok",
+    "input": "sending incremental file list\n./\nfile1.txt\nfile2.txt\n\nsent 1,234 bytes  received 42 bytes  2,552.00 bytes/sec\ntotal size is 98,765  speedup is 77.31\n",
+    "expected": "ok (synced)"
+  },
+  {
+    "filter": "rsync",
+    "name": "error lines pass through",
+    "input": "sending incremental file list\nrsync: [Receiver] mkdir \"/remote/path\" failed: Permission denied (13)\nrsync error: error in file system (code 11) at receiver.c(741) [Receiver=3.2.7]\n",
+    "expected": "rsync: [Receiver] mkdir \"/remote/path\" failed: Permission denied (13)\nrsync error: error in file system (code 11) at receiver.c(741) [Receiver=3.2.7]"
+  },
+  {
+    "filter": "rsync",
+    "name": "errors not swallowed when total size present",
+    "input": "rsync: [sender] error\nerror in rsync protocol data stream (code 12)\nsent 100 bytes  received 200 bytes  60.00 bytes/sec\ntotal size is 1000  speedup is 3.33\n",
+    "expected": "rsync: [sender] error\nerror in rsync protocol data stream (code 12)\ntotal size is 1000  speedup is 3.33"
+  },
+  {
+    "filter": "shellcheck",
+    "name": "multi-warning output stripped of blank lines only",
+    "input": "In script.sh line 3:\nif [[ $1 == \"\" ]]\n     ^-- SC2236: Use -z instead of ! -n.\n\nIn script.sh line 7:\necho $var\n     ^-- SC2086: Double quote to prevent globbing.\n\n",
+    "expected": "In script.sh line 3:\nif [[ $1 == \"\" ]]\n     ^-- SC2236: Use -z instead of ! -n.\nIn script.sh line 7:\necho $var\n     ^-- SC2086: Double quote to prevent globbing."
+  },
+  {
+    "filter": "shellcheck",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "shopify-theme",
+    "name": "strips upload/download lines, keeps tail",
+    "input": "Uploading assets/app.css\nUploading assets/app.js\nUploading templates/index.liquid\nDownloading assets/old.css\n\nTheme 'Development' (id: 12345) pushed to store.example.myshopify.com\n",
+    "expected": "Theme 'Development' (id: 12345) pushed to store.example.myshopify.com"
+  },
+  {
+    "filter": "shopify-theme",
+    "name": "on_empty when all stripped",
+    "input": "Uploading assets/app.css\nDownloading assets/base.css\n",
+    "expected": "shopify theme: ok"
+  },
+  {
+    "filter": "skopeo",
+    "name": "copy strips progress, keeps result",
+    "input": "Getting image source signatures\nCopying blob sha256:abc123 done\nCopying blob sha256:def456 done\nCopying config sha256:789ghi done\nWriting manifest to image destination\nStoring signatures\n",
+    "expected": "skopeo: ok"
+  },
+  {
+    "filter": "skopeo",
+    "name": "inspect keeps output",
+    "input": "{\n    \"Name\": \"docker.io/library/nginx\",\n    \"Tag\": \"latest\",\n    \"Digest\": \"sha256:abc123\",\n    \"RepoTags\": [\"latest\", \"1.25\"],\n    \"Created\": \"2026-01-01T00:00:00Z\"\n}\n",
+    "expected": "{\n    \"Name\": \"docker.io/library/nginx\",\n    \"Tag\": \"latest\",\n    \"Digest\": \"sha256:abc123\",\n    \"RepoTags\": [\"latest\", \"1.25\"],\n    \"Created\": \"2026-01-01T00:00:00Z\"\n}"
+  },
+  {
+    "filter": "skopeo",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "skopeo: ok"
+  },
+  {
+    "filter": "sops",
+    "name": "strips blank lines",
+    "input": "mac: xyz123\n\nversion: 3.8.1",
+    "expected": "mac: xyz123\nversion: 3.8.1"
+  },
+  {
+    "filter": "sops",
+    "name": "preserves non-blank output unchanged",
+    "input": "mac: abc123\nversion: 3.8.1",
+    "expected": "mac: abc123\nversion: 3.8.1"
+  },
+  {
+    "filter": "spring-boot",
+    "name": "keeps startup summary and errors",
+    "input": "  .   ____          _ \n /\\\\ / ___'_ __ _ _(_)_ __  \n( ( )\\___ | '_ | '_| | '_ \\ \n \\/  ___)| |_)| | | | | || )\n  '  |____| .__|_| |_|_| |_\\__|\n  :: Spring Boot ::  (v3.2.0)\n2024-01-01 INFO Initializing Spring\n2024-01-01 INFO Bean 'dataSource' created\n2024-01-01 INFO Tomcat started on port 8080\n2024-01-01 INFO Started MyApp in 3.2 seconds",
+    "expected": "2024-01-01 INFO Tomcat started on port 8080\n2024-01-01 INFO Started MyApp in 3.2 seconds"
+  },
+  {
+    "filter": "spring-boot",
+    "name": "preserves errors",
+    "input": "  :: Spring Boot ::  (v3.2.0)\n2024-01-01 INFO Initializing Spring\n2024-01-01 ERROR Application run failed\nCaused by: java.lang.NullPointerException",
+    "expected": "2024-01-01 ERROR Application run failed\nCaused by: java.lang.NullPointerException"
+  },
+  {
+    "filter": "ssh",
+    "name": "strips connection banners, keeps command output",
+    "input": "Warning: Permanently added '192.168.1.10' (ED25519) to the list of known hosts.\n\ntotal 32\ndrwxr-xr-x 4 user user 4096 Mar 10 12:00 app\n-rw-r--r-- 1 user user 1234 Mar 10 11:00 config.yaml\n\nConnection to 192.168.1.10 closed.\n",
+    "expected": "total 32\ndrwxr-xr-x 4 user user 4096 Mar 10 12:00 app\n-rw-r--r-- 1 user user 1234 Mar 10 11:00 config.yaml"
+  },
+  {
+    "filter": "ssh",
+    "name": "verbose debug lines stripped",
+    "input": "debug1: Connecting to host.example.com port 22.\ndebug1: Connection established.\nAuthenticated to host.example.com ([1.2.3.4]:22).\nuptime: 12:00:00 up 42 days, load average: 0.10, 0.15, 0.12\nConnection to host.example.com closed.\n",
+    "expected": "uptime: 12:00:00 up 42 days, load average: 0.10, 0.15, 0.12"
+  },
+  {
+    "filter": "ssh",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "stat",
+    "name": "linux stat output strips device and birth",
+    "input": "  File: main.rs\n  Size: 12345           Blocks: 24         IO Block: 4096   regular file\nDevice: 801h/2049d      Inode: 1234567     Links: 1\nAccess: (0644/-rw-r--r--)  Uid: ( 1000/ patrick)   Gid: ( 1000/ patrick)\nAccess: 2026-03-10 12:00:00.000000000 +0100\nModify: 2026-03-10 11:00:00.000000000 +0100\nChange: 2026-03-10 11:00:00.000000000 +0100\n Birth: 2026-03-09 10:00:00.000000000 +0100\n",
+    "expected": "  File: main.rs\n  Size: 12345           Blocks: 24         IO Block: 4096   regular file\nAccess: (0644/-rw-r--r--)  Uid: ( 1000/ patrick)   Gid: ( 1000/ patrick)\nAccess: 2026-03-10 12:00:00.000000000 +0100\nModify: 2026-03-10 11:00:00.000000000 +0100\nChange: 2026-03-10 11:00:00.000000000 +0100"
+  },
+  {
+    "filter": "stat",
+    "name": "macOS stat -x strips device and birth",
+    "input": "  File: \"main.rs\"\n  Size: 82848        FileType: Regular File\n  Mode: (0644/-rw-r--r--)         Uid: (  501/ patrick)  Gid: (   20/   staff)\nDevice: 1,15   Inode: 66302332    Links: 1\nAccess: Wed Mar 18 21:21:15 2026\nModify: Wed Mar 18 20:56:11 2026\nChange: Wed Mar 18 20:56:11 2026\n Birth: Wed Mar 18 20:56:11 2026\n",
+    "expected": "  File: \"main.rs\"\n  Size: 82848        FileType: Regular File\n  Mode: (0644/-rw-r--r--)         Uid: (  501/ patrick)  Gid: (   20/   staff)\nAccess: Wed Mar 18 21:21:15 2026\nModify: Wed Mar 18 20:56:11 2026\nChange: Wed Mar 18 20:56:11 2026"
+  },
+  {
+    "filter": "stat",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "swift-build",
+    "name": "successful build short-circuits to ok",
+    "input": "Build complete!\n",
+    "expected": "ok (build complete)"
+  },
+  {
+    "filter": "swift-build",
+    "name": "build errors pass through after stripping noise",
+    "input": "Compiling MyApp MyApp.swift\n/home/user/MyApp/Sources/MyApp/main.swift:5:1: error: use of unresolved identifier 'foo'\nfoo()\n^~~\nLinking MyApp\nerror: build had 1 command failure\n",
+    "expected": "/home/user/MyApp/Sources/MyApp/main.swift:5:1: error: use of unresolved identifier 'foo'\nfoo()\n^~~\nerror: build had 1 command failure"
+  },
+  {
+    "filter": "swift-build",
+    "name": "warnings not swallowed when Build complete present",
+    "input": "CompileSwift normal x86_64 MyFile.swift\n/path/to/MyFile.swift:42:10: warning: unused variable 'x'\nBuild complete! (with warnings)\n",
+    "expected": "CompileSwift normal x86_64 MyFile.swift\n/path/to/MyFile.swift:42:10: warning: unused variable 'x'\nBuild complete! (with warnings)"
+  },
+  {
+    "filter": "systemctl-status",
+    "name": "verbose unit status stripped of blank lines",
+    "input": "● nginx.service - A high performance web server\n     Loaded: loaded (/lib/systemd/system/nginx.service; enabled)\n     Active: active (running) since Mon 2024-01-15 10:30:00 UTC; 2h ago\n       Docs: man:nginx(8)\n   Main PID: 1234 (nginx)\n      Tasks: 3 (limit: 4915)\n     Memory: 8.5M\n\n     CGroup: /system.slice/nginx.service\n             ├─1234 nginx: master process /usr/sbin/nginx\n             └─1235 nginx: worker process\n\nJan 15 10:30:00 host nginx[1234]: nginx/1.24.0\nJan 15 10:30:00 host systemd[1]: Started nginx.service\n",
+    "expected": "● nginx.service - A high performance web server\n     Loaded: loaded (/lib/systemd/system/nginx.service; enabled)\n     Active: active (running) since Mon 2024-01-15 10:30:00 UTC; 2h ago\n       Docs: man:nginx(8)\n   Main PID: 1234 (nginx)\n      Tasks: 3 (limit: 4915)\n     Memory: 8.5M\n     CGroup: /system.slice/nginx.service\n             ├─1234 nginx: master process /usr/sbin/nginx\n             └─1235 nginx: worker process\nJan 15 10:30:00 host nginx[1234]: nginx/1.24.0\nJan 15 10:30:00 host systemd[1]: Started nginx.service"
+  },
+  {
+    "filter": "systemctl-status",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  },
+  {
+    "filter": "task",
+    "name": "strips task headers, keeps output",
+    "input": "task: [build] go build ./...\n\ntask: [test] go test ./...\nok  myapp 0.5s\n\ntask: Task \"lint\" is up to date",
+    "expected": "ok  myapp 0.5s"
+  },
+  {
+    "filter": "task",
+    "name": "preserves error output",
+    "input": "task: [build] go build ./...\n./main.go:10: undefined: foo\ntask: Failed to run task \"build\": exit status 1",
+    "expected": "./main.go:10: undefined: foo\ntask: Failed to run task \"build\": exit status 1"
+  },
+  {
+    "filter": "task",
+    "name": "all up to date",
+    "input": "task: Task \"build\" is up to date\ntask: Task \"lint\" is up to date\n",
+    "expected": "task: ok"
+  },
+  {
+    "filter": "terraform-plan",
+    "name": "strips Refreshing state lines and blank lines",
+    "input": "Acquiring state lock. This may take a few moments...\nRefreshing state... [id=vpc-abc]\nRefreshing state... [id=sg-123]\nReleasing state lock. This may take a few moments...\n\nTerraform will perform the following actions:\n\n  # aws_instance.web will be created\n  + resource \"aws_instance\" \"web\" {}\n\nPlan: 1 to add, 0 to change, 0 to destroy.\n",
+    "expected": "Terraform will perform the following actions:\n  # aws_instance.web will be created\n  + resource \"aws_instance\" \"web\" {}\nPlan: 1 to add, 0 to change, 0 to destroy."
+  },
+  {
+    "filter": "terraform-plan",
+    "name": "strips noise, preserves non-blank content",
+    "input": "Refreshing state... [id=vpc-abc]\nNo changes. Your infrastructure matches the configuration.",
+    "expected": "No changes. Your infrastructure matches the configuration."
+  },
+  {
+    "filter": "tofu-fmt",
+    "name": "empty output returns on_empty message",
+    "input": "",
+    "expected": "tofu fmt: ok (no changes)"
+  },
+  {
+    "filter": "tofu-fmt",
+    "name": "changed files pass through",
+    "input": "main.tf\nvariables.tf",
+    "expected": "main.tf\nvariables.tf"
+  },
+  {
+    "filter": "tofu-init",
+    "name": "strips downloading/installing lines",
+    "input": "Initializing the backend...\nInitializing provider plugins...\n- Downloading hashicorp/aws 5.0.0...\n- Installing hashicorp/aws 5.0.0...\n- Using previously-installed hashicorp/random 3.5.1\n\nOpenTofu has been successfully initialized!\n",
+    "expected": "OpenTofu has been successfully initialized!"
+  },
+  {
+    "filter": "tofu-init",
+    "name": "on_empty when all noise stripped",
+    "input": "Initializing the backend...\nInitializing provider plugins...\n- Using previously-installed hashicorp/aws 5.0.0\n\n",
+    "expected": "tofu init: ok"
+  },
+  {
+    "filter": "tofu-plan",
+    "name": "strips Refreshing state and lock lines",
+    "input": "Acquiring state lock. This may take a few moments...\nRefreshing state... [id=vpc-abc123]\nRefreshing state... [id=sg-def456]\nReleasing state lock. This may take a few moments...\n\nOpenTofu will perform the following actions:\n\n  # aws_instance.web will be created\n  + resource \"aws_instance\" \"web\" {}\n\nPlan: 1 to add, 0 to change, 0 to destroy.\n",
+    "expected": "OpenTofu will perform the following actions:\n  # aws_instance.web will be created\n  + resource \"aws_instance\" \"web\" {}\nPlan: 1 to add, 0 to change, 0 to destroy."
+  },
+  {
+    "filter": "tofu-plan",
+    "name": "on_empty when all noise stripped",
+    "input": "Refreshing state... [id=vpc-abc]\nAcquiring state lock. This may take a few moments...\nReleasing state lock. This may take a few moments...",
+    "expected": "tofu plan: no changes detected"
+  },
+  {
+    "filter": "tofu-validate",
+    "name": "success short-circuits to ok",
+    "input": "Success! The configuration is valid.",
+    "expected": "ok (valid)"
+  },
+  {
+    "filter": "tofu-validate",
+    "name": "error passes through unchanged",
+    "input": "Error: Invalid resource type\n  on main.tf line 3: resource \"aws_instancee\" \"web\"",
+    "expected": "Error: Invalid resource type\n  on main.tf line 3: resource \"aws_instancee\" \"web\""
+  },
+  {
+    "filter": "trunk-build",
+    "name": "strips compile noise, keeps tail summary",
+    "input": "   Compiling tokio v1.35.0\n   Compiling hyper v0.14.28\n   Compiling my-crate v0.1.0\n   Downloading serde v1.0.195\n   Fresh regex v1.10.2\n\n   Finished release [optimized] target(s) in 45.23s\n   Binary: target/release/my-crate (5.2MB)\n",
+    "expected": "   Finished release [optimized] target(s) in 45.23s\n   Binary: target/release/my-crate (5.2MB)"
+  },
+  {
+    "filter": "trunk-build",
+    "name": "on_empty when all noise stripped",
+    "input": "   Compiling my-crate v0.1.0\n   Fresh serde v1.0\n   Checking tokio v1.35.0\n\n",
+    "expected": "trunk build: ok"
+  },
+  {
+    "filter": "turbo",
+    "name": "strips cache noise, keeps task output",
+    "input": " cache hit, replaying logs abc123\n cache miss, executing abc456\n\n3 packages in scope\n\n> myapp:build\n\nCompiled successfully.\n\nTasks:    2 successful, 2 total (1 cached)\nDuration: 3.2s",
+    "expected": "> myapp:build\nCompiled successfully."
+  },
+  {
+    "filter": "turbo",
+    "name": "preserves error output",
+    "input": "> myapp:lint\n\nError: src/index.ts(5,1): error TS2304\n\nTasks:    0 successful, 1 total\nDuration: 1.1s",
+    "expected": "> myapp:lint\nError: src/index.ts(5,1): error TS2304"
+  },
+  {
+    "filter": "turbo",
+    "name": "empty after stripping",
+    "input": " cache hit, replaying logs abc\n\n",
+    "expected": "turbo: ok"
+  },
+  {
+    "filter": "ty",
+    "name": "strips noise, keeps diagnostics",
+    "input": "ty 0.1.0\nChecking 15 files\n\nerror[unresolved-reference]: Name `foo` used when not defined\n  --> app/main.py:10:5\n   |\n10 |     foo()\n   |     ^^^\n   |\n\nwarning[unused-variable]: Variable `x` is not used\n  --> app/utils.py:8:9\n   |\n 8 |     x = 42\n   |     ^\n   |\n\nFound 1 error, 1 warning\n",
+    "expected": "error[unresolved-reference]: Name `foo` used when not defined\n  --> app/main.py:10:5\n   |\n10 |     foo()\n   |     ^^^\n   |\nwarning[unused-variable]: Variable `x` is not used\n  --> app/utils.py:8:9\n   |\n 8 |     x = 42\n   |     ^\n   |\nFound 1 error, 1 warning"
+  },
+  {
+    "filter": "ty",
+    "name": "clean output",
+    "input": "ty 0.1.0\nChecking 10 files\n\nAll checks passed!\n",
+    "expected": "All checks passed!"
+  },
+  {
+    "filter": "ty",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "ty: ok"
+  },
+  {
+    "filter": "uv-sync",
+    "name": "audited packages short-circuits to ok",
+    "input": "Resolved 42 packages in 123ms\nAudited 42 packages in 0.05ms\n",
+    "expected": "ok (up to date)"
+  },
+  {
+    "filter": "uv-sync",
+    "name": "install strips download and cached lines",
+    "input": "  Downloading requests-2.31.0-py3-none-any.whl (62.6 kB)\n  Using cached certifi-2023.11.17-py3-none-any.whl (162 kB)\n  Preparing packages...\nInstalled 5 packages in 23ms\n + certifi==2023.11.17\n + charset-normalizer==3.3.2\n + idna==3.6\n + requests==2.31.0\n + urllib3==2.1.0\n",
+    "expected": "Installed 5 packages in 23ms\n + certifi==2023.11.17\n + charset-normalizer==3.3.2\n + idna==3.6\n + requests==2.31.0\n + urllib3==2.1.0"
+  },
+  {
+    "filter": "xcodebuild",
+    "name": "strips build phases, keeps errors and summary",
+    "input": "note: Using new build system\nCompileSwift normal arm64 /Users/dev/App/ViewController.swift\n    cd /Users/dev/App\n    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -c\nCompileSwift normal arm64 /Users/dev/App/AppDelegate.swift\n    cd /Users/dev/App\n    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer\nLd /Users/dev/Build/Products/Debug/App normal arm64\n    cd /Users/dev/App\n    /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang\nCodeSign /Users/dev/Build/Products/Debug/App.app\n    cd /Users/dev/App\n    builtin-codesign --force --sign\n\n/Users/dev/App/ViewController.swift:42:9: error: use of unresolved identifier 'foo'\n/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used\n\n** BUILD FAILED **\n",
+    "expected": "/Users/dev/App/ViewController.swift:42:9: error: use of unresolved identifier 'foo'\n/Users/dev/App/Model.swift:18:5: warning: variable 'x' was never used\n** BUILD FAILED **"
+  },
+  {
+    "filter": "xcodebuild",
+    "name": "clean build success",
+    "input": "note: Using new build system\nCompileSwift normal arm64 /Users/dev/App/Main.swift\n    cd /Users/dev/App\nLd /Users/dev/Build/Products/Debug/App normal arm64\n    cd /Users/dev/App\nCodeSign /Users/dev/Build/Products/Debug/App.app\n    cd /Users/dev/App\n    builtin-codesign --force --sign\n\n** BUILD SUCCEEDED **\n",
+    "expected": "** BUILD SUCCEEDED **"
+  },
+  {
+    "filter": "xcodebuild",
+    "name": "test output keeps test results",
+    "input": "note: Using new build system\nCompileSwift normal arm64 /Users/dev/AppTests/Tests.swift\n    cd /Users/dev/App\nTest Suite 'All tests' started at 2026-03-10 12:00:00\nTest Suite 'AppTests' started at 2026-03-10 12:00:00\nTest Case '-[AppTests testExample]' passed (0.001 seconds).\nTest Case '-[AppTests testFailing]' failed (0.002 seconds).\nTest Suite 'AppTests' passed at 2026-03-10 12:00:01\nExecuted 2 tests, with 1 failure in 0.003 seconds\n",
+    "expected": "Test Suite 'All tests' started at 2026-03-10 12:00:00\nTest Suite 'AppTests' started at 2026-03-10 12:00:00\nTest Case '-[AppTests testExample]' passed (0.001 seconds).\nTest Case '-[AppTests testFailing]' failed (0.002 seconds).\nTest Suite 'AppTests' passed at 2026-03-10 12:00:01\nExecuted 2 tests, with 1 failure in 0.003 seconds"
+  },
+  {
+    "filter": "xcodebuild",
+    "name": "empty input returns on_empty message",
+    "input": "",
+    "expected": "xcodebuild: ok"
+  },
+  {
+    "filter": "yadm",
+    "name": "strips hint lines",
+    "input": "On branch main\nYour branch is up to date with 'origin/main'.\n\n  (use \"yadm add\" to update what will be committed)\n\nChanges not staged for commit:\n  modified:   .bashrc",
+    "expected": "On branch main\nYour branch is up to date with 'origin/main'.\nChanges not staged for commit:\n  modified:   .bashrc"
+  },
+  {
+    "filter": "yadm",
+    "name": "short output preserved",
+    "input": "Already up to date.",
+    "expected": "Already up to date."
+  },
+  {
+    "filter": "yamllint",
+    "name": "multi-warning output stripped of blank lines",
+    "input": "config.yml\n  3:1     warning  missing document start \"---\"  (document-start)\n  5:12    error    too many spaces inside braces  (braces)\n\n  8:1     error    wrong indentation: expected 2 but found 4  (indentation)\n",
+    "expected": "config.yml\n  3:1     warning  missing document start \"---\"  (document-start)\n  5:12    error    too many spaces inside braces  (braces)\n  8:1     error    wrong indentation: expected 2 but found 4  (indentation)"
+  },
+  {
+    "filter": "yamllint",
+    "name": "empty input passes through",
+    "input": "",
+    "expected": ""
+  }
+]
