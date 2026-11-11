@@ -1,5 +1,6 @@
 import type { Provider } from './types.ts';
-import { filterRtkOutput, type RtkFilter } from './vendor/rtk.ts';
+import { historyCommand, historyArgv } from './shell-command.ts';
+import { filterRtkOutput, matchRtkFilter, type RtkFilter } from './vendor/rtk.ts';
 import { knownCompactionSnapshot, completeCompactionSnapshot } from './providers/codex-snapshots.ts';
 
 export const MAX_HISTORY_BYTES = 64 * 1024 * 1024;
@@ -150,20 +151,9 @@ function parseLine(text: string) {
   };
 }
 
-// No shell evaluation. Reject composition, substitution and wrappers whose actual
-// command cannot be established from one simple invocation.
+// Resolve only literal, unambiguous command wrappers; never execute history.
 export function commandFilter(command: unknown): RtkFilter | undefined {
-  if (typeof command !== 'string' || command.length > 16_384 || /[\n\r;&|<>`$\\]/.test(command)) return;
-  const tokens = command.match(/'[^']*'|"[^"]*"|[^\s'"]+/g);
-  if (!tokens || tokens.join(' ').replace(/\s/g, '') !== command.replace(/\s/g, '')) return;
-  const args = tokens.map(token => /^['"]/.test(token) ? token.slice(1, -1) : token);
-  const [exe, ...rest] = args;
-  if (exe === 'rg' && rest.includes('--files') && rest.every(arg => !arg.startsWith('-') || ['--files', '--hidden', '--no-ignore', '-g', '--glob'].includes(arg))) return 'find';
-  if (['rg', 'grep'].includes(exe) && !rest.some(arg => /^(?:--(?:json|files|count|replace|passthru|context|before-context|after-context)|-[AclLqUoz])/.test(arg))) return 'grep';
-  if (exe === 'find' && rest.every(arg => !arg.startsWith('-') || ['-type', '-name', '-iname', '-path', '-maxdepth', '-mindepth', '-print', '-not'].includes(arg))) return 'find';
-  if (exe === 'fd' && rest.every(arg => !arg.startsWith('-') || ['--hidden', '--no-ignore', '--type', '-t', '--extension', '-e', '--max-depth', '-d', '--absolute-path', '-a'].includes(arg))) return 'find';
-  if (exe === 'cargo' && rest[0] === 'test') return 'cargo-test';
-  if (exe === 'pytest' || ['python', 'python3'].includes(exe) && rest[0] === '-m' && rest[1] === 'pytest') return 'pytest';
+  return matchRtkFilter(Array.isArray(command) ? historyArgv(command) : historyCommand(command));
 }
 
 function compact(filter: RtkFilter | undefined, output: unknown): string | undefined {
@@ -203,15 +193,8 @@ function rewriteCodexItem(parsed: ReturnType<typeof parseLine>, item: unknown, o
   if (options.compactTools && ['CommandExecution', 'commandExecution'].includes(item.type) && item.status === 'completed') {
     const canonical = item.type === 'CommandExecution';
     if (item[canonical ? 'exit_code' : 'exitCode'] !== 0) return;
-    let command = item.command;
-    if (canonical) {
-      // Only an exact shell invocation has a known command string; never execute it.
-      if (!Array.isArray(command) || command.length !== 3 || !['/bin/zsh', '/bin/bash', '/bin/sh', 'zsh', 'bash', 'sh'].includes(command[0]) ||
-          !['-c', '-lc'].includes(command[1])) return;
-      command = command[2];
-    }
     const key = canonical ? 'aggregated_output' : 'aggregatedOutput';
-    const result = compact(commandFilter(command), item[key]);
+    const result = compact(commandFilter(item.command), item[key]);
     if (result && parsed.replace(item, key, result, 'toolOutputs')) counts.toolOutputs++;
   }
 }
