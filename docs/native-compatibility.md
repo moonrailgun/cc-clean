@@ -32,6 +32,14 @@ Reasoning removal only deletes a nonempty string `encrypted_content` member from
 
 The in-memory history transformer accepts Claude files up to 64 MiB and Codex files up to 512 MiB stored and decoded, with a 64 MiB limit per JSONL line. Configuration inspection has a 64 KiB bound. These are implementation limits, not provider-version restrictions. Claude files must have consistent session identity. Compacted replacement histories and unrecognized image shapes are left untouched by image/output/reasoning operations.
 
+## Expanded RTK filters: synthetic coverage
+
+The RTK 0.49.0 port at `653efb6ed02bd287d686c50e830dd1009356904f` expands shell-output filtering to all 23 pipe groups / 28 names, 62 built-in rules and native historical-text formatters. The [inventory](../third_party/rtk/UPSTREAM.md) records source mappings, required input formats and runtime-only exclusions. The rule suite runs all 151 upstream inline fixtures. Pipe and native suites use both unchanged upstream inputs and synthetic cases for caps, malformed schemas, diagnostic retention and unknown-format passthrough. Conservative format checks can deliberately retain output that upstream would truncate.
+
+In-memory history tests cover Claude Bash, Codex command events/cache items, literal single-call JavaScript wrappers, preserved JSON/text envelopes, empty stdin polling, session conflicts, nonempty stdin, failures, ANSI/CRLF, raw numeric literals, exact byte savings and idempotence. The existing Quick clean, age/activity, history graph and SQLite projection tests remain part of `npm run test:read-only`.
+
+This is source and synthetic evidence only. No cleanup, cleanup preview, real-history rewrite, native continuation or installed-app verification was performed for this expanded port. Earlier native evidence elsewhere in this document does not validate the expanded filter formats. Execution, external reports, binary artifacts, hooks, telemetry, recall and the separately licensed RTK engine/proxy are outside the historical-text port.
+
 ## Codex compressed history read support
 
 Analysis recognizes current and archived `.jsonl.zst` histories and streams decoded records through the same parser as plain JSONL. Synthetic read-only fixtures cover Unicode records split across concatenated zstd frames, empty frames, compressed input larger than the read buffer, plain-path SQLite indexes, identity mismatches, token/date/model aggregation, cache reuse, decoded metadata sampling, cancellation, and damaged/truncated/trailing-invalid frames. Incomplete results are not cached as verified. File fingerprints are checked before and after reading; no uncompressed history file is created.
