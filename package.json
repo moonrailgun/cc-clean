@@ -52,6 +52,9 @@
     "prepublishOnly": "npm run typecheck && npm run test:read-only"
   },
   "release-it": {
+    "git": {
+      "commitMessage": "chore(release): bump version to ${version}"
+    },
     "npm": {
       "publishArgs": [
         "--registry=https://registry.npmjs.org/"
