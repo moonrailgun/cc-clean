@@ -47,7 +47,7 @@
     "release:patch": "release-it patch",
     "typecheck": "tsc --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
-    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/commands.test.ts test/agent.test.ts test/analyze.test.ts test/state.test.ts test/ui.test.ts test/slim.test.ts test/history-codec.test.ts test/protection.test.ts test/activity.test.ts test/codex-history.test.ts test/codex-shared.test.ts test/system-temp.test.ts test/session-temp.test.ts test/shell-command.test.ts",
+    "test:read-only": "node --disable-warning=ExperimentalWarning --test test/commands.test.ts test/agent.test.ts test/analyze.test.ts test/state.test.ts test/ui.test.ts test/slim.test.ts test/history-codec.test.ts test/protection.test.ts test/activity.test.ts test/codex-history.test.ts test/codex-shared.test.ts test/system-temp.test.ts test/session-temp.test.ts test/shell-command.test.ts test/exec-wrapper.test.ts",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm run test:read-only"
   },
