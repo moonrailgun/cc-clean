@@ -5,6 +5,7 @@ import { rustFilters } from './rtk-native-rust.ts';
 import { rubyFilters } from './rtk-native-ruby.ts';
 import { systemFilters } from './rtk-native-system.ts';
 import { extraFilters } from './rtk-native-extra.ts';
+import { containerFilters,matchContainerFilter } from './rtk-native-container.ts';
 import { systemTextFilters } from './rtk-native-system-text.ts';
 import { cloudFilters, matchCloudFilter } from './rtk-native-cloud.ts';
 import { buildFilters, matchBuildFilter } from './rtk-native-build.ts';
@@ -14,11 +15,11 @@ export * from './rtk-native-helpers.ts';
 export * from './rtk-native-find.ts';
 export * from './rtk-native-search.ts';
 export { filterEnvironment, filterJson, summarizeDependencies } from './rtk-native-system-text.ts';
-export const nativeFilters: Record<string, (input: string) => string> = { ...jsFilters, ...systemFilters, ...rustFilters, ...rubyFilters, ...extraFilters, ...systemTextFilters, ...cloudFilters, ...buildFilters, ...mavenFilters, ...gitNativeFilters };
+export const nativeFilters: Record<string, (input: string) => string> = { ...jsFilters, ...systemFilters, ...rustFilters, ...rubyFilters, ...extraFilters, ...containerFilters, ...systemTextFilters, ...cloudFilters, ...buildFilters, ...mavenFilters, ...gitNativeFilters };
 export function matchNativeFilter(argv: string[]): string | undefined {
   const [exe, sub, next] = argv;
   if (argv.some(a => ['--help', '-h', '--watch', '--interactive', '--verbose'].includes(a))) return undefined;
-  const delegated=matchCloudFilter(argv)??matchBuildFilter(argv)??matchMavenFilter(argv)??matchGitNativeFilter(argv);if(delegated)return delegated;
+  const delegated=matchContainerFilter(argv)??matchCloudFilter(argv)??matchBuildFilter(argv)??matchMavenFilter(argv)??matchGitNativeFilter(argv);if(delegated)return delegated;
   const has = (...flags: string[]) => argv.some((arg, i) => flags.some(flag => arg === `${flag}=json` || arg === flag && argv[i + 1] === 'json'));
   if (exe === 'cargo') { if(sub==='nextest'&&next!=='run')return undefined;const name = `cargo-${sub}`; return name in rustFilters ? name : undefined; }
   if (exe === 'black' && !argv.some(arg=>['--diff','--color','--code','-c'].includes(arg))) return 'black';
