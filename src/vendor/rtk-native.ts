@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Historical-text adapters derived from RTK 0.49.0, commit 653efb6ed02bd287d686c50e830dd1009356904f.
 import { jsFilters } from './rtk-native-js.ts';
+import { rustFilters } from './rtk-native-rust.ts';
+import { rubyFilters } from './rtk-native-ruby.ts';
 import { systemFilters } from './rtk-native-system.ts';
 import { systemTextFilters } from './rtk-native-system-text.ts';
 import { cloudFilters, matchCloudFilter } from './rtk-native-cloud.ts';
@@ -11,12 +13,13 @@ export * from './rtk-native-helpers.ts';
 export * from './rtk-native-find.ts';
 export * from './rtk-native-search.ts';
 export { filterEnvironment, filterJson, summarizeDependencies } from './rtk-native-system-text.ts';
-export const nativeFilters: Record<string, (input: string) => string> = { ...jsFilters, ...systemFilters, ...systemTextFilters, ...cloudFilters, ...buildFilters, ...mavenFilters, ...gitNativeFilters };
+export const nativeFilters: Record<string, (input: string) => string> = { ...jsFilters, ...systemFilters, ...rustFilters, ...rubyFilters, ...systemTextFilters, ...cloudFilters, ...buildFilters, ...mavenFilters, ...gitNativeFilters };
 export function matchNativeFilter(argv: string[]): string | undefined {
   const [exe, sub, next] = argv;
   if (argv.some(a => ['--help', '-h', '--watch', '--interactive', '--verbose'].includes(a))) return undefined;
   const delegated=matchCloudFilter(argv)??matchBuildFilter(argv)??matchMavenFilter(argv)??matchGitNativeFilter(argv);if(delegated)return delegated;
   const has = (...flags: string[]) => argv.some((arg, i) => flags.some(flag => arg === `${flag}=json` || arg === flag && argv[i + 1] === 'json'));
+  if (exe === 'cargo') { if(sub==='nextest'&&next!=='run')return undefined;const name = `cargo-${sub}`; return name in rustFilters ? name : undefined; }
   if (exe === 'black' && !argv.some(arg=>['--diff','--color','--code','-c'].includes(arg))) return 'black';
   if ((exe === 'env' || exe === 'printenv') && argv.length === 1) return 'env';
   if (exe === 'ls') {
@@ -24,6 +27,8 @@ export function matchNativeFilter(argv: string[]): string | undefined {
     if(flags.some(arg=>!/^-[laAh]+$/.test(arg))||!flags.some(arg=>arg.includes('l')))return undefined;
     return flags.some(arg=>/[aA]/.test(arg))?'ls-long-all':'ls-long';
   }
+  if (exe === 'rspec' || exe === 'rubocop') return exe;
+  if (exe === 'rake' && sub === 'test') return 'rake-test';
   if (exe === 'npm' && ['install', 'i', 'ci', 'run', 'exec', 'uninstall', 'update'].includes(sub)) return 'npm';
   if (exe === 'pnpm') {
     if (['install', 'i', 'add', 'remove', 'update'].includes(sub)) return 'pnpm-install';

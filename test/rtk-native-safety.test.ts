@@ -18,6 +18,13 @@ test('Playwright retains flaky reports and malformed suite aggregates', () => {
   const text='Running 2 tests using 1 worker\n  1 flaky\n  1 passed (2s)\n';
   assert.equal(nativeFilters.playwright(text),text);
 });
+test('Cargo refuses unrecognized tails, partial installs and unknown JSON events', () => {
+  for(const name of ['cargo-build','cargo-check','cargo-clippy']) {
+    for(const raw of ['    Checking demo v1.0\n    Finished dev target(s) in 1s\nUNEXPECTED IMPORTANT OUTPUT\n', '{"reason":"unknown-event"}\n{"reason":"build-finished","success":true}\n', '{"reason":"build-finished","success":true}\nUNEXPECTED IMPORTANT OUTPUT\n']) assert.equal(nativeFilters[name](raw),raw,name);
+  }
+  const partial='  Installing tool v1.0\n   Compiling dependency v1.0\n';
+  assert.equal(nativeFilters['cargo-install'](partial),partial);
+});
 test('JSON helpers preserve integers that cannot be represented exactly', () => {
   for(const raw of ['{"id":9007199254740993}','{"value":1e400}','[9007199254740993]']) assert.equal(filterJson(raw),raw);
 });
