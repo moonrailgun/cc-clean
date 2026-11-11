@@ -4,6 +4,7 @@ import { jsFilters } from './rtk-native-js.ts';
 import { rustFilters } from './rtk-native-rust.ts';
 import { rubyFilters } from './rtk-native-ruby.ts';
 import { systemFilters } from './rtk-native-system.ts';
+import { extraFilters } from './rtk-native-extra.ts';
 import { systemTextFilters } from './rtk-native-system-text.ts';
 import { cloudFilters, matchCloudFilter } from './rtk-native-cloud.ts';
 import { buildFilters, matchBuildFilter } from './rtk-native-build.ts';
@@ -13,7 +14,7 @@ export * from './rtk-native-helpers.ts';
 export * from './rtk-native-find.ts';
 export * from './rtk-native-search.ts';
 export { filterEnvironment, filterJson, summarizeDependencies } from './rtk-native-system-text.ts';
-export const nativeFilters: Record<string, (input: string) => string> = { ...jsFilters, ...systemFilters, ...rustFilters, ...rubyFilters, ...systemTextFilters, ...cloudFilters, ...buildFilters, ...mavenFilters, ...gitNativeFilters };
+export const nativeFilters: Record<string, (input: string) => string> = { ...jsFilters, ...systemFilters, ...rustFilters, ...rubyFilters, ...extraFilters, ...systemTextFilters, ...cloudFilters, ...buildFilters, ...mavenFilters, ...gitNativeFilters };
 export function matchNativeFilter(argv: string[]): string | undefined {
   const [exe, sub, next] = argv;
   if (argv.some(a => ['--help', '-h', '--watch', '--interactive', '--verbose'].includes(a))) return undefined;
@@ -47,6 +48,14 @@ export function matchNativeFilter(argv: string[]): string | undefined {
   if (exe === 'tree' && !argv.some(a => ['-J', '-X', '-H', '--fromfile'].includes(a))) return 'tree';
   if (exe === 'php' && argv.some(a=>a==='-l'||a==='--syntax-check')) return 'php-lint';
   if (exe === 'go' && sub === 'vet') return 'go-vet';
+  if (exe === 'golangci-lint' && sub === 'run') {
+    if(argv.includes('--output.json.path=stdout')) return 'golangci-v2';
+    if(has('--out-format')) return 'golangci-v1';
+  }
+  if(exe === 'sbt') {const task=sub?.split(/\s/)[0].split(/[/:]/).at(-1);if(['test','testOnly','testQuick'].includes(task??''))return 'sbt-test';if(task==='compile'||task==='run')return `sbt-${task}`;}
+  if(exe === 'php' && sub?.endsWith('run-tests.php')) return 'phpt';
+  if(exe === 'php' && sub?.endsWith('artisan') && next!=='test') return 'artisan';
+  if(exe === 'psql' && !argv.some(a=>['-A','--no-align','--csv','-H','--html'].includes(a))) return 'psql';
   if (exe === 'wc') {
     const flags = argv.slice(1).filter(a => /^-[lwcm]+$/.test(a)).join('').replace(/-/g, '');
     if (argv.slice(1).some(a => a.startsWith('--') || a.startsWith('-') && !/^-[lwcm]+$/.test(a))) return undefined;
