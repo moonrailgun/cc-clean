@@ -4,6 +4,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { nativeFilters, filterJson } from '../src/vendor/rtk-native.ts';
 
+test('Kubernetes retains Running pods with waiting error reasons', () => {
+  const raw=JSON.stringify({kind:'PodList',items:[{metadata:{name:'broken-app',namespace:'prod'},status:{phase:'Running',containerStatuses:[{restartCount:6,state:{waiting:{reason:'CrashLoopBackOff'}}}]}}]});
+  assert.equal(nativeFilters['kube-pods'](raw),raw);
+});
 test('ESLint rejects contradictory aggregate counts and invalid severity', () => {
   const entry={filePath:'/src/bad.ts',errorCount:0,warningCount:0,messages:[{ruleId:'no-undef',severity:2,message:'missing is not defined',line:1,column:1}]};
   for(const value of [entry,{...entry,errorCount:1,messages:[{...entry.messages[0],severity:3}]}]) {
