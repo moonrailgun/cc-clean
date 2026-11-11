@@ -1,5 +1,6 @@
 import type { Provider } from './types.ts';
 import { historyCommand, historyArgv } from './shell-command.ts';
+import { execWrapperCall } from './exec-wrapper.ts';
 import { filterRtkOutput, matchRtkFilter, type RtkFilter } from './vendor/rtk.ts';
 import { knownCompactionSnapshot, completeCompactionSnapshot } from './providers/codex-snapshots.ts';
 
@@ -164,18 +165,47 @@ function compact(filter: RtkFilter | undefined, output: unknown): string | undef
   if (Buffer.byteLength(result) < Buffer.byteLength(output)) return result;
 }
 
-function compactCodexOutput(filter: RtkFilter | undefined, output: string): string | undefined {
-  const envelope = /^((?:Chunk ID: [^\n]+\n)?Wall time: [^\n]+\nProcess exited with code 0\n(?:Original token count: \d+\n)?(?:Final output:|Output:)\n)([\s\S]*)$/.exec(output);
-  if (envelope) {
-    const result = compact(filter, envelope[2]);
-    return result && envelope[1] + result;
+type ExecutionOutput = {
+  session?: number;
+  completed: boolean;
+  compact(filter: RtkFilter | undefined): string | undefined;
+};
+function executionOutput(output: string, wrapped = false): ExecutionOutput | undefined {
+  if (wrapped) {
+    const rendered = /^(Script completed\nWall time:? \d+(?:\.\d+)? seconds\nOutput:\n)([\s\S]*)$/.exec(output);
+    if (rendered) {
+      const inner = executionOutput(rendered[2]);
+      return inner && {...inner, compact(filter) {
+        const result = inner.compact(filter);
+        return result && rendered[1] + result;
+      }};
+    }
   }
-  if (output.startsWith('{')) {
+  const envelope = /^((?:Chunk ID: [^\n]+\n)?Wall time: [^\n]+\n(Process exited with code (-?\d+)|Process running with session ID (\d+))\n(?:Original token count: \d+\n)?(?:Final output:|Output:)\n)([\s\S]*)$/.exec(output);
+  if (envelope) {
+    const session = envelope[4] === undefined ? undefined : Number(envelope[4]);
+    if (session !== undefined && !Number.isSafeInteger(session)) return;
+    return {session, completed: session === undefined, compact(filter) {
+      if (envelope[3] !== '0') return;
+      const result = compact(filter, envelope[5]);
+      return result && envelope[1] + result;
+    }};
+  }
+  if (output.trimStart().startsWith('{')) {
     try {
       const parsed = parseLine(output), row = parsed.row;
-      if (row.metadata?.exit_code !== 0 || row.metadata?.session_id != null) return;
-      const result = compact(filter, row.output);
-      if (result && parsed.replace(row, 'output', result, 'toolOutputs')) return parsed.render();
+      const status = object(row.metadata) ? row.metadata : row;
+      if (typeof row.output !== 'string' ||
+          status.exit_code != null && !Number.isSafeInteger(status.exit_code) ||
+          status.session_id != null && (!Number.isSafeInteger(status.session_id) || status.session_id < 0) ||
+          status.exit_code != null && status.session_id != null ||
+          status.exit_code == null && status.session_id == null ||
+          status !== row && (Object.hasOwn(row, 'exit_code') || Object.hasOwn(row, 'session_id'))) return;
+      return {session: status.session_id ?? undefined, completed: status.exit_code != null, compact(filter) {
+        if (status.exit_code !== 0) return;
+        const result = compact(filter, row.output);
+        if (result && parsed.replace(row, 'output', result, 'toolOutputs')) return parsed.render();
+      }};
     } catch { /* Unknown envelopes remain intact. */ }
   }
 }
@@ -239,12 +269,51 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
   let lastCompaction = -1, latestComplete = false, snapshotsKnown = true, rollback = false;
   const requestLines = new Set<number>();
   let requestsKnown = true, conversationRecords = 0;
-  const calls = new Map<string, RtkFilter | undefined>();
+  const calls = new Map<string, {filter?: RtkFilter; session?: number; wrapped?: boolean}>();
+  const sessions = new Map<number, RtkFilter | undefined>();
+  const polling = new Map<number, string>();
+  const seenSessions = new Set<number>(), results = new Set<string>();
   let session: string | undefined, records = 0, ordinal = -1;
   function remember(id: unknown, command: unknown) {
     if (typeof id !== 'string') return;
     if (calls.has(id)) throw new Error('Duplicate tool call identity; original retained');
-    calls.set(id, commandFilter(command));
+    calls.set(id, {filter: commandFilter(command)});
+  }
+  function rememberExecution(id: unknown, name: string, args: Row, wrapped = false) {
+    remember(id, name === 'exec_command' ? args.cmd : name === 'shell_command' ? args.command : undefined);
+    if (typeof id === 'string') calls.get(id)!.wrapped = wrapped;
+    if (typeof id !== 'string' || name !== 'write_stdin' || !Number.isSafeInteger(args.session_id)) return;
+    const session = args.session_id;
+    // Typed input can change an interactive command; only empty polls retain attribution.
+    const previous = polling.get(session);
+    if (previous) calls.get(previous)!.filter = undefined;
+    const filter = !previous && (args.chars === undefined || args.chars === '') ? sessions.get(session) : undefined;
+    calls.set(id, {filter, session, wrapped});
+    polling.set(session, id);
+    // Concurrent polls cannot both claim the same pending command.
+    sessions.set(session, undefined);
+  }
+  function toolResult(id: unknown, output: string, wrapped: boolean): string | undefined {
+    if (typeof id !== 'string') return;
+    if (results.has(id)) throw new Error('Duplicate tool result identity; original retained');
+    results.add(id);
+    const call = calls.get(id);
+    if (!call || call.wrapped !== wrapped) return;
+    if (call.session !== undefined && polling.get(call.session) === id) polling.delete(call.session);
+    const envelope = executionOutput(output, wrapped);
+    if (!envelope) return;
+    if (envelope.session !== undefined) {
+      const session = envelope.session;
+      if (call.session === session || call.session === undefined && !seenSessions.has(session)) sessions.set(session, call.filter);
+      else {
+        sessions.set(session, undefined);
+        const pending = polling.get(session);
+        if (pending) calls.get(pending)!.filter = undefined;
+      }
+      seenSessions.add(session);
+    }
+    if (call.session !== undefined && envelope.completed) sessions.delete(call.session);
+    return envelope.compact(call.filter);
   }
   for (let n = 0; n < lines.length; n++) {
     const text = decode(lines[n]);
@@ -301,7 +370,7 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           if (row.type === 'user' && block.type === 'tool_result') {
             replaceImages(block.content, false);
             if (!options.compactTools || block.is_error !== false) continue;
-            const filter = calls.get(block.tool_use_id);
+            const filter = calls.get(block.tool_use_id)?.filter;
             if (typeof block.content === 'string') replaceToolText(block, 'content', filter);
             else if (Array.isArray(block.content) && block.content.length === 1 && block.content[0]?.type === 'text') replaceToolText(block.content[0], 'text', filter);
           }
@@ -359,14 +428,18 @@ export function slimHistory(input: Buffer, provider: Provider, options: SlimOpti
           replaceImages(payload.output, true);
         if (options.compactTools && payload.type === 'function_call') {
           let args: Row = {};
-          try { const decoded = JSON.parse(payload.arguments); if (object(decoded)) args = decoded; } catch { /* Unknown arguments remain untouched. */ }
+          try { args = parseLine(payload.arguments).row; } catch { /* Unknown arguments remain untouched. */ }
           const name = String(payload.name).replace(/^functions\./, '');
-          remember(payload.call_id, name === 'exec_command' ? args.cmd : name === 'shell_command' ? args.command : undefined);
+          rememberExecution(payload.call_id, name, args);
         }
-        if (options.compactTools && payload.type === 'function_call_output' && typeof payload.output === 'string') {
+        if (options.compactTools && payload.type === 'custom_tool_call') {
+          const call = ['exec', 'functions.exec'].includes(payload.name) ? execWrapperCall(payload.input) : undefined;
+          rememberExecution(payload.call_id, call?.name ?? '', call?.args ?? {}, true);
+        }
+        if (options.compactTools && ['function_call_output', 'custom_tool_call_output'].includes(payload.type) && typeof payload.output === 'string') {
           // Preserve the native execution envelope and exit status verbatim. Live
           // process chunks, unknown envelopes and failures cannot be filtered.
-          const result = compactCodexOutput(calls.get(payload.call_id), payload.output);
+          const result = toolResult(payload.call_id, payload.output, payload.type === 'custom_tool_call_output');
           if (result && parsed.replace(payload, 'output', result, 'toolOutputs')) counts.toolOutputs++;
         }
       }
